@@ -148,26 +148,7 @@ app.get('/dbtest', async (req, res) => {
 
 //////////////////////// ESPACIO PARA MIGRACIONES////////////////////
 
-// Endpoint temporal para migrar estructura de tablas
-app.get('/migrar-estructura', async (req, res) => {
-  try {
-    await pool.query(`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS nombre VARCHAR(100);`);
-    await pool.query(`ALTER TABLE medicamentos ADD COLUMN IF NOT EXISTS notas TEXT;`);
-    await pool.query(`ALTER TABLE citas ADD COLUMN IF NOT EXISTS notas TEXT;`);
-    await pool.query(`ALTER TABLE citas ADD COLUMN IF NOT EXISTS recordatorio INTEGER;`);
-    await pool.query(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS completada BOOLEAN DEFAULT false;`);
-    await pool.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS nombre VARCHAR(100);`);
-    await pool.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS categoria VARCHAR(50);`);
-    await pool.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS especialidad VARCHAR(100);`);
-    await pool.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS telefono VARCHAR(50);`);
-    await pool.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS email VARCHAR(100);`);
-    await pool.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS direccion VARCHAR(255);`);
-    await pool.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS notas TEXT;`);
-    res.send('Migración de estructura completada.');
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+
 
 /////////////////////////////////////////////////////////////////////
 
