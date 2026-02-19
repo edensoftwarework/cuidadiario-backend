@@ -8,11 +8,11 @@ app.use(express.json());
 
 // Crear usuario
 app.post('/usuarios', async (req, res) => {
-  const { email, password_hash, premium } = req.body;
+  const { nombre, email, password_hash, premium } = req.body;
   try {
     const result = await pool.query(
-      'INSERT INTO usuarios (email, password_hash, premium) VALUES ($1, $2, $3) RETURNING *',
-      [email, password_hash, premium || false]
+      'INSERT INTO usuarios (nombre, email, password_hash, premium) VALUES ($1, $2, $3, $4) RETURNING *',
+      [nombre, email, password_hash, premium || false]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -43,11 +43,11 @@ app.get('/usuarios/:id', async (req, res) => {
 
 // Actualizar usuario
 app.put('/usuarios/:id', async (req, res) => {
-  const { email, password_hash, premium } = req.body;
+  const { nombre, email, password_hash, premium } = req.body;
   try {
     const result = await pool.query(
-      'UPDATE usuarios SET email = $1, password_hash = $2, premium = $3 WHERE id = $4 RETURNING *',
-      [email, password_hash, premium, req.params.id]
+      'UPDATE usuarios SET nombre = $1, email = $2, password_hash = $3, premium = $4 WHERE id = $5 RETURNING *',
+      [nombre, email, password_hash, premium, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
     res.json(result.rows[0]);
@@ -67,16 +67,15 @@ app.delete('/usuarios/:id', async (req, res) => {
   }
 });
 
-
 ////////////////////////// ENDPOINTS DE MEDICAMENTOS /////////////////////
 
 // Crear medicamento
 app.post('/medicamentos', async (req, res) => {
-  const { usuario_id, nombre, dosis, frecuencia, hora_inicio, recordatorio } = req.body;
+  const { usuario_id, nombre, dosis, frecuencia, hora_inicio, recordatorio, notas } = req.body;
   try {
     const result = await pool.query(
-      'INSERT INTO medicamentos (usuario_id, nombre, dosis, frecuencia, hora_inicio, recordatorio) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-      [usuario_id, nombre, dosis, frecuencia, hora_inicio, recordatorio || false]
+      'INSERT INTO medicamentos (usuario_id, nombre, dosis, frecuencia, hora_inicio, recordatorio, notas) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+      [usuario_id, nombre, dosis, frecuencia, hora_inicio, recordatorio || false, notas || null]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -107,11 +106,11 @@ app.get('/medicamentos/:id', async (req, res) => {
 
 // Actualizar medicamento
 app.put('/medicamentos/:id', async (req, res) => {
-  const { usuario_id, nombre, dosis, frecuencia, hora_inicio, recordatorio } = req.body;
+  const { usuario_id, nombre, dosis, frecuencia, hora_inicio, recordatorio, notas } = req.body;
   try {
     const result = await pool.query(
-      'UPDATE medicamentos SET usuario_id = $1, nombre = $2, dosis = $3, frecuencia = $4, hora_inicio = $5, recordatorio = $6 WHERE id = $7 RETURNING *',
-      [usuario_id, nombre, dosis, frecuencia, hora_inicio, recordatorio, req.params.id]
+      'UPDATE medicamentos SET usuario_id = $1, nombre = $2, dosis = $3, frecuencia = $4, hora_inicio = $5, recordatorio = $6, notas = $7 WHERE id = $8 RETURNING *',
+      [usuario_id, nombre, dosis, frecuencia, hora_inicio, recordatorio, notas, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Medicamento no encontrado' });
     res.json(result.rows[0]);
@@ -131,7 +130,6 @@ app.delete('/medicamentos/:id', async (req, res) => {
   }
 });
 
-
 /////////////////////////////////////////////////////////////////////////////
 
 app.get('/', (req, res) => {
@@ -148,18 +146,32 @@ app.get('/dbtest', async (req, res) => {
   }
 });
 
-
-
 //////////////////////// ESPACIO PARA MIGRACIONES////////////////////
 
-
+// Endpoint temporal para migrar estructura de tablas
+app.get('/migrar-estructura', async (req, res) => {
+  try {
+    await pool.query(`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS nombre VARCHAR(100);`);
+    await pool.query(`ALTER TABLE medicamentos ADD COLUMN IF NOT EXISTS notas TEXT;`);
+    await pool.query(`ALTER TABLE citas ADD COLUMN IF NOT EXISTS notas TEXT;`);
+    await pool.query(`ALTER TABLE citas ADD COLUMN IF NOT EXISTS recordatorio INTEGER;`);
+    await pool.query(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS completada BOOLEAN DEFAULT false;`);
+    await pool.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS nombre VARCHAR(100);`);
+    await pool.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS categoria VARCHAR(50);`);
+    await pool.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS especialidad VARCHAR(100);`);
+    await pool.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS telefono VARCHAR(50);`);
+    await pool.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS email VARCHAR(100);`);
+    await pool.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS direccion VARCHAR(255);`);
+    await pool.query(`ALTER TABLE contactos ADD COLUMN IF NOT EXISTS notas TEXT;`);
+    res.send('Migración de estructura completada.');
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 /////////////////////////////////////////////////////////////////////
-
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Servidor escuchando en puerto ${PORT}`);
 });
-
-
