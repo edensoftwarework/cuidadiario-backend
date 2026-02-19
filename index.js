@@ -2,7 +2,10 @@ const express = require('express');
 const app = express();
 const pool = require('./db');
 const bcrypt = require('bcrypt');
-const SALT_ROUNDS = 10;         
+const SALT_ROUNDS = 10;  
+const jwt = require('jsonwebtoken');
+const JWT_SECRET = process.env.JWT_SECRET || 'tu_clave_secreta';
+
 
 app.use(express.json());
 
@@ -73,6 +76,43 @@ app.delete('/usuarios/:id', async (req, res) => {
     const result = await pool.query('DELETE FROM usuarios WHERE id = $1 RETURNING *', [req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
     res.json({ message: 'Usuario eliminado' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/////////////////////////////// ENDPOINT DE LOGIN /////////////////////
+
+// Endpoint de login
+app.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+  try {
+    // Buscar usuario por email
+    const result = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email]);
+    if (result.rows.length === 0) return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+
+    const user = result.rows[0];
+    // Comparar la contraseña enviada con el hash guardado
+    const valid = await bcrypt.compare(password, user.password_hash);
+    if (!valid) return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+
+    // Generar token JWT
+    const token = jwt.sign(
+      { id: user.id, email: user.email },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    // Devolver token y datos básicos del usuario
+    res.json({
+      token,
+      usuario: {
+        id: user.id,
+        nombre: user.nombre,
+        email: user.email,
+        premium: user.premium
+      }
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
