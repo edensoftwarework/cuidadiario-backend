@@ -148,7 +148,7 @@ app.post('/medicamentos', async (req, res) => {
 });
 
 // Obtener todos los medicamentos
-app.get('/medicamentos', async (req, res) => {
+app.get('/medicamentos', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM medicamentos');
     res.json(result.rows);
@@ -197,7 +197,7 @@ app.delete('/medicamentos/:id', async (req, res) => {
 ///////////////////////////// ENDPOINTS DE CITAS /////////////////////
 
 // Crear cita
-app.post('/citas', async (req, res) => {
+app.post('/citas', authMiddleware, async (req, res) => {
   const { usuario_id, tipo, titulo, fecha, hora, lugar, profesional, notas, recordatorio } = req.body;
   try {
     const result = await pool.query(
@@ -295,7 +295,7 @@ app.get('/tareas/:id', async (req, res) => {
 });
 
 // Actualizar tarea
-app.put('/tareas/:id', async (req, res) => {
+app.put('/tareas/:id', authMiddleware, async (req, res) => {
   const { usuario_id, titulo, categoria, fecha, hora, frecuencia, completada } = req.body;
   try {
     const result = await pool.query(
@@ -436,7 +436,7 @@ app.put('/contactos/:id', async (req, res) => {
 });
 
 // Eliminar contacto
-app.delete('/contactos/:id', async (req, res) => {
+app.delete('/contactos/:id', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query('DELETE FROM contactos WHERE id = $1 RETURNING *', [req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Contacto no encontrado' });
