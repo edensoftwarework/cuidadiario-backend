@@ -400,7 +400,14 @@ app.get('/dbtest', async (req, res) => {
 
 //////////////////////// ESPACIO PARA MIGRACIONES////////////////////
 
-
+app.get('/migrar-tareas-hora', async (req, res) => {
+  try {
+    await pool.query('ALTER TABLE tareas ADD COLUMN IF NOT EXISTS hora TIME;');
+    res.send('Columna hora agregada a tareas.');
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 /////////////////////////////////////////////////////////////////////
 
