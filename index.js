@@ -260,11 +260,11 @@ app.delete('/tareas/:id', async (req, res) => {
 
 // Crear síntoma
 app.post('/sintomas', async (req, res) => {
-  const { usuario_id, fecha, tipo, intensidad, estado_animo, descripcion } = req.body;
+  const { usuario_id, nombre, intensidad, estado_animo, descripcion, fecha, hora } = req.body;
   try {
     const result = await pool.query(
-      'INSERT INTO sintomas (usuario_id, fecha, tipo, intensidad, estado_animo, descripcion) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-      [usuario_id, fecha, tipo, intensidad, estado_animo, descripcion]
+      'INSERT INTO sintomas (usuario_id, nombre, intensidad, estado_animo, descripcion, fecha, hora) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+      [usuario_id, nombre, intensidad, estado_animo, descripcion, fecha, hora]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -295,11 +295,11 @@ app.get('/sintomas/:id', async (req, res) => {
 
 // Actualizar síntoma
 app.put('/sintomas/:id', async (req, res) => {
-  const { usuario_id, fecha, tipo, intensidad, estado_animo, descripcion } = req.body;
+  const { usuario_id, nombre, intensidad, estado_animo, descripcion, fecha, hora } = req.body;
   try {
     const result = await pool.query(
-      'UPDATE sintomas SET usuario_id = $1, fecha = $2, tipo = $3, intensidad = $4, estado_animo = $5, descripcion = $6 WHERE id = $7 RETURNING *',
-      [usuario_id, fecha, tipo, intensidad, estado_animo, descripcion, req.params.id]
+      'UPDATE sintomas SET usuario_id = $1, nombre = $2, intensidad = $3, estado_animo = $4, descripcion = $5, fecha = $6, hora = $7 WHERE id = $8 RETURNING *',
+      [usuario_id, nombre, intensidad, estado_animo, descripcion, fecha, hora, req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Síntoma no encontrado' });
     res.json(result.rows[0]);
