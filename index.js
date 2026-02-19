@@ -1,15 +1,18 @@
 const express = require('express');
 const app = express();
 const pool = require('./db');
+const bcrypt = require('bcrypt');
+const SALT_ROUNDS = 10;         
 
 app.use(express.json());
 
 ///////////////////// ENDPOINTS DE USUARIOS /////////////////////
 
-// Crear usuario
+// Crear usuario (ahora hashea la contraseña)
 app.post('/usuarios', async (req, res) => {
-  const { nombre, email, password_hash, premium } = req.body;
+  const { nombre, email, password, premium } = req.body; // password en texto plano
   try {
+    const password_hash = await bcrypt.hash(password, SALT_ROUNDS); // hashear
     const result = await pool.query(
       'INSERT INTO usuarios (nombre, email, password_hash, premium) VALUES ($1, $2, $3, $4) RETURNING *',
       [nombre, email, password_hash, premium || false]
@@ -43,8 +46,16 @@ app.get('/usuarios/:id', async (req, res) => {
 
 // Actualizar usuario
 app.put('/usuarios/:id', async (req, res) => {
-  const { nombre, email, password_hash, premium } = req.body;
+  const { nombre, email, password, premium } = req.body;
   try {
+    let password_hash;
+    if (password) {
+      password_hash = await bcrypt.hash(password, SALT_ROUNDS);
+    } else {
+      // Si no se envía password, mantener el hash anterior
+      const user = await pool.query('SELECT password_hash FROM usuarios WHERE id = $1', [req.params.id]);
+      password_hash = user.rows[0]?.password_hash;
+    }
     const result = await pool.query(
       'UPDATE usuarios SET nombre = $1, email = $2, password_hash = $3, premium = $4 WHERE id = $5 RETURNING *',
       [nombre, email, password_hash, premium, req.params.id]
