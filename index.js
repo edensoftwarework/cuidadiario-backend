@@ -2,9 +2,22 @@ const express = require('express');
 const app = express();
 const pool = require('./db');
 const bcrypt = require('bcrypt');
-const SALT_ROUNDS = 10;  
+const SALT_ROUNDS = 10;
 const jwt = require('jsonwebtoken');
 const JWT_SECRET = process.env.JWT_SECRET || 'tu_clave_secreta';
+const cors = require('cors');
+
+// ========== CONFIGURACIÓN ==========
+
+// CORS - Permitir peticiones desde el frontend
+app.use(cors({
+  origin: '*', // En producción, especifica tu dominio: 'https://tu-dominio.com'
+  credentials: true
+}));
+
+app.use(express.json());
+
+// ========== MIDDLEWARE DE AUTENTICACIÓN ==========
 
 function authMiddleware(req, res, next) {
   const auth = req.headers.authorization;
@@ -13,110 +26,85 @@ function authMiddleware(req, res, next) {
   const token = auth.split(' ')[1];
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded; // Ahora puedes acceder a req.user.id en tus endpoints
-    next(); // Permite que la petición continúe
+    req.user = decoded;
+    next();
   } catch (err) {
     res.status(401).json({ error: 'Token inválido' });
   }
 }
 
-app.use(express.json());
+// ========== ENDPOINTS PÚBLICOS ==========
 
-///////////////////// ENDPOINTS DE USUARIOS /////////////////////
+app.get('/', (req, res) => {
+  res.send('Backend funcionando para CuidaDiario!');
+});
 
-// Crear usuario (ahora hashea la contraseña)
-app.post('/usuarios', async (req, res) => {
-  const { nombre, email, password, premium } = req.body; // password en texto plano
+app.get('/api/test', (req, res) => {
+  res.json({ status: 'ok', message: 'Backend funcionando correctamente' });
+});
+
+app.get('/dbtest', async (req, res) => {
   try {
-    const password_hash = await bcrypt.hash(password, SALT_ROUNDS); // hashear
-    const result = await pool.query(
-      'INSERT INTO usuarios (nombre, email, password_hash, premium) VALUES ($1, $2, $3, $4) RETURNING *',
-      [nombre, email, password_hash, premium || false]
-    );
-    res.status(201).json(result.rows[0]);
+    const result = await pool.query('SELECT NOW()');
+    res.json({ time: result.rows[0].now, status: 'Database connected' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Obtener todos los usuarios
-app.get('/usuarios', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM usuarios');
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+// ========== AUTENTICACIÓN ==========
 
-// Obtener usuario por id
-app.get('/usuarios/:id', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM usuarios WHERE id = $1', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+// Registro de usuarios
+app.post('/api/register', async (req, res) => {
+  const { nombre, email, password } = req.body;
+  
+  if (!nombre || !email || !password) {
+    return res.status(400).json({ error: 'Todos los campos son requeridos' });
   }
-});
-
-// Actualizar usuario
-app.put('/usuarios/:id', async (req, res) => {
-  const { nombre, email, password, premium } = req.body;
+  
   try {
-    let password_hash;
-    if (password) {
-      password_hash = await bcrypt.hash(password, SALT_ROUNDS);
-    } else {
-      // Si no se envía password, mantener el hash anterior
-      const user = await pool.query('SELECT password_hash FROM usuarios WHERE id = $1', [req.params.id]);
-      password_hash = user.rows[0]?.password_hash;
+    const existing = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email]);
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: 'El email ya está registrado' });
     }
+    
+    const password_hash = await bcrypt.hash(password, SALT_ROUNDS);
     const result = await pool.query(
-      'UPDATE usuarios SET nombre = $1, email = $2, password_hash = $3, premium = $4 WHERE id = $5 RETURNING *',
-      [nombre, email, password_hash, premium, req.params.id]
+      'INSERT INTO usuarios (nombre, email, password_hash, premium) VALUES ($1, $2, $3, $4) RETURNING id, nombre, email, premium',
+      [nombre, email, password_hash, false]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
-    res.json(result.rows[0]);
+    
+    const user = result.rows[0];
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+    
+    res.status(201).json({ token, usuario: user });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Eliminar usuario
-app.delete('/usuarios/:id', async (req, res) => {
-  try {
-    const result = await pool.query('DELETE FROM usuarios WHERE id = $1 RETURNING *', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
-    res.json({ message: 'Usuario eliminado' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/////////////////////////////// ENDPOINT DE LOGIN /////////////////////
-
-// Endpoint de login
-app.post('/login', async (req, res) => {
+// Login
+app.post('/api/login', async (req, res) => {
   const { email, password } = req.body;
+  
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email y contraseña son requeridos' });
+  }
+  
   try {
-    // Buscar usuario por email
     const result = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email]);
-    if (result.rows.length === 0) return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+    }
 
     const user = result.rows[0];
-    // Comparar la contraseña enviada con el hash guardado
     const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+    if (!valid) {
+      return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+    }
 
-    // Generar token JWT
-    const token = jwt.sign(
-      { id: user.id, email: user.email },
-      JWT_SECRET,
-      { expiresIn: '7d' }
-    );
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
 
-    // Devolver token y datos básicos del usuario
     res.json({
       token,
       usuario: {
@@ -131,11 +119,12 @@ app.post('/login', async (req, res) => {
   }
 });
 
-////////////////////////// ENDPOINTS DE MEDICAMENTOS /////////////////////
+// ========== MEDICAMENTOS (PROTEGIDOS) ==========
 
-// Crear medicamento
-app.post('/medicamentos', async (req, res) => {
-  const { usuario_id, nombre, dosis, frecuencia, hora_inicio, recordatorio, notas } = req.body;
+app.post('/api/medicamentos', authMiddleware, async (req, res) => {
+  const { nombre, dosis, frecuencia, hora_inicio, recordatorio, notas } = req.body;
+  const usuario_id = req.user.id;
+  
   try {
     const result = await pool.query(
       'INSERT INTO medicamentos (usuario_id, nombre, dosis, frecuencia, hora_inicio, recordatorio, notas) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
@@ -147,58 +136,71 @@ app.post('/medicamentos', async (req, res) => {
   }
 });
 
-// Obtener todos los medicamentos
-app.get('/medicamentos', authMiddleware, async (req, res) => {
+app.get('/api/medicamentos', authMiddleware, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM medicamentos');
+    const result = await pool.query(
+      'SELECT * FROM medicamentos WHERE usuario_id = $1 ORDER BY id DESC',
+      [req.user.id]
+    );
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Obtener medicamento por id
-app.get('/medicamentos/:id', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM medicamentos WHERE id = $1', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Medicamento no encontrado' });
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Actualizar medicamento
-app.put('/medicamentos/:id', async (req, res) => {
-  const { usuario_id, nombre, dosis, frecuencia, hora_inicio, recordatorio, notas } = req.body;
+app.get('/api/medicamentos/:id', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
-      'UPDATE medicamentos SET usuario_id = $1, nombre = $2, dosis = $3, frecuencia = $4, hora_inicio = $5, recordatorio = $6, notas = $7 WHERE id = $8 RETURNING *',
-      [usuario_id, nombre, dosis, frecuencia, hora_inicio, recordatorio, notas, req.params.id]
+      'SELECT * FROM medicamentos WHERE id = $1 AND usuario_id = $2',
+      [req.params.id, req.user.id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Medicamento no encontrado' });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Medicamento no encontrado' });
+    }
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Eliminar medicamento
-app.delete('/medicamentos/:id', async (req, res) => {
+app.put('/api/medicamentos/:id', authMiddleware, async (req, res) => {
+  const { nombre, dosis, frecuencia, hora_inicio, recordatorio, notas } = req.body;
+  
   try {
-    const result = await pool.query('DELETE FROM medicamentos WHERE id = $1 RETURNING *', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Medicamento no encontrado' });
+    const result = await pool.query(
+      'UPDATE medicamentos SET nombre = $1, dosis = $2, frecuencia = $3, hora_inicio = $4, recordatorio = $5, notas = $6 WHERE id = $7 AND usuario_id = $8 RETURNING *',
+      [nombre, dosis, frecuencia, hora_inicio, recordatorio, notas, req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Medicamento no encontrado' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/medicamentos/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'DELETE FROM medicamentos WHERE id = $1 AND usuario_id = $2 RETURNING *',
+      [req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Medicamento no encontrado' });
+    }
     res.json({ message: 'Medicamento eliminado' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-///////////////////////////// ENDPOINTS DE CITAS /////////////////////
+// ========== CITAS (PROTEGIDOS) ==========
 
-// Crear cita
-app.post('/citas', authMiddleware, async (req, res) => {
-  const { usuario_id, tipo, titulo, fecha, hora, lugar, profesional, notas, recordatorio } = req.body;
+app.post('/api/citas', authMiddleware, async (req, res) => {
+  const { tipo, titulo, fecha, hora, lugar, profesional, notas, recordatorio } = req.body;
+  const usuario_id = req.user.id;
+  
   try {
     const result = await pool.query(
       'INSERT INTO citas (usuario_id, tipo, titulo, fecha, hora, lugar, profesional, notas, recordatorio) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *',
@@ -210,58 +212,71 @@ app.post('/citas', authMiddleware, async (req, res) => {
   }
 });
 
-// Obtener todas las citas
-app.get('/citas', async (req, res) => {
+app.get('/api/citas', authMiddleware, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM citas');
+    const result = await pool.query(
+      'SELECT * FROM citas WHERE usuario_id = $1 ORDER BY fecha DESC, hora DESC',
+      [req.user.id]
+    );
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Obtener cita por id
-app.get('/citas/:id', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM citas WHERE id = $1', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Cita no encontrada' });
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Actualizar cita
-app.put('/citas/:id', async (req, res) => {
-  const { usuario_id, tipo, titulo, fecha, hora, lugar, profesional, notas, recordatorio } = req.body;
+app.get('/api/citas/:id', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
-      'UPDATE citas SET usuario_id = $1, tipo = $2, titulo = $3, fecha = $4, hora = $5, lugar = $6, profesional = $7, notas = $8, recordatorio = $9 WHERE id = $10 RETURNING *',
-      [usuario_id, tipo, titulo, fecha, hora, lugar, profesional, notas, recordatorio, req.params.id]
+      'SELECT * FROM citas WHERE id = $1 AND usuario_id = $2',
+      [req.params.id, req.user.id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Cita no encontrada' });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Cita no encontrada' });
+    }
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Eliminar cita
-app.delete('/citas/:id', async (req, res) => {
+app.put('/api/citas/:id', authMiddleware, async (req, res) => {
+  const { tipo, titulo, fecha, hora, lugar, profesional, notas, recordatorio } = req.body;
+  
   try {
-    const result = await pool.query('DELETE FROM citas WHERE id = $1 RETURNING *', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Cita no encontrada' });
+    const result = await pool.query(
+      'UPDATE citas SET tipo = $1, titulo = $2, fecha = $3, hora = $4, lugar = $5, profesional = $6, notas = $7, recordatorio = $8 WHERE id = $9 AND usuario_id = $10 RETURNING *',
+      [tipo, titulo, fecha, hora, lugar, profesional, notas, recordatorio, req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Cita no encontrada' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/citas/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'DELETE FROM citas WHERE id = $1 AND usuario_id = $2 RETURNING *',
+      [req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Cita no encontrada' });
+    }
     res.json({ message: 'Cita eliminada' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-////////////////////////////// ENDPOINTS DE TAREAS /////////////////////
+// ========== TAREAS (PROTEGIDOS) ==========
 
-// Crear tarea
-app.post('/tareas', async (req, res) => {
-  const { usuario_id, titulo, categoria, fecha, hora, frecuencia, completada } = req.body;
+app.post('/api/tareas', authMiddleware, async (req, res) => {
+  const { titulo, categoria, fecha, hora, frecuencia, completada } = req.body;
+  const usuario_id = req.user.id;
+  
   try {
     const result = await pool.query(
       'INSERT INTO tareas (usuario_id, titulo, categoria, fecha, hora, frecuencia, completada) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
@@ -273,58 +288,71 @@ app.post('/tareas', async (req, res) => {
   }
 });
 
-// Obtener todas las tareas
-app.get('/tareas', async (req, res) => {
+app.get('/api/tareas', authMiddleware, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM tareas');
+    const result = await pool.query(
+      'SELECT * FROM tareas WHERE usuario_id = $1 ORDER BY fecha DESC, hora DESC',
+      [req.user.id]
+    );
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Obtener tarea por id
-app.get('/tareas/:id', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM tareas WHERE id = $1', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Tarea no encontrada' });
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Actualizar tarea
-app.put('/tareas/:id', authMiddleware, async (req, res) => {
-  const { usuario_id, titulo, categoria, fecha, hora, frecuencia, completada } = req.body;
+app.get('/api/tareas/:id', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
-      'UPDATE tareas SET usuario_id = $1, titulo = $2, categoria = $3, fecha = $4, hora = $5, frecuencia = $6, completada = $7 WHERE id = $8 RETURNING *',
-      [usuario_id, titulo, categoria, fecha, hora, frecuencia, completada, req.params.id]
+      'SELECT * FROM tareas WHERE id = $1 AND usuario_id = $2',
+      [req.params.id, req.user.id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Tarea no encontrada' });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Tarea no encontrada' });
+    }
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Eliminar tarea
-app.delete('/tareas/:id', async (req, res) => {
+app.put('/api/tareas/:id', authMiddleware, async (req, res) => {
+  const { titulo, categoria, fecha, hora, frecuencia, completada } = req.body;
+  
   try {
-    const result = await pool.query('DELETE FROM tareas WHERE id = $1 RETURNING *', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Tarea no encontrada' });
+    const result = await pool.query(
+      'UPDATE tareas SET titulo = $1, categoria = $2, fecha = $3, hora = $4, frecuencia = $5, completada = $6 WHERE id = $7 AND usuario_id = $8 RETURNING *',
+      [titulo, categoria, fecha, hora, frecuencia, completada, req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Tarea no encontrada' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/tareas/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'DELETE FROM tareas WHERE id = $1 AND usuario_id = $2 RETURNING *',
+      [req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Tarea no encontrada' });
+    }
     res.json({ message: 'Tarea eliminada' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-//////////////////////////////// ENDPOINTS DE SÍNTOMAS /////////////////////
+// ========== SÍNTOMAS (PROTEGIDOS) ==========
 
-// Crear síntoma
-app.post('/sintomas', async (req, res) => {
-  const { usuario_id, nombre, intensidad, estado_animo, descripcion, fecha, hora } = req.body;
+app.post('/api/sintomas', authMiddleware, async (req, res) => {
+  const { nombre, intensidad, estado_animo, descripcion, fecha, hora } = req.body;
+  const usuario_id = req.user.id;
+  
   try {
     const result = await pool.query(
       'INSERT INTO sintomas (usuario_id, nombre, intensidad, estado_animo, descripcion, fecha, hora) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
@@ -336,58 +364,71 @@ app.post('/sintomas', async (req, res) => {
   }
 });
 
-// Obtener todos los síntomas
-app.get('/sintomas', async (req, res) => {
+app.get('/api/sintomas', authMiddleware, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM sintomas');
+    const result = await pool.query(
+      'SELECT * FROM sintomas WHERE usuario_id = $1 ORDER BY fecha DESC, hora DESC',
+      [req.user.id]
+    );
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Obtener síntoma por id
-app.get('/sintomas/:id', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM sintomas WHERE id = $1', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Síntoma no encontrado' });
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Actualizar síntoma
-app.put('/sintomas/:id', async (req, res) => {
-  const { usuario_id, nombre, intensidad, estado_animo, descripcion, fecha, hora } = req.body;
+app.get('/api/sintomas/:id', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
-      'UPDATE sintomas SET usuario_id = $1, nombre = $2, intensidad = $3, estado_animo = $4, descripcion = $5, fecha = $6, hora = $7 WHERE id = $8 RETURNING *',
-      [usuario_id, nombre, intensidad, estado_animo, descripcion, fecha, hora, req.params.id]
+      'SELECT * FROM sintomas WHERE id = $1 AND usuario_id = $2',
+      [req.params.id, req.user.id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Síntoma no encontrado' });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Síntoma no encontrado' });
+    }
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Eliminar síntoma
-app.delete('/sintomas/:id', async (req, res) => {
+app.put('/api/sintomas/:id', authMiddleware, async (req, res) => {
+  const { nombre, intensidad, estado_animo, descripcion, fecha, hora } = req.body;
+  
   try {
-    const result = await pool.query('DELETE FROM sintomas WHERE id = $1 RETURNING *', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Síntoma no encontrado' });
+    const result = await pool.query(
+      'UPDATE sintomas SET nombre = $1, intensidad = $2, estado_animo = $3, descripcion = $4, fecha = $5, hora = $6 WHERE id = $7 AND usuario_id = $8 RETURNING *',
+      [nombre, intensidad, estado_animo, descripcion, fecha, hora, req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Síntoma no encontrado' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/sintomas/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'DELETE FROM sintomas WHERE id = $1 AND usuario_id = $2 RETURNING *',
+      [req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Síntoma no encontrado' });
+    }
     res.json({ message: 'Síntoma eliminado' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-/////////////////////////////// ENDPOINTS DE CONTACTOS /////////////////////
+// ========== CONTACTOS (PROTEGIDOS) ==========
 
-// Crear contacto
-app.post('/contactos', async (req, res) => {
-  const { usuario_id, nombre, categoria, especialidad, telefono, email, direccion, notas } = req.body;
+app.post('/api/contactos', authMiddleware, async (req, res) => {
+  const { nombre, categoria, especialidad, telefono, email, direccion, notas } = req.body;
+  const usuario_id = req.user.id;
+  
   try {
     const result = await pool.query(
       'INSERT INTO contactos (usuario_id, nombre, categoria, especialidad, telefono, email, direccion, notas) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
@@ -399,76 +440,69 @@ app.post('/contactos', async (req, res) => {
   }
 });
 
-// Obtener todos los contactos
-app.get('/contactos', async (req, res) => {
+app.get('/api/contactos', authMiddleware, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM contactos');
+    const result = await pool.query(
+      'SELECT * FROM contactos WHERE usuario_id = $1 ORDER BY nombre ASC',
+      [req.user.id]
+    );
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Obtener contacto por id
-app.get('/contactos/:id', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM contactos WHERE id = $1', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Contacto no encontrado' });
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Actualizar contacto
-app.put('/contactos/:id', async (req, res) => {
-  const { usuario_id, nombre, categoria, especialidad, telefono, email, direccion, notas } = req.body;
+app.get('/api/contactos/:id', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
-      'UPDATE contactos SET usuario_id = $1, nombre = $2, categoria = $3, especialidad = $4, telefono = $5, email = $6, direccion = $7, notas = $8 WHERE id = $9 RETURNING *',
-      [usuario_id, nombre, categoria, especialidad, telefono, email, direccion, notas, req.params.id]
+      'SELECT * FROM contactos WHERE id = $1 AND usuario_id = $2',
+      [req.params.id, req.user.id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Contacto no encontrado' });
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Contacto no encontrado' });
+    }
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Eliminar contacto
-app.delete('/contactos/:id', authMiddleware, async (req, res) => {
+app.put('/api/contactos/:id', authMiddleware, async (req, res) => {
+  const { nombre, categoria, especialidad, telefono, email, direccion, notas } = req.body;
+  
   try {
-    const result = await pool.query('DELETE FROM contactos WHERE id = $1 RETURNING *', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Contacto no encontrado' });
+    const result = await pool.query(
+      'UPDATE contactos SET nombre = $1, categoria = $2, especialidad = $3, telefono = $4, email = $5, direccion = $6, notas = $7 WHERE id = $8 AND usuario_id = $9 RETURNING *',
+      [nombre, categoria, especialidad, telefono, email, direccion, notas, req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Contacto no encontrado' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/contactos/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'DELETE FROM contactos WHERE id = $1 AND usuario_id = $2 RETURNING *',
+      [req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Contacto no encontrado' });
+    }
     res.json({ message: 'Contacto eliminado' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-/////////////////////////////////////////////////////////////////////////////
-
-app.get('/', (req, res) => {
-  res.send('Backend funcionando para CuidaDiario!');
-});
-
-// Endpoint para probar la conexión a PostgreSQL
-app.get('/dbtest', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT NOW()');
-    res.json({ time: result.rows[0].now });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-//////////////////////// ESPACIO PARA MIGRACIONES////////////////////
-
-
-
-/////////////////////////////////////////////////////////////////////
+// ========== INICIAR SERVIDOR ==========
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Servidor escuchando en puerto ${PORT}`);
+  console.log(`✅ Servidor escuchando en puerto ${PORT}`);
+  console.log(`📍 http://localhost:${PORT}`);
 });
