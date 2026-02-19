@@ -79,6 +79,80 @@ app.get('/dbtest', async (req, res) => {
   }
 });
 
+
+
+//////////////////////// ESPACIO PARA MIGRACIONES////////////////////
+
+app.get('/migrate', async (req, res) => {
+  try {
+    // Tabla citas
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS citas (
+        id SERIAL PRIMARY KEY,
+        usuario_id INTEGER REFERENCES usuarios(id),
+        tipo VARCHAR(50),
+        titulo VARCHAR(255),
+        fecha DATE,
+        hora TIME,
+        lugar VARCHAR(255),
+        profesional VARCHAR(255),
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    // Tabla tareas
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS tareas (
+        id SERIAL PRIMARY KEY,
+        usuario_id INTEGER REFERENCES usuarios(id),
+        titulo VARCHAR(255) NOT NULL,
+        categoria VARCHAR(50),
+        frecuencia VARCHAR(50),
+        fecha DATE,
+        completada BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    // Tabla síntomas
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS sintomas (
+        id SERIAL PRIMARY KEY,
+        usuario_id INTEGER REFERENCES usuarios(id),
+        nombre VARCHAR(100),
+        intensidad INTEGER,
+        estado_animo VARCHAR(20),
+        descripcion TEXT,
+        fecha DATE,
+        hora TIME,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    // Tabla contactos
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS contactos (
+        id SERIAL PRIMARY KEY,
+        usuario_id INTEGER REFERENCES usuarios(id),
+        nombre VARCHAR(255) NOT NULL,
+        telefono VARCHAR(30),
+        email VARCHAR(255),
+        direccion VARCHAR(255),
+        categoria VARCHAR(50),
+        especialidad VARCHAR(100),
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    res.send('Migración completada.');
+  } catch (err) {
+    res.status(500).send('Error en migración: ' + err.message);
+  }
+});
+
+/////////////////////////////////////////////////////////////////////
+
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Servidor escuchando en puerto ${PORT}`);
