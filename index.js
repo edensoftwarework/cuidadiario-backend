@@ -6,6 +6,19 @@ const SALT_ROUNDS = 10;
 const jwt = require('jsonwebtoken');
 const JWT_SECRET = process.env.JWT_SECRET || 'tu_clave_secreta';
 
+function authMiddleware(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth) return res.status(401).json({ error: 'Token requerido' });
+
+  const token = auth.split(' ')[1];
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded; // Ahora puedes acceder a req.user.id en tus endpoints
+    next(); // Permite que la petición continúe
+  } catch (err) {
+    res.status(401).json({ error: 'Token inválido' });
+  }
+}
 
 app.use(express.json());
 
