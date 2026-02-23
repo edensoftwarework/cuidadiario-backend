@@ -12,66 +12,7 @@ app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
 
 // ========== MIGRACIÓN AUTOMÁTICA ==========
-async function runMigrations() {
-  try {
-    console.log('🔄 Ejecutando migraciones...');
 
-    // Renombrar columna nombre → tipo en sintomas (si todavía se llama nombre)
-    await pool.query(`
-      DO $$ BEGIN
-        IF EXISTS (
-          SELECT 1 FROM information_schema.columns
-          WHERE table_name='sintomas' AND column_name='nombre'
-        ) THEN
-          ALTER TABLE sintomas RENAME COLUMN nombre TO tipo;
-        END IF;
-      END $$;
-    `);
-
-    // Agregar columnas faltantes en tareas
-    await pool.query(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS descripcion TEXT`);
-    await pool.query(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS recordatorio BOOLEAN DEFAULT FALSE`);
-    await pool.query(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS hasta_fecha DATE`);
-
-    // Agregar columna faltante en medicamentos
-    await pool.query(`ALTER TABLE medicamentos ADD COLUMN IF NOT EXISTS horarios_custom TEXT`);
-
-    // Crear tabla signos_vitales (reemplaza localStorage)
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS signos_vitales (
-        id SERIAL PRIMARY KEY,
-        usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
-        tipo VARCHAR(50) NOT NULL,
-        valor DECIMAL(10,2),
-        sistolica INTEGER,
-        diastolica INTEGER,
-        notas TEXT,
-        fecha TIMESTAMP NOT NULL DEFAULT NOW(),
-        created_at TIMESTAMP DEFAULT NOW()
-      )
-    `);
-
-    // Crear tabla historial_medicamentos (reemplaza localStorage)
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS historial_medicamentos (
-        id SERIAL PRIMARY KEY,
-        usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE,
-        medicamento_id INTEGER,
-        medicamento_nombre VARCHAR(255) NOT NULL,
-        dosis VARCHAR(255),
-        notas TEXT,
-        fecha TIMESTAMP NOT NULL DEFAULT NOW(),
-        created_at TIMESTAMP DEFAULT NOW()
-      )
-    `);
-
-    console.log('✅ Migraciones completadas');
-  } catch (err) {
-    console.error('❌ Error en migraciones:', err.message);
-  }
-}
-
-runMigrations();
 
 // ========== MIDDLEWARE DE AUTENTICACIÓN ==========
 function authMiddleware(req, res, next) {
