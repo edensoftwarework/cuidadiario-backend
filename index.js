@@ -12,7 +12,7 @@ app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
 
 // ========== MIGRACIÓN AUTOMÁTICA ==========
-
+//
 
 // ========== MIDDLEWARE DE AUTENTICACIÓN ==========
 function authMiddleware(req, res, next) {
