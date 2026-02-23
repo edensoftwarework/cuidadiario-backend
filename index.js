@@ -12,7 +12,88 @@ app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
 
 // ========== MIGRACIÓN AUTOMÁTICA ==========
+async function runMigrations() {
+  try {
+    console.log('⏳ Ejecutando migraciones...');
 
+    // ----- Tabla de pacientes (NUEVA) -----
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS pacientes (
+        id           SERIAL PRIMARY KEY,
+        usuario_id   INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+        nombre       VARCHAR(100) NOT NULL,
+        relacion     VARCHAR(50),
+        fecha_nacimiento DATE,
+        notas        TEXT,
+        activo       BOOLEAN DEFAULT true,
+        created_at   TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // ----- Tabla signos_vitales -----
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS signos_vitales (
+        id           SERIAL PRIMARY KEY,
+        usuario_id   INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+        tipo         VARCHAR(50) NOT NULL,
+        valor        DECIMAL,
+        sistolica    INTEGER,
+        diastolica   INTEGER,
+        notas        TEXT,
+        fecha        TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // ----- Tabla historial_medicamentos -----
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS historial_medicamentos (
+        id                  SERIAL PRIMARY KEY,
+        usuario_id          INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+        medicamento_id      INTEGER,
+        medicamento_nombre  VARCHAR(100) NOT NULL,
+        dosis               VARCHAR(100),
+        notas               TEXT,
+        fecha               TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // ----- Columnas que pueden no existir en tablas previas -----
+    const safeAlter = async (sql) => pool.query(sql).catch(() => {});
+
+    // Columnas extra en tareas
+    await safeAlter(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS descripcion   TEXT`);
+    await safeAlter(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS recordatorio  BOOLEAN DEFAULT false`);
+    await safeAlter(`ALTER TABLE tareas ADD COLUMN IF NOT EXISTS hasta_fecha   DATE`);
+
+    // Columnas extra en medicamentos
+    await safeAlter(`ALTER TABLE medicamentos ADD COLUMN IF NOT EXISTS horarios_custom TEXT`);
+
+    // Renombrar sintomas.nombre → tipo si existe el nombre viejo
+    const colCheck = await pool.query(`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_name='sintomas' AND column_name='nombre'
+    `);
+    if (colCheck.rows.length > 0) {
+      await safeAlter(`ALTER TABLE sintomas RENAME COLUMN nombre TO tipo`);
+    }
+
+    // ----- Agregar paciente_id a todas las tablas clínicas -----
+    const clinicalTables = [
+      'medicamentos', 'citas', 'tareas', 'sintomas',
+      'contactos', 'signos_vitales', 'historial_medicamentos'
+    ];
+    for (const table of clinicalTables) {
+      await safeAlter(`
+        ALTER TABLE ${table}
+        ADD COLUMN IF NOT EXISTS paciente_id INTEGER REFERENCES pacientes(id) ON DELETE SET NULL
+      `);
+    }
+
+    console.log('✅ Migraciones completadas');
+  } catch (err) {
+    console.error('❌ Error en migraciones:', err.message);
+  }
+}
 
 // ========== MIDDLEWARE DE AUTENTICACIÓN ==========
 function authMiddleware(req, res, next) {
@@ -25,6 +106,12 @@ function authMiddleware(req, res, next) {
   } catch (err) {
     res.status(401).json({ error: 'Token inválido' });
   }
+}
+
+// Helper: parsea paciente_id de query o body, devuelve número o null
+function parsePacienteId(req) {
+  const v = req.query.paciente_id || req.body?.paciente_id || req.body?.pacienteId;
+  return v ? parseInt(v) : null;
 }
 
 // ========== ENDPOINTS PÚBLICOS ==========
@@ -80,19 +167,117 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
+// ========== PACIENTES (NUEVO) ==========
+
+// GET /api/pacientes — listar todos los pacientes del usuario
+app.get('/api/pacientes', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM pacientes WHERE usuario_id=$1 AND activo=true ORDER BY id ASC',
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/pacientes — crear paciente (máx 1 en free, ilimitado en premium)
+app.post('/api/pacientes', authMiddleware, async (req, res) => {
+  const { nombre, relacion, fecha_nacimiento, fechaNacimiento, notas } = req.body;
+  if (!nombre) return res.status(400).json({ error: 'El nombre es requerido' });
+  try {
+    // Verificar límite para usuarios free
+    const userResult = await pool.query('SELECT premium FROM usuarios WHERE id=$1', [req.user.id]);
+    const isPremium = userResult.rows[0]?.premium || false;
+
+    if (!isPremium) {
+      const count = await pool.query(
+        'SELECT COUNT(*) FROM pacientes WHERE usuario_id=$1 AND activo=true',
+        [req.user.id]
+      );
+      if (parseInt(count.rows[0].count) >= 1) {
+        return res.status(403).json({
+          error: 'La versión gratuita permite solo 1 paciente. Actualiza a Premium para agregar más.'
+        });
+      }
+    }
+
+    const result = await pool.query(
+      'INSERT INTO pacientes (usuario_id, nombre, relacion, fecha_nacimiento, notas) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+      [req.user.id, nombre, relacion || null, fecha_nacimiento || fechaNacimiento || null, notas || null]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /api/pacientes/:id — actualizar paciente
+app.put('/api/pacientes/:id', authMiddleware, async (req, res) => {
+  const { nombre, relacion, fecha_nacimiento, fechaNacimiento, notas } = req.body;
+  try {
+    const current = await pool.query(
+      'SELECT * FROM pacientes WHERE id=$1 AND usuario_id=$2',
+      [req.params.id, req.user.id]
+    );
+    if (current.rows.length === 0)
+      return res.status(404).json({ error: 'Paciente no encontrado' });
+    const p = current.rows[0];
+    const result = await pool.query(
+      'UPDATE pacientes SET nombre=$1, relacion=$2, fecha_nacimiento=$3, notas=$4 WHERE id=$5 AND usuario_id=$6 RETURNING *',
+      [
+        nombre           !== undefined ? nombre                                   : p.nombre,
+        relacion         !== undefined ? (relacion || null)                       : p.relacion,
+        fecha_nacimiento !== undefined ? (fecha_nacimiento || null)
+          : fechaNacimiento !== undefined ? (fechaNacimiento || null)             : p.fecha_nacimiento,
+        notas            !== undefined ? (notas || null)                          : p.notas,
+        req.params.id, req.user.id
+      ]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/pacientes/:id — baja lógica (activo=false)
+app.delete('/api/pacientes/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'UPDATE pacientes SET activo=false WHERE id=$1 AND usuario_id=$2 RETURNING *',
+      [req.params.id, req.user.id]
+    );
+    if (result.rows.length === 0)
+      return res.status(404).json({ error: 'Paciente no encontrado' });
+    res.json({ message: 'Paciente eliminado' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ========== MEDICAMENTOS ==========
 app.post('/api/medicamentos', authMiddleware, async (req, res) => {
-  // Acepta tanto camelCase (frontend) como snake_case
-  const { nombre, dosis, frecuencia, horaInicio, hora_inicio, recordatorio, notas, horariosCustom, horarios_custom } = req.body;
+  const {
+    nombre, dosis, frecuencia,
+    horaInicio, hora_inicio,
+    recordatorio, notas,
+    horariosCustom, horarios_custom,
+    paciente_id, pacienteId
+  } = req.body;
   const usuario_id = req.user.id;
   try {
     const result = await pool.query(
-      'INSERT INTO medicamentos (usuario_id, nombre, dosis, frecuencia, hora_inicio, recordatorio, notas, horarios_custom) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
-      [usuario_id, nombre, dosis, frecuencia,
+      'INSERT INTO medicamentos (usuario_id, paciente_id, nombre, dosis, frecuencia, hora_inicio, recordatorio, notas, horarios_custom) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
+      [
+        usuario_id,
+        paciente_id || pacienteId || null,
+        nombre, dosis, frecuencia,
         horaInicio || hora_inicio || null,
         recordatorio || false,
         notas || null,
-        horariosCustom || horarios_custom || null]
+        horariosCustom || horarios_custom || null
+      ]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -101,11 +286,11 @@ app.post('/api/medicamentos', authMiddleware, async (req, res) => {
 });
 
 app.get('/api/medicamentos', authMiddleware, async (req, res) => {
+  const paciente_id = req.query.paciente_id ? parseInt(req.query.paciente_id) : null;
   try {
-    const result = await pool.query(
-      'SELECT * FROM medicamentos WHERE usuario_id = $1 ORDER BY id DESC',
-      [req.user.id]
-    );
+    const result = paciente_id
+      ? await pool.query('SELECT * FROM medicamentos WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY id DESC', [req.user.id, paciente_id])
+      : await pool.query('SELECT * FROM medicamentos WHERE usuario_id=$1 ORDER BY id DESC', [req.user.id]);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -115,7 +300,7 @@ app.get('/api/medicamentos', authMiddleware, async (req, res) => {
 app.get('/api/medicamentos/:id', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT * FROM medicamentos WHERE id = $1 AND usuario_id = $2',
+      'SELECT * FROM medicamentos WHERE id=$1 AND usuario_id=$2',
       [req.params.id, req.user.id]
     );
     if (result.rows.length === 0)
@@ -131,12 +316,14 @@ app.put('/api/medicamentos/:id', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
       'UPDATE medicamentos SET nombre=$1, dosis=$2, frecuencia=$3, hora_inicio=$4, recordatorio=$5, notas=$6, horarios_custom=$7 WHERE id=$8 AND usuario_id=$9 RETURNING *',
-      [nombre, dosis, frecuencia,
+      [
+        nombre, dosis, frecuencia,
         horaInicio || hora_inicio || null,
         recordatorio,
         notas || null,
         horariosCustom || horarios_custom || null,
-        req.params.id, req.user.id]
+        req.params.id, req.user.id
+      ]
     );
     if (result.rows.length === 0)
       return res.status(404).json({ error: 'Medicamento no encontrado' });
@@ -162,12 +349,12 @@ app.delete('/api/medicamentos/:id', authMiddleware, async (req, res) => {
 
 // ========== CITAS ==========
 app.post('/api/citas', authMiddleware, async (req, res) => {
-  const { tipo, titulo, fecha, hora, lugar, profesional, notas, recordatorio } = req.body;
+  const { tipo, titulo, fecha, hora, lugar, profesional, notas, recordatorio, paciente_id, pacienteId } = req.body;
   const usuario_id = req.user.id;
   try {
     const result = await pool.query(
-      'INSERT INTO citas (usuario_id, tipo, titulo, fecha, hora, lugar, profesional, notas, recordatorio) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
-      [usuario_id, tipo, titulo, fecha, hora, lugar || null, profesional || null, notas || null, recordatorio || null]
+      'INSERT INTO citas (usuario_id, paciente_id, tipo, titulo, fecha, hora, lugar, profesional, notas, recordatorio) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
+      [usuario_id, paciente_id || pacienteId || null, tipo, titulo, fecha, hora, lugar || null, profesional || null, notas || null, recordatorio || null]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -176,11 +363,11 @@ app.post('/api/citas', authMiddleware, async (req, res) => {
 });
 
 app.get('/api/citas', authMiddleware, async (req, res) => {
+  const paciente_id = req.query.paciente_id ? parseInt(req.query.paciente_id) : null;
   try {
-    const result = await pool.query(
-      'SELECT * FROM citas WHERE usuario_id=$1 ORDER BY fecha DESC, hora DESC',
-      [req.user.id]
-    );
+    const result = paciente_id
+      ? await pool.query('SELECT * FROM citas WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY fecha DESC, hora DESC', [req.user.id, paciente_id])
+      : await pool.query('SELECT * FROM citas WHERE usuario_id=$1 ORDER BY fecha DESC, hora DESC', [req.user.id]);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -232,13 +419,22 @@ app.delete('/api/citas/:id', authMiddleware, async (req, res) => {
 
 // ========== TAREAS ==========
 app.post('/api/tareas', authMiddleware, async (req, res) => {
-  const { titulo, categoria, fecha, hora, frecuencia, completada, descripcion, recordatorio, hastaFecha, hasta_fecha } = req.body;
+  const {
+    titulo, categoria, fecha, hora, frecuencia, completada,
+    descripcion, recordatorio, hastaFecha, hasta_fecha,
+    paciente_id, pacienteId
+  } = req.body;
   const usuario_id = req.user.id;
   try {
     const result = await pool.query(
-      'INSERT INTO tareas (usuario_id, titulo, categoria, fecha, hora, frecuencia, completada, descripcion, recordatorio, hasta_fecha) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
-      [usuario_id, titulo, categoria, fecha, hora || null, frecuencia, completada || false,
-        descripcion || null, recordatorio || false, hastaFecha || hasta_fecha || null]
+      'INSERT INTO tareas (usuario_id, paciente_id, titulo, categoria, fecha, hora, frecuencia, completada, descripcion, recordatorio, hasta_fecha) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
+      [
+        usuario_id, paciente_id || pacienteId || null,
+        titulo, categoria, fecha,
+        hora || null, frecuencia, completada || false,
+        descripcion || null, recordatorio || false,
+        hastaFecha || hasta_fecha || null
+      ]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -247,11 +443,11 @@ app.post('/api/tareas', authMiddleware, async (req, res) => {
 });
 
 app.get('/api/tareas', authMiddleware, async (req, res) => {
+  const paciente_id = req.query.paciente_id ? parseInt(req.query.paciente_id) : null;
   try {
-    const result = await pool.query(
-      'SELECT * FROM tareas WHERE usuario_id=$1 ORDER BY fecha ASC, hora ASC',
-      [req.user.id]
-    );
+    const result = paciente_id
+      ? await pool.query('SELECT * FROM tareas WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY fecha ASC, hora ASC', [req.user.id, paciente_id])
+      : await pool.query('SELECT * FROM tareas WHERE usuario_id=$1 ORDER BY fecha ASC, hora ASC', [req.user.id]);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -272,10 +468,9 @@ app.get('/api/tareas/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// PUT con actualización parcial: solo se sobreescriben los campos que vienen en el body
+// PUT con actualización parcial: solo sobreescribe los campos que vienen en el body
 app.put('/api/tareas/:id', authMiddleware, async (req, res) => {
   try {
-    // Obtener datos actuales para no pisar campos con null
     const current = await pool.query(
       'SELECT * FROM tareas WHERE id=$1 AND usuario_id=$2',
       [req.params.id, req.user.id]
@@ -289,15 +484,15 @@ app.put('/api/tareas/:id', authMiddleware, async (req, res) => {
     const result = await pool.query(
       'UPDATE tareas SET titulo=$1, categoria=$2, fecha=$3, hora=$4, frecuencia=$5, completada=$6, descripcion=$7, recordatorio=$8, hasta_fecha=$9 WHERE id=$10 AND usuario_id=$11 RETURNING *',
       [
-        b.titulo     !== undefined ? b.titulo     : t.titulo,
-        b.categoria  !== undefined ? b.categoria  : t.categoria,
-        b.fecha      !== undefined ? b.fecha      : t.fecha,
-        b.hora       !== undefined ? (b.hora || null) : t.hora,
-        b.frecuencia !== undefined ? b.frecuencia : t.frecuencia,
-        b.completada !== undefined ? b.completada : t.completada,
-        b.descripcion !== undefined ? (b.descripcion || null) : t.descripcion,
-        b.recordatorio !== undefined ? b.recordatorio : t.recordatorio,
-        b.hastaFecha !== undefined ? (b.hastaFecha || null)
+        b.titulo      !== undefined ? b.titulo                 : t.titulo,
+        b.categoria   !== undefined ? b.categoria              : t.categoria,
+        b.fecha       !== undefined ? b.fecha                  : t.fecha,
+        b.hora        !== undefined ? (b.hora || null)         : t.hora,
+        b.frecuencia  !== undefined ? b.frecuencia             : t.frecuencia,
+        b.completada  !== undefined ? b.completada             : t.completada,
+        b.descripcion !== undefined ? (b.descripcion || null)  : t.descripcion,
+        b.recordatorio !== undefined ? b.recordatorio          : t.recordatorio,
+        b.hastaFecha  !== undefined ? (b.hastaFecha || null)
           : b.hasta_fecha !== undefined ? (b.hasta_fecha || null)
           : t.hasta_fecha,
         req.params.id, req.user.id
@@ -325,16 +520,18 @@ app.delete('/api/tareas/:id', authMiddleware, async (req, res) => {
 
 // ========== SÍNTOMAS ==========
 app.post('/api/sintomas', authMiddleware, async (req, res) => {
-  // Acepta tipo (frontend) y estadoAnimo (camelCase del frontend)
-  const { tipo, nombre, intensidad, estadoAnimo, estado_animo, descripcion, fecha } = req.body;
+  const { tipo, nombre, intensidad, estadoAnimo, estado_animo, descripcion, fecha, paciente_id, pacienteId } = req.body;
   const usuario_id = req.user.id;
   try {
     const result = await pool.query(
-      'INSERT INTO sintomas (usuario_id, tipo, intensidad, estado_animo, descripcion, fecha) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
-      [usuario_id, tipo || nombre, intensidad,
+      'INSERT INTO sintomas (usuario_id, paciente_id, tipo, intensidad, estado_animo, descripcion, fecha) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
+      [
+        usuario_id, paciente_id || pacienteId || null,
+        tipo || nombre, intensidad,
         estadoAnimo || estado_animo || null,
         descripcion || null,
-        fecha ? new Date(fecha) : new Date()]
+        fecha ? new Date(fecha) : new Date()
+      ]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -343,11 +540,11 @@ app.post('/api/sintomas', authMiddleware, async (req, res) => {
 });
 
 app.get('/api/sintomas', authMiddleware, async (req, res) => {
+  const paciente_id = req.query.paciente_id ? parseInt(req.query.paciente_id) : null;
   try {
-    const result = await pool.query(
-      'SELECT * FROM sintomas WHERE usuario_id=$1 ORDER BY fecha DESC',
-      [req.user.id]
-    );
+    const result = paciente_id
+      ? await pool.query('SELECT * FROM sintomas WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY fecha DESC', [req.user.id, paciente_id])
+      : await pool.query('SELECT * FROM sintomas WHERE usuario_id=$1 ORDER BY fecha DESC', [req.user.id]);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -373,11 +570,13 @@ app.put('/api/sintomas/:id', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
       'UPDATE sintomas SET tipo=$1, intensidad=$2, estado_animo=$3, descripcion=$4, fecha=$5 WHERE id=$6 AND usuario_id=$7 RETURNING *',
-      [tipo || nombre, intensidad,
+      [
+        tipo || nombre, intensidad,
         estadoAnimo || estado_animo || null,
         descripcion || null,
         fecha ? new Date(fecha) : new Date(),
-        req.params.id, req.user.id]
+        req.params.id, req.user.id
+      ]
     );
     if (result.rows.length === 0)
       return res.status(404).json({ error: 'Síntoma no encontrado' });
@@ -403,12 +602,12 @@ app.delete('/api/sintomas/:id', authMiddleware, async (req, res) => {
 
 // ========== CONTACTOS ==========
 app.post('/api/contactos', authMiddleware, async (req, res) => {
-  const { nombre, categoria, especialidad, telefono, email, direccion, notas } = req.body;
+  const { nombre, categoria, especialidad, telefono, email, direccion, notas, paciente_id, pacienteId } = req.body;
   const usuario_id = req.user.id;
   try {
     const result = await pool.query(
-      'INSERT INTO contactos (usuario_id, nombre, categoria, especialidad, telefono, email, direccion, notas) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
-      [usuario_id, nombre, categoria, especialidad || null, telefono, email || null, direccion || null, notas || null]
+      'INSERT INTO contactos (usuario_id, paciente_id, nombre, categoria, especialidad, telefono, email, direccion, notas) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
+      [usuario_id, paciente_id || pacienteId || null, nombre, categoria, especialidad || null, telefono, email || null, direccion || null, notas || null]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -417,11 +616,11 @@ app.post('/api/contactos', authMiddleware, async (req, res) => {
 });
 
 app.get('/api/contactos', authMiddleware, async (req, res) => {
+  const paciente_id = req.query.paciente_id ? parseInt(req.query.paciente_id) : null;
   try {
-    const result = await pool.query(
-      'SELECT * FROM contactos WHERE usuario_id=$1 ORDER BY nombre ASC',
-      [req.user.id]
-    );
+    const result = paciente_id
+      ? await pool.query('SELECT * FROM contactos WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY nombre ASC', [req.user.id, paciente_id])
+      : await pool.query('SELECT * FROM contactos WHERE usuario_id=$1 ORDER BY nombre ASC', [req.user.id]);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -473,12 +672,12 @@ app.delete('/api/contactos/:id', authMiddleware, async (req, res) => {
 
 // ========== SIGNOS VITALES ==========
 app.post('/api/signos-vitales', authMiddleware, async (req, res) => {
-  const { tipo, valor, sistolica, diastolica, notas, fecha } = req.body;
+  const { tipo, valor, sistolica, diastolica, notas, fecha, paciente_id, pacienteId } = req.body;
   const usuario_id = req.user.id;
   try {
     const result = await pool.query(
-      'INSERT INTO signos_vitales (usuario_id, tipo, valor, sistolica, diastolica, notas, fecha) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
-      [usuario_id, tipo, valor || null, sistolica || null, diastolica || null, notas || null, fecha ? new Date(fecha) : new Date()]
+      'INSERT INTO signos_vitales (usuario_id, paciente_id, tipo, valor, sistolica, diastolica, notas, fecha) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
+      [usuario_id, paciente_id || pacienteId || null, tipo, valor || null, sistolica || null, diastolica || null, notas || null, fecha ? new Date(fecha) : new Date()]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -487,11 +686,11 @@ app.post('/api/signos-vitales', authMiddleware, async (req, res) => {
 });
 
 app.get('/api/signos-vitales', authMiddleware, async (req, res) => {
+  const paciente_id = req.query.paciente_id ? parseInt(req.query.paciente_id) : null;
   try {
-    const result = await pool.query(
-      'SELECT * FROM signos_vitales WHERE usuario_id=$1 ORDER BY fecha DESC',
-      [req.user.id]
-    );
+    const result = paciente_id
+      ? await pool.query('SELECT * FROM signos_vitales WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY fecha DESC', [req.user.id, paciente_id])
+      : await pool.query('SELECT * FROM signos_vitales WHERE usuario_id=$1 ORDER BY fecha DESC', [req.user.id]);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -514,17 +713,25 @@ app.delete('/api/signos-vitales/:id', authMiddleware, async (req, res) => {
 
 // ========== HISTORIAL MEDICAMENTOS ==========
 app.post('/api/historial-medicamentos', authMiddleware, async (req, res) => {
-  const { medicamento_id, medicamentoId, medicamento_nombre, medicamentoNombre, dosis, notas, fecha } = req.body;
+  const {
+    medicamento_id, medicamentoId,
+    medicamento_nombre, medicamentoNombre,
+    dosis, notas, fecha,
+    paciente_id, pacienteId
+  } = req.body;
   const usuario_id = req.user.id;
   try {
     const result = await pool.query(
-      'INSERT INTO historial_medicamentos (usuario_id, medicamento_id, medicamento_nombre, dosis, notas, fecha) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
-      [usuario_id,
+      'INSERT INTO historial_medicamentos (usuario_id, paciente_id, medicamento_id, medicamento_nombre, dosis, notas, fecha) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
+      [
+        usuario_id,
+        paciente_id || pacienteId || null,
         medicamento_id || medicamentoId || null,
         medicamento_nombre || medicamentoNombre,
         dosis || null,
         notas || null,
-        fecha ? new Date(fecha) : new Date()]
+        fecha ? new Date(fecha) : new Date()
+      ]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -533,11 +740,11 @@ app.post('/api/historial-medicamentos', authMiddleware, async (req, res) => {
 });
 
 app.get('/api/historial-medicamentos', authMiddleware, async (req, res) => {
+  const paciente_id = req.query.paciente_id ? parseInt(req.query.paciente_id) : null;
   try {
-    const result = await pool.query(
-      'SELECT * FROM historial_medicamentos WHERE usuario_id=$1 ORDER BY fecha DESC LIMIT 100',
-      [req.user.id]
-    );
+    const result = paciente_id
+      ? await pool.query('SELECT * FROM historial_medicamentos WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY fecha DESC LIMIT 100', [req.user.id, paciente_id])
+      : await pool.query('SELECT * FROM historial_medicamentos WHERE usuario_id=$1 ORDER BY fecha DESC LIMIT 100', [req.user.id]);
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -560,7 +767,8 @@ app.delete('/api/historial-medicamentos/:id', authMiddleware, async (req, res) =
 
 // ========== INICIAR SERVIDOR ==========
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`✅ Servidor escuchando en puerto ${PORT}`);
   console.log(`📍 http://localhost:${PORT}`);
+  await runMigrations();
 });
