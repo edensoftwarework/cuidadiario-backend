@@ -819,6 +819,122 @@ app.get('/api/me', authMiddleware, async (req, res) => {
 
 
 
+
+
+
+
+// ========== PAYPAL ==========
+
+const PAYPAL_CLIENT_ID     = process.env.PAYPAL_CLIENT_ID;
+const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
+const PAYPAL_API_HOST      = 'api-m.paypal.com'; // Para sandbox: 'api-m.sandbox.paypal.com'
+
+// Helper: obtiene un Access Token de PayPal usando Client ID + Secret
+function getPayPalAccessToken() {
+    return new Promise((resolve, reject) => {
+        const https = require('https');
+        const credentials = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
+        const postData = 'grant_type=client_credentials';
+        const options = {
+            hostname: PAYPAL_API_HOST,
+            path: '/v1/oauth2/token',
+            method: 'POST',
+            headers: {
+                'Authorization': `Basic ${credentials}`,
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Content-Length': Buffer.byteLength(postData)
+            }
+        };
+        const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try { resolve(JSON.parse(data).access_token); }
+                catch (e) { reject(e); }
+            });
+        });
+        req.on('error', reject);
+        req.write(postData);
+        req.end();
+    });
+}
+
+// Helper: hace una llamada a la API de PayPal
+async function paypalRequest(path, method, body = null) {
+    const accessToken = await getPayPalAccessToken();
+    return new Promise((resolve, reject) => {
+        const https = require('https');
+        const options = {
+            hostname: PAYPAL_API_HOST,
+            path,
+            method,
+            headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Content-Type': 'application/json'
+            }
+        };
+        const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try { resolve({ status: res.statusCode, body: JSON.parse(data) }); }
+                catch (e) { resolve({ status: res.statusCode, body: data }); }
+            });
+        });
+        req.on('error', reject);
+        if (body) req.write(JSON.stringify(body));
+        req.end();
+    });
+}
+
+// POST /api/paypal/create-order — crea una orden de pago PayPal
+app.post('/api/paypal/create-order', authMiddleware, async (req, res) => {
+    try {
+        const { amount, currency } = req.body;
+        const result = await paypalRequest('/v2/checkout/orders', 'POST', {
+            intent: 'CAPTURE',
+            purchase_units: [{
+                amount: {
+                    currency_code: currency || 'USD',
+                    value: String(amount || '3.00')
+                },
+                description: 'CuidaDiario Premium'
+            }]
+        });
+        if (result.status !== 201) {
+            console.error('Error PayPal create-order:', result.body);
+            return res.status(400).json({ error: result.body?.message || 'Error al crear orden en PayPal' });
+        }
+        res.json({ orderID: result.body.id });
+    } catch (err) {
+        console.error('Error paypal/create-order:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/paypal/capture-order/:orderID — captura el pago y activa premium
+app.post('/api/paypal/capture-order/:orderID', authMiddleware, async (req, res) => {
+    try {
+        const { orderID } = req.params;
+        const result = await paypalRequest(`/v2/checkout/orders/${orderID}/capture`, 'POST');
+        if (result.status !== 201 && result.status !== 200) {
+            console.error('Error PayPal capture:', result.body);
+            return res.status(400).json({ error: result.body?.message || 'Error al capturar pago en PayPal' });
+        }
+        // Activar premium en la base de datos
+        await pool.query('UPDATE usuarios SET premium=$1 WHERE id=$2', [true, req.user.id]);
+        console.log(`[PayPal] Usuario ${req.user.id} → premium: true`);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error paypal/capture-order:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+
+
+
+
 // ========== INICIAR SERVIDOR ==========
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
