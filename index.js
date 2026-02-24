@@ -751,7 +751,7 @@ app.post('/api/create-subscription', authMiddleware, async (req, res) => {
             reason: 'CuidaDiario Premium',
             external_reference: String(req.user.id),
             payer_email: user.email,
-            back_url: 'https://cuidadiario.com.ar/pages/premium-success.html'
+            back_url: 'https://cuidadiario.edensoftwork.com/pages/premium-success.html'
         };
 
         const mp = await mpRequest('/preapproval', 'POST', payload);
