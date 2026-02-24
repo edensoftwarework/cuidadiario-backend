@@ -754,6 +754,8 @@ app.post('/api/create-subscription', authMiddleware, async (req, res) => {
             back_url: 'https://cuidadiario.edensoftwork.com/pages/premium-success.html'
         };
 
+        console.log('Payload MercadoPago:', payload); // <-- AGREGÁ ESTA LÍNEA
+
         const mp = await mpRequest('/preapproval', 'POST', payload);
 
         if (mp.status !== 200 && mp.status !== 201) {
