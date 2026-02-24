@@ -932,7 +932,19 @@ app.post('/api/paypal/capture-order/:orderID', authMiddleware, async (req, res) 
 });
 
 
-
+// POST /api/paypal/activate-subscription — activa premium al suscribirse por PayPal
+app.post('/api/paypal/activate-subscription', authMiddleware, async (req, res) => {
+    try {
+        const { subscriptionID } = req.body;
+        if (!subscriptionID) return res.status(400).json({ error: 'subscriptionID requerido' });
+        await pool.query('UPDATE usuarios SET premium=$1 WHERE id=$2', [true, req.user.id]);
+        console.log(`[PayPal Subscription] Usuario ${req.user.id} → premium: true (sub: ${subscriptionID})`);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Error activate-subscription:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
 
 
 // ========== INICIAR SERVIDOR ==========
