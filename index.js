@@ -702,7 +702,7 @@ app.delete('/api/historial-medicamentos/:id', authMiddleware, async (req, res) =
 // ========== MERCADOPAGO ==========
 
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-const MP_PLAN_ID      = process.env.MP_PLAN_ID;
+//const MP_PLAN_ID      = process.env.MP_PLAN_ID;
 
 // Helper para llamadas a la API de MercadoPago (compatible con Node 16+)
 function mpRequest(path, method = 'GET', body = null) {
@@ -739,11 +739,16 @@ app.post('/api/create-subscription', authMiddleware, async (req, res) => {
         const user = userResult.rows[0];
 
         const payload = {
-            preapproval_plan_id: MP_PLAN_ID,
             reason: 'CuidaDiario Premium',
-            external_reference: String(req.user.id),
+            auto_recurring: {
+                frequency: 1,
+                frequency_type: 'months',
+                transaction_amount: 4000,
+                currency_id: 'ARS'
+            },
+            back_url: 'https://cuidadiario.edensoftwork.com/pages/premium-success.html',
             payer_email: user.email,
-            back_url: 'https://cuidadiario.edensoftwork.com/pages/premium-success.html'
+            external_reference: String(req.user.id)
         };
 
         console.log('Payload MercadoPago:', payload);
