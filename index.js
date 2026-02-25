@@ -808,6 +808,42 @@ app.get('/api/me', authMiddleware, async (req, res) => {
     }
 });
 
+// PUT /api/profile — actualizar nombre, email y/o contraseña del usuario autenticado
+app.put('/api/profile', authMiddleware, async (req, res) => {
+    try {
+        const { nombre, email, password } = req.body;
+        if (!nombre || !email)
+            return res.status(400).json({ error: 'Nombre y email son requeridos' });
+
+        // Verificar que el email no esté en uso por otro usuario
+        const existing = await pool.query(
+            'SELECT id FROM usuarios WHERE email=$1 AND id!=$2',
+            [email, req.user.id]
+        );
+        if (existing.rows.length > 0)
+            return res.status(400).json({ error: 'El email ya está en uso por otra cuenta' });
+
+        let result;
+        if (password) {
+            const bcrypt = require('bcrypt');
+            const password_hash = await bcrypt.hash(password, 10);
+            result = await pool.query(
+                'UPDATE usuarios SET nombre=$1, email=$2, password_hash=$3 WHERE id=$4 RETURNING id, nombre, email, premium',
+                [nombre, email, password_hash, req.user.id]
+            );
+        } else {
+            result = await pool.query(
+                'UPDATE usuarios SET nombre=$1, email=$2 WHERE id=$3 RETURNING id, nombre, email, premium',
+                [nombre, email, req.user.id]
+            );
+        }
+
+        res.json({ mensaje: 'Perfil actualizado', usuario: result.rows[0] });
+    } catch (err) {
+        console.error('Error actualizando perfil:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
 
 // ========== PAYPAL ==========
 
