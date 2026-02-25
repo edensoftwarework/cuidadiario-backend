@@ -6,13 +6,27 @@ const SALT_ROUNDS = 10;
 const jwt = require('jsonwebtoken');
 const JWT_SECRET = process.env.JWT_SECRET || 'tu_clave_secreta';
 const cors = require('cors');
+const https = require('https'); // ← AGREGADO: necesario para PayPal webhook helpers
 
 // ========== CONFIGURACIÓN ==========
 app.use(cors({ origin: '*', credentials: true }));
+// IMPORTANTE: el webhook de PayPal necesita raw body, va ANTES de express.json()
+app.use('/api/paypal/webhook', express.raw({ type: 'application/json' })); // ← AGREGADO
 app.use(express.json());
 
 // ========== MIGRACIÓN AUTOMÁTICA ==========
-//
+// ← AGREGADO: agrega columna paypal_subscription_id si no existe (idempotente)
+async function runMigrations() {
+  try {
+    await pool.query(`
+      ALTER TABLE usuarios
+      ADD COLUMN IF NOT EXISTS paypal_subscription_id VARCHAR(64)
+    `);
+    console.log('✅ Migraciones completadas');
+  } catch (err) {
+    console.error('❌ Error en migraciones:', err.message);
+  }
+}
 
 // ========== MIDDLEWARE DE AUTENTICACIÓN ==========
 function authMiddleware(req, res, next) {
@@ -685,27 +699,6 @@ app.delete('/api/historial-medicamentos/:id', authMiddleware, async (req, res) =
 });
 
 
-
-
-
-
-
-
-
-
-
-
-/**
- * BACKEND_MP_CODE.js
- * ==================
- * Pegá este código en tu index.js de Railway,
- * ANTES de la sección "// ========== INICIAR SERVIDOR =========="
- *
- * También agregá estas variables de entorno en Railway:
- *   MP_ACCESS_TOKEN = TEST-2169653944930562-022412-694c4aa1355c2f010d1d313463a1dc43-340181145
- *   MP_PLAN_ID      = 7d77b92de140451383e4588766e9e4ba
- */
-
 // ========== MERCADOPAGO ==========
 
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
@@ -714,7 +707,6 @@ const MP_PLAN_ID      = process.env.MP_PLAN_ID;
 // Helper para llamadas a la API de MercadoPago (compatible con Node 16+)
 function mpRequest(path, method = 'GET', body = null) {
     return new Promise((resolve, reject) => {
-        const https = require('https');
         const options = {
             hostname: 'api.mercadopago.com',
             path,
@@ -754,7 +746,7 @@ app.post('/api/create-subscription', authMiddleware, async (req, res) => {
             back_url: 'https://cuidadiario.edensoftwork.com/pages/premium-success.html'
         };
 
-        console.log('Payload MercadoPago:', payload); // <-- AGREGÁ ESTA LÍNEA
+        console.log('Payload MercadoPago:', payload);
 
         const mp = await mpRequest('/preapproval', 'POST', payload);
 
@@ -775,7 +767,6 @@ app.post('/api/webhook/mercadopago', async (req, res) => {
     try {
         const { type, data } = req.body;
 
-        // MercadoPago envía type: "subscription_preapproval" cuando cambia el estado
         if (type === 'subscription_preapproval' && data?.id) {
             const mp = await mpRequest(`/preapproval/${data.id}`);
 
@@ -783,7 +774,6 @@ app.post('/api/webhook/mercadopago', async (req, res) => {
                 const preapproval = mp.body;
                 const userId = parseInt(preapproval.external_reference);
                 if (userId && !isNaN(userId)) {
-                    // "authorized" = activo, "paused" / "cancelled" = inactivo
                     const isPremium = preapproval.status === 'authorized';
                     await pool.query('UPDATE usuarios SET premium=$1 WHERE id=$2', [isPremium, userId]);
                     console.log(`[MP Webhook] Usuario ${userId} → premium: ${isPremium} (estado: ${preapproval.status})`);
@@ -791,7 +781,6 @@ app.post('/api/webhook/mercadopago', async (req, res) => {
             }
         }
 
-        // Siempre responder 200 para evitar reintentos innecesarios de MP
         res.sendStatus(200);
     } catch (err) {
         console.error('[MP Webhook] Error:', err.message);
@@ -799,7 +788,7 @@ app.post('/api/webhook/mercadopago', async (req, res) => {
     }
 });
 
-// GET /api/me — obtener datos actuales del usuario autenticado (usado por premium-success.html)
+// GET /api/me — obtener datos actuales del usuario autenticado
 app.get('/api/me', authMiddleware, async (req, res) => {
     try {
         const result = await pool.query(
@@ -808,31 +797,26 @@ app.get('/api/me', authMiddleware, async (req, res) => {
         );
         if (result.rows.length === 0)
             return res.status(404).json({ error: 'Usuario no encontrado' });
-        res.json(result.rows[0]);
+        res.json({ usuario: result.rows[0] }); // ← MODIFICADO: envuelto en { usuario: ... }
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
 
-
-
-
-
-
-
-
-
 // ========== PAYPAL ==========
 
 const PAYPAL_CLIENT_ID     = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
-const PAYPAL_API_HOST      = 'api-m.paypal.com'; // Para sandbox: 'api-m.sandbox.paypal.com'
+// ← MODIFICADO: usa PAYPAL_MODE para soportar sandbox y live
+const PAYPAL_MODE    = process.env.PAYPAL_MODE || 'sandbox';
+const PAYPAL_API_HOST = PAYPAL_MODE === 'live'
+    ? 'api-m.paypal.com'
+    : 'api-m.sandbox.paypal.com';
 
 // Helper: obtiene un Access Token de PayPal usando Client ID + Secret
 function getPayPalAccessToken() {
     return new Promise((resolve, reject) => {
-        const https = require('https');
         const credentials = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64');
         const postData = 'grant_type=client_credentials';
         const options = {
@@ -863,7 +847,6 @@ function getPayPalAccessToken() {
 async function paypalRequest(path, method, body = null) {
     const accessToken = await getPayPalAccessToken();
     return new Promise((resolve, reject) => {
-        const https = require('https');
         const options = {
             hostname: PAYPAL_API_HOST,
             path,
@@ -921,7 +904,6 @@ app.post('/api/paypal/capture-order/:orderID', authMiddleware, async (req, res) 
             console.error('Error PayPal capture:', result.body);
             return res.status(400).json({ error: result.body?.message || 'Error al capturar pago en PayPal' });
         }
-        // Activar premium en la base de datos
         await pool.query('UPDATE usuarios SET premium=$1 WHERE id=$2', [true, req.user.id]);
         console.log(`[PayPal] Usuario ${req.user.id} → premium: true`);
         res.json({ success: true });
@@ -931,18 +913,62 @@ app.post('/api/paypal/capture-order/:orderID', authMiddleware, async (req, res) 
     }
 });
 
-
 // POST /api/paypal/activate-subscription — activa premium al suscribirse por PayPal
 app.post('/api/paypal/activate-subscription', authMiddleware, async (req, res) => {
     try {
         const { subscriptionID } = req.body;
         if (!subscriptionID) return res.status(400).json({ error: 'subscriptionID requerido' });
-        await pool.query('UPDATE usuarios SET premium=$1 WHERE id=$2', [true, req.user.id]);
+        // ← MODIFICADO: guarda también el subscriptionID para poder dar de baja por webhook
+        await pool.query(
+            'UPDATE usuarios SET premium=$1, paypal_subscription_id=$2 WHERE id=$3',
+            [true, subscriptionID, req.user.id]
+        );
         console.log(`[PayPal Subscription] Usuario ${req.user.id} → premium: true (sub: ${subscriptionID})`);
         res.json({ success: true });
     } catch (err) {
         console.error('Error activate-subscription:', err);
         res.status(500).json({ error: err.message });
+    }
+});
+
+// ← AGREGADO: webhook de PayPal para cancelaciones automáticas
+// POST /api/paypal/webhook — maneja BILLING.SUBSCRIPTION.CANCELLED / SUSPENDED / EXPIRED
+app.post('/api/paypal/webhook', async (req, res) => {
+    try {
+        // El middleware express.raw() ya capturó el body crudo
+        const rawBody = req.body;
+        const event = JSON.parse(
+            Buffer.isBuffer(rawBody) ? rawBody.toString() : rawBody
+        );
+
+        console.log('🔔 PayPal webhook recibido:', event.event_type, event.id);
+
+        const CANCEL_EVENTS = [
+            'BILLING.SUBSCRIPTION.CANCELLED',
+            'BILLING.SUBSCRIPTION.SUSPENDED',
+            'BILLING.SUBSCRIPTION.EXPIRED'
+        ];
+
+        if (CANCEL_EVENTS.includes(event.event_type)) {
+            const subscriptionId = event.resource?.id;
+            if (subscriptionId) {
+                const result = await pool.query(
+                    'UPDATE usuarios SET premium=FALSE WHERE paypal_subscription_id=$1 RETURNING id, email',
+                    [subscriptionId]
+                );
+                if (result.rows.length > 0) {
+                    console.log(`🔻 Premium desactivado para usuario ${result.rows[0].id} (${result.rows[0].email}) — ${event.event_type}`);
+                } else {
+                    console.warn(`⚠️ Ningún usuario encontrado para subscription ${subscriptionId}`);
+                }
+            }
+        }
+
+        // Siempre responder 200 para que PayPal no reintente
+        res.status(200).json({ received: true });
+    } catch (err) {
+        console.error('Error procesando PayPal webhook:', err);
+        res.status(200).json({ received: true });
     }
 });
 
@@ -952,5 +978,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`✅ Servidor escuchando en puerto ${PORT}`);
   console.log(`📍 http://localhost:${PORT}`);
-  //await runMigrations();
+  console.log(`💳 PayPal mode: ${PAYPAL_MODE}`);
+  await runMigrations(); // ← MODIFICADO: descomentado para agregar columna paypal_subscription_id
 });
