@@ -107,6 +107,16 @@ function parsePacienteId(req) {
     return v ? parseInt(v) : null;
 }
 
+// Helper: verifica que el paciente pertenece al usuario autenticado
+async function validatePaciente(pacienteId, usuarioId) {
+    if (!pacienteId) return true;
+    const result = await pool.query(
+        'SELECT id FROM pacientes WHERE id=$1 AND usuario_id=$2 AND activo=true',
+        [pacienteId, usuarioId]
+    );
+    return result.rows.length > 0;
+}
+
 // ========== ENDPOINTS PÚBLICOS ==========
 app.get('/', (req, res) => res.send('Backend funcionando para CuidaDiario!'));
 app.get('/api/test', (req, res) => res.json({ status: 'ok', message: 'Backend funcionando correctamente' }));
@@ -238,10 +248,13 @@ app.delete('/api/pacientes/:id', authMiddleware, async (req, res) => {
 // ========== MEDICAMENTOS ==========
 app.post('/api/medicamentos', authMiddleware, async (req, res) => {
     const { nombre, dosis, frecuencia, horaInicio, hora_inicio, recordatorio, notas, horariosCustom, horarios_custom, paciente_id, pacienteId } = req.body;
+    const pid = paciente_id || pacienteId || null;
     try {
+        if (pid && !(await validatePaciente(pid, req.user.id)))
+            return res.status(403).json({ error: 'El paciente no pertenece a este usuario' });
         const result = await pool.query(
             'INSERT INTO medicamentos (usuario_id, paciente_id, nombre, dosis, frecuencia, hora_inicio, recordatorio, notas, horarios_custom) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
-            [req.user.id, paciente_id || pacienteId || null, nombre, dosis, frecuencia, horaInicio || hora_inicio || null, recordatorio || false, notas || null, horariosCustom || horarios_custom || null]
+            [req.user.id, pid, nombre, dosis, frecuencia, horaInicio || hora_inicio || null, recordatorio || false, notas || null, horariosCustom || horarios_custom || null]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -298,10 +311,13 @@ app.delete('/api/medicamentos/:id', authMiddleware, async (req, res) => {
 // ========== CITAS ==========
 app.post('/api/citas', authMiddleware, async (req, res) => {
     const { tipo, titulo, fecha, hora, lugar, profesional, notas, recordatorio, paciente_id, pacienteId } = req.body;
+    const pid = paciente_id || pacienteId || null;
     try {
+        if (pid && !(await validatePaciente(pid, req.user.id)))
+            return res.status(403).json({ error: 'El paciente no pertenece a este usuario' });
         const result = await pool.query(
             'INSERT INTO citas (usuario_id, paciente_id, tipo, titulo, fecha, hora, lugar, profesional, notas, recordatorio) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
-            [req.user.id, paciente_id || pacienteId || null, tipo, titulo, fecha, hora, lugar || null, profesional || null, notas || null, recordatorio || null]
+            [req.user.id, pid, tipo, titulo, fecha, hora, lugar || null, profesional || null, notas || null, recordatorio || null]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -358,10 +374,13 @@ app.delete('/api/citas/:id', authMiddleware, async (req, res) => {
 // ========== TAREAS ==========
 app.post('/api/tareas', authMiddleware, async (req, res) => {
     const { titulo, categoria, fecha, hora, frecuencia, completada, descripcion, recordatorio, hastaFecha, hasta_fecha, paciente_id, pacienteId } = req.body;
+    const pid = paciente_id || pacienteId || null;
     try {
+        if (pid && !(await validatePaciente(pid, req.user.id)))
+            return res.status(403).json({ error: 'El paciente no pertenece a este usuario' });
         const result = await pool.query(
             'INSERT INTO tareas (usuario_id, paciente_id, titulo, categoria, fecha, hora, frecuencia, completada, descripcion, recordatorio, hasta_fecha) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
-            [req.user.id, paciente_id || pacienteId || null, titulo, categoria, fecha, hora || null, frecuencia, completada || false, descripcion || null, recordatorio || false, hastaFecha || hasta_fecha || null]
+            [req.user.id, pid, titulo, categoria, fecha, hora || null, frecuencia, completada || false, descripcion || null, recordatorio || false, hastaFecha || hasta_fecha || null]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -432,10 +451,13 @@ app.delete('/api/tareas/:id', authMiddleware, async (req, res) => {
 // ========== SÍNTOMAS ==========
 app.post('/api/sintomas', authMiddleware, async (req, res) => {
     const { tipo, nombre, intensidad, estadoAnimo, estado_animo, descripcion, fecha, paciente_id, pacienteId } = req.body;
+    const pid = paciente_id || pacienteId || null;
     try {
+        if (pid && !(await validatePaciente(pid, req.user.id)))
+            return res.status(403).json({ error: 'El paciente no pertenece a este usuario' });
         const result = await pool.query(
             'INSERT INTO sintomas (usuario_id, paciente_id, tipo, intensidad, estado_animo, descripcion, fecha) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
-            [req.user.id, paciente_id || pacienteId || null, tipo || nombre, intensidad, estadoAnimo || estado_animo || null, descripcion || null, fecha ? new Date(fecha) : new Date()]
+            [req.user.id, pid, tipo || nombre, intensidad, estadoAnimo || estado_animo || null, descripcion || null, fecha ? new Date(fecha) : new Date()]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -492,10 +514,13 @@ app.delete('/api/sintomas/:id', authMiddleware, async (req, res) => {
 // ========== CONTACTOS ==========
 app.post('/api/contactos', authMiddleware, async (req, res) => {
     const { nombre, categoria, especialidad, telefono, email, direccion, notas, paciente_id, pacienteId } = req.body;
+    const pid = paciente_id || pacienteId || null;
     try {
+        if (pid && !(await validatePaciente(pid, req.user.id)))
+            return res.status(403).json({ error: 'El paciente no pertenece a este usuario' });
         const result = await pool.query(
             'INSERT INTO contactos (usuario_id, paciente_id, nombre, categoria, especialidad, telefono, email, direccion, notas) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
-            [req.user.id, paciente_id || pacienteId || null, nombre, categoria, especialidad || null, telefono, email || null, direccion || null, notas || null]
+            [req.user.id, pid, nombre, categoria, especialidad || null, telefono, email || null, direccion || null, notas || null]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -552,10 +577,13 @@ app.delete('/api/contactos/:id', authMiddleware, async (req, res) => {
 // ========== SIGNOS VITALES ==========
 app.post('/api/signos-vitales', authMiddleware, async (req, res) => {
     const { tipo, valor, sistolica, diastolica, notas, fecha, paciente_id, pacienteId } = req.body;
+    const pid = paciente_id || pacienteId || null;
     try {
+        if (pid && !(await validatePaciente(pid, req.user.id)))
+            return res.status(403).json({ error: 'El paciente no pertenece a este usuario' });
         const result = await pool.query(
             'INSERT INTO signos_vitales (usuario_id, paciente_id, tipo, valor, sistolica, diastolica, notas, fecha) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
-            [req.user.id, paciente_id || pacienteId || null, tipo, valor || null, sistolica || null, diastolica || null, notas || null, fecha ? new Date(fecha) : new Date()]
+            [req.user.id, pid, tipo, valor || null, sistolica || null, diastolica || null, notas || null, fecha ? new Date(fecha) : new Date()]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -588,10 +616,13 @@ app.delete('/api/signos-vitales/:id', authMiddleware, async (req, res) => {
 // ========== HISTORIAL MEDICAMENTOS ==========
 app.post('/api/historial-medicamentos', authMiddleware, async (req, res) => {
     const { medicamento_id, medicamentoId, medicamento_nombre, medicamentoNombre, dosis, notas, fecha, paciente_id, pacienteId } = req.body;
+    const pid = paciente_id || pacienteId || null;
     try {
+        if (pid && !(await validatePaciente(pid, req.user.id)))
+            return res.status(403).json({ error: 'El paciente no pertenece a este usuario' });
         const result = await pool.query(
             'INSERT INTO historial_medicamentos (usuario_id, paciente_id, medicamento_id, medicamento_nombre, dosis, notas, fecha) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
-            [req.user.id, paciente_id || pacienteId || null, medicamento_id || medicamentoId || null, medicamento_nombre || medicamentoNombre, dosis || null, notas || null, fecha ? new Date(fecha) : new Date()]
+            [req.user.id, pid, medicamento_id || medicamentoId || null, medicamento_nombre || medicamentoNombre, dosis || null, notas || null, fecha ? new Date(fecha) : new Date()]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
