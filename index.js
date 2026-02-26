@@ -254,7 +254,7 @@ app.post('/api/forgot-password', async (req, res) => {
 
         if (emailTransporter) {
             await emailTransporter.sendMail({
-                from: `"CuidaDiario" <${SMTP_FROM}>`,
+                from: SMTP_FROM.includes('<') ? SMTP_FROM : `"CuidaDiario" <${SMTP_FROM}>`,
                 to: email,
                 subject: '🔑 Restablecer contraseña — CuidaDiario',
                 html: `
@@ -893,20 +893,29 @@ function startPushReminders() {
                 });
             }
 
-            // ── 2. Citas con recordatorio que son mañana ──
-            const tomorrowStr = new Date(now.getTime() + 86400000).toISOString().split('T')[0];
+            // ── 2. Citas cuyo recordatorio vence en los próximos 20 minutos ──
+            // c.recordatorio = minutos antes de la cita (ej: '30', '60', '1440')
             const citas = await pool.query(`
-                SELECT c.usuario_id, c.titulo, c.fecha, c.hora, c.lugar
+                SELECT c.usuario_id, c.titulo, c.fecha, c.hora, c.recordatorio, c.lugar
                 FROM citas c
                 INNER JOIN push_subscriptions ps ON ps.usuario_id = c.usuario_id
                 WHERE c.recordatorio IS NOT NULL
-                  AND c.fecha = $1
-            `, [tomorrowStr]);
+                  AND c.recordatorio <> '0'
+                  AND c.hora IS NOT NULL
+                  AND (c.fecha || ' ' || c.hora)::timestamp AT TIME ZONE 'America/Argentina/Buenos_Aires'
+                      - (CAST(c.recordatorio AS integer) * INTERVAL '1 minute')
+                      BETWEEN NOW() AND NOW() + INTERVAL '20 minutes'
+            `);
             for (const cita of citas.rows) {
+                const mins = parseInt(cita.recordatorio);
+                const tiempoTexto = mins < 60 ? `en ${mins} min`
+                    : mins === 60 ? 'en 1 hora'
+                    : mins === 1440 ? 'mañana'
+                    : `en ${Math.round(mins / 60)}h`;
                 await sendPushToUser(cita.usuario_id, {
-                    title: '📅 Cita médica mañana',
-                    body: `${cita.titulo}${cita.hora ? ' a las ' + cita.hora : ''}${cita.lugar ? ' en ' + cita.lugar : ''}`,
-                    tag: `cita-${cita.usuario_id}-${tomorrowStr}`,
+                    title: '📅 Recordatorio de cita',
+                    body: `${cita.titulo} — ${tiempoTexto}${cita.lugar ? ' en ' + cita.lugar : ''}`,
+                    tag: `cita-${cita.usuario_id}-${cita.fecha}-${cita.hora}`,
                     url: '/'
                 });
             }
@@ -938,8 +947,8 @@ function startPushReminders() {
     }
 
     checkAndSendReminders(); // correr al arrancar
-    setInterval(checkAndSendReminders, 60 * 60 * 1000); // cada 1 hora
-    console.log('✅ Push reminders iniciados (chequeo cada hora)');
+    setInterval(checkAndSendReminders, 15 * 60 * 1000); // cada 15 minutos
+    console.log('✅ Push reminders iniciados (chequeo cada 15 minutos)');
 }
 
 // ========== MERCADOPAGO ==========
