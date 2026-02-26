@@ -69,8 +69,11 @@ const FRONTEND_URL  = (process.env.FRONTEND_URL || '').replace(/\/$/, ''); // si
 let emailTransporter = null;
 if (SMTP_USER && SMTP_PASS) {
     emailTransporter = nodemailer.createTransport({
-        service: 'gmail',   // Cambiá a 'outlook', 'yahoo', etc. si usás otro proveedor
-        auth: { user: SMTP_USER, pass: SMTP_PASS }
+        host: 'smtp.gmail.com',
+        port: 587,
+        secure: false,      // STARTTLS — funciona en Railway (puerto 465 puede estar bloqueado)
+        auth: { user: SMTP_USER, pass: SMTP_PASS },
+        tls: { rejectUnauthorized: false }  // evita errores de certificado en algunos entornos
     });
     console.log('✅ Nodemailer (SMTP Gmail) configurado');
 } else {
@@ -881,8 +884,8 @@ function startPushReminders() {
                 WHERE m.recordatorio = true
                   AND m.hora_inicio IS NOT NULL
                   AND m.hora_inicio BETWEEN
-                      TO_CHAR(NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires', 'HH24:MI')
-                      AND TO_CHAR((NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires' + INTERVAL '35 minutes'), 'HH24:MI')
+                      (NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')::TIME
+                      AND ((NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires') + INTERVAL '35 minutes')::TIME
             `);
             for (const med of meds.rows) {
                 await sendPushToUser(med.usuario_id, {
