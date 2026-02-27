@@ -1008,6 +1008,7 @@ function startPushReminders() {
                 INNER JOIN usuarios u ON u.id = m.usuario_id
                 WHERE m.recordatorio = true
                   AND m.hora_inicio IS NOT NULL
+                  AND m.hora_inicio <> ''
             `);
 
             for (const med of allMeds.rows) {
@@ -1040,6 +1041,7 @@ function startPushReminders() {
                 WHERE c.recordatorio IS NOT NULL
                   AND c.recordatorio <> '0'
                   AND c.hora IS NOT NULL
+                  AND c.hora <> ''
                   AND (c.fecha || ' ' || c.hora)::timestamp
                       - (CAST(c.recordatorio AS integer) * INTERVAL '1 minute')
                       BETWEEN (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))::timestamp
