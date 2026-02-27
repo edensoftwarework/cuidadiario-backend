@@ -911,33 +911,96 @@ function startPushReminders() {
         return;
     }
 
+    // Helpers de tiempo para Argentina
+    function nowAR() {
+        // Devuelve un Date ajustado a UTC-3 (America/Argentina/Buenos_Aires)
+        const d = new Date();
+        // Calculamos el offset real del servidor y lo normalizamos a -3h
+        const utc = d.getTime() + d.getTimezoneOffset() * 60000;
+        return new Date(utc - 3 * 3600000);
+    }
+
+    // Genera todos los horarios del día para un medicamento según su frecuencia
+    function getMedHorarios(med) {
+        if (!med.hora_inicio) return [];
+
+        // Horarios personalizados (ej: "08:00,14:00,20:00")
+        if (med.frecuencia === 'custom' && med.horarios_custom) {
+            return med.horarios_custom.split(',').map(h => h.trim()).filter(Boolean);
+        }
+
+        const frecuencias = {
+            'cada-4h': 4, 'cada-6h': 6, 'cada-8h': 8, 'cada-12h': 12, 'diaria': 24
+        };
+        const intervaloHoras = frecuencias[med.frecuencia] || 24;
+
+        // hora_inicio puede venir como "HH:MM:SS" o "HH:MM"
+        const [hStr, mStr] = med.hora_inicio.split(':');
+        const horaInicio = parseInt(hStr);
+        const minInicio  = parseInt(mStr);
+
+        const horarios = [];
+        let h = horaInicio;
+        while (h < 24) {
+            horarios.push(`${String(h).padStart(2,'0')}:${String(minInicio).padStart(2,'0')}`);
+            h += intervaloHoras;
+        }
+        return horarios;
+    }
+
+    // Comprueba si alguno de los horarios cae dentro de la ventana [now, now+windowMin]
+    function esDentroVentana(horarios, nowAR, windowMin = 12) {
+        const nowMinutes = nowAR.getHours() * 60 + nowAR.getMinutes();
+        return horarios.some(h => {
+            const [hh, mm] = h.split(':').map(Number);
+            const medMinutes = hh * 60 + mm;
+            return medMinutes >= nowMinutes && medMinutes < nowMinutes + windowMin;
+        });
+    }
+
     async function checkAndSendReminders() {
         try {
-            const now = new Date();
-            const nowHHMM = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
-            const todayStr = now.toISOString().split('T')[0];
+            const now    = new Date();
+            const ar     = nowAR();
+            const nowHHMM = `${String(ar.getHours()).padStart(2,'0')}:${String(ar.getMinutes()).padStart(2,'0')}`;
+            const todayStr = `${ar.getFullYear()}-${String(ar.getMonth()+1).padStart(2,'0')}-${String(ar.getDate()).padStart(2,'0')}`;
 
-            // ── 1. Medicamentos con recordatorio=true y hora próxima (±35 min) ──
-            const meds = await pool.query(`
-                SELECT m.usuario_id, m.nombre, m.dosis, m.hora_inicio
+            // ── 1. Medicamentos con recordatorio=true ──
+            // Traemos TODOS los medicamentos con recordatorio activo y suscripción push.
+            // Luego calculamos en JS todos sus horarios del día (según frecuencia) y
+            // enviamos notificación si alguno cae en los próximos 12 minutos.
+            const allMeds = await pool.query(`
+                SELECT DISTINCT ON (m.id) m.usuario_id, m.nombre, m.dosis,
+                       m.hora_inicio, m.frecuencia, m.horarios_custom
                 FROM medicamentos m
                 INNER JOIN push_subscriptions ps ON ps.usuario_id = m.usuario_id
                 WHERE m.recordatorio = true
                   AND m.hora_inicio IS NOT NULL
-                  AND m.hora_inicio BETWEEN
-                      (NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')::TIME
-                      AND ((NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires') + INTERVAL '35 minutes')::TIME
             `);
-            for (const med of meds.rows) {
+
+            for (const med of allMeds.rows) {
+                const horarios = getMedHorarios(med);
+                if (!horarios.length) continue;
+
+                // Buscamos el horario exacto que está en ventana
+                const arNow = nowAR();
+                const arMin = arNow.getHours() * 60 + arNow.getMinutes();
+                const horaMatch = horarios.find(h => {
+                    const [hh, mm] = h.split(':').map(Number);
+                    const medMin = hh * 60 + mm;
+                    return medMin >= arMin && medMin < arMin + 12;
+                });
+                if (!horaMatch) continue;
+
                 await sendPushToUser(med.usuario_id, {
                     title: '💊 Recordatorio de medicamento',
-                    body: `${med.nombre} — ${med.dosis} a las ${med.hora_inicio}`,
-                    tag: `med-${med.usuario_id}-${med.nombre}`,
+                    body: `${med.nombre} — ${med.dosis} a las ${horaMatch}`,
+                    tag: `med-${med.usuario_id}-${med.nombre}-${horaMatch}`,
                     url: '/'
                 });
             }
 
-            // ── 2. Citas cuyo recordatorio vence en los próximos 20 minutos ──
+            // ── 2. Citas cuyo recordatorio vence en los próximos 12 minutos ──
             // c.recordatorio = minutos antes de la cita (ej: '30', '60', '1440')
             const citas = await pool.query(`
                 SELECT c.usuario_id, c.titulo, c.fecha, c.hora, c.recordatorio, c.lugar
@@ -946,9 +1009,9 @@ function startPushReminders() {
                 WHERE c.recordatorio IS NOT NULL
                   AND c.recordatorio <> '0'
                   AND c.hora IS NOT NULL
-                  AND (c.fecha || ' ' || c.hora)::timestamp AT TIME ZONE 'America/Argentina/Buenos_Aires'
-                      - (CAST(c.recordatorio AS integer) * INTERVAL '1 minute')
-                      BETWEEN NOW() AND NOW() + INTERVAL '20 minutes'
+                  AND (c.fecha || ' ' || c.hora)::timestamp - (CAST(c.recordatorio AS integer) * INTERVAL '1 minute')
+                      BETWEEN (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Argentina/Buenos_Aires') - INTERVAL '2 minutes'
+                          AND (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Argentina/Buenos_Aires') + INTERVAL '12 minutes'
             `);
             for (const cita of citas.rows) {
                 const mins = parseInt(cita.recordatorio);
@@ -964,21 +1027,45 @@ function startPushReminders() {
                 });
             }
 
-            // ── 3. Tareas pendientes de hoy (aviso a las 8 AM) ──
-            if (now.getHours() === 8 && now.getMinutes() < 30) {
-                const tareas = await pool.query(`
+            // ── 3. Tareas con recordatorio=true y hora específica (±12 min) ──
+            const tareasConHora = await pool.query(`
+                SELECT t.usuario_id, t.titulo, t.hora, t.fecha
+                FROM tareas t
+                INNER JOIN push_subscriptions ps ON ps.usuario_id = t.usuario_id
+                WHERE t.completada = false
+                  AND t.recordatorio = true
+                  AND t.hora IS NOT NULL
+                  AND t.fecha = $1
+                  AND t.hora::time
+                      BETWEEN (NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')::time - INTERVAL '2 minutes'
+                          AND (NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')::time + INTERVAL '12 minutes'
+            `, [todayStr]);
+            for (const tarea of tareasConHora.rows) {
+                await sendPushToUser(tarea.usuario_id, {
+                    title: '✓ Recordatorio de tarea',
+                    body: `${tarea.titulo} — a las ${tarea.hora.substring(0, 5)}`,
+                    tag: `tarea-${tarea.usuario_id}-${tarea.fecha}-${tarea.hora}`,
+                    url: '/'
+                });
+            }
+
+            // ── 4. Tareas sin hora: resumen de pendientes de hoy a las 8 AM ──
+            if (ar.getHours() === 8 && ar.getMinutes() < 10) {
+                const tareasSinHora = await pool.query(`
                     SELECT t.usuario_id, COUNT(*) as pendientes
                     FROM tareas t
                     INNER JOIN push_subscriptions ps ON ps.usuario_id = t.usuario_id
                     WHERE t.completada = false
+                      AND t.recordatorio = true
+                      AND (t.hora IS NULL OR t.hora = '')
                       AND t.fecha = $1
                     GROUP BY t.usuario_id
                 `, [todayStr]);
-                for (const row of tareas.rows) {
+                for (const row of tareasSinHora.rows) {
                     await sendPushToUser(row.usuario_id, {
                         title: '✓ Tareas pendientes hoy',
                         body: `Tenés ${row.pendientes} tarea${row.pendientes > 1 ? 's' : ''} pendiente${row.pendientes > 1 ? 's' : ''} para hoy`,
-                        tag: `tareas-${row.usuario_id}-${todayStr}`,
+                        tag: `tareas-resumen-${row.usuario_id}-${todayStr}`,
                         url: '/'
                     });
                 }
@@ -991,8 +1078,8 @@ function startPushReminders() {
     }
 
     checkAndSendReminders(); // correr al arrancar
-    setInterval(checkAndSendReminders, 15 * 60 * 1000); // cada 15 minutos
-    console.log('✅ Push reminders iniciados (chequeo cada 15 minutos)');
+    setInterval(checkAndSendReminders, 10 * 60 * 1000); // cada 10 minutos
+    console.log('✅ Push reminders iniciados (chequeo cada 10 minutos)');
 }
 
 // ========== MERCADOPAGO ==========
