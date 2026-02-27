@@ -954,21 +954,30 @@ function startPushReminders() {
     }
 
     // Genera todos los horarios del día de un medicamento según su frecuencia
+    // Si no tiene hora_inicio usa 08:00 como punto de partida; nunca pasa de las 22:00
     function getMedHorarios(med) {
-        if (!med.hora_inicio) return [];
         if (med.frecuencia === 'custom' && med.horarios_custom) {
             return med.horarios_custom.split(',').map(h => h.trim()).filter(Boolean);
         }
         const frecuencias = { 'cada-4h': 4, 'cada-6h': 6, 'cada-8h': 8, 'cada-12h': 12, 'diaria': 24 };
         const intervaloHoras = frecuencias[med.frecuencia] || 24;
-        const [hStr, mStr] = med.hora_inicio.split(':');
-        const horaInicio = parseInt(hStr);
-        const minInicio  = parseInt(mStr);
+
+        // Si no tiene hora_inicio configurada, arrancar a las 08:00
+        const horaInicioStr = (med.hora_inicio && med.hora_inicio !== '') ? med.hora_inicio : '08:00';
+        const [hStr, mStr] = horaInicioStr.split(':');
+        const horaInicio = parseInt(hStr) || 8;
+        const minInicio  = parseInt(mStr) || 0;
+
         const horarios = [];
         let h = horaInicio;
-        while (h < 24) {
+        // Generar horarios hasta las 22:00 (10 PM) — no molestar de madrugada
+        while (h < 22) {
             horarios.push(`${String(h).padStart(2,'0')}:${String(minInicio).padStart(2,'0')}`);
             h += intervaloHoras;
+        }
+        // Garantizar al menos un horario aunque hora_inicio sea >= 22
+        if (horarios.length === 0) {
+            horarios.push(`${String(horaInicio).padStart(2,'0')}:${String(minInicio).padStart(2,'0')}`);
         }
         return horarios;
     }
@@ -996,8 +1005,8 @@ function startPushReminders() {
             await pool.query("DELETE FROM push_sent WHERE sent_at < NOW() - INTERVAL '24 hours'").catch(() => {});
 
             // ── 1. Medicamentos — todos los de recordatorio activo ──
-            // En JS se calculan todos los horarios del día según frecuencia del usuario
-            // y se usa la timezone del usuario para saber qué hora es ahora para él.
+            // getMedHorarios() calcula los horarios del día según frecuencia.
+            // Si el med no tiene hora_inicio, usa 08:00 como inicio por defecto.
             const allMeds = await pool.query(`
                 SELECT DISTINCT ON (m.id)
                     m.usuario_id, m.nombre, m.dosis,
@@ -1007,8 +1016,6 @@ function startPushReminders() {
                 INNER JOIN push_subscriptions ps ON ps.usuario_id = m.usuario_id
                 INNER JOIN usuarios u ON u.id = m.usuario_id
                 WHERE m.recordatorio = true
-                  AND m.hora_inicio IS NOT NULL
-                  AND m.hora_inicio <> ''
             `);
 
             for (const med of allMeds.rows) {
@@ -1019,7 +1026,8 @@ function startPushReminders() {
                 const horaMatch = horarios.find(h => {
                     const [hh, mm] = h.split(':').map(Number);
                     const medMin = hh * 60 + mm;
-                    return medMin >= tzMin && medMin < tzMin + 12;
+                    // Ventana de 15 min (el cron corre cada 8 min → siempre hay overlap)
+                    return medMin >= tzMin && medMin < tzMin + 15;
                 });
                 if (!horaMatch) continue;
                 const tag = `med-${med.usuario_id}-${med.nombre}-${horaMatch}-${tzNow.dateStr}`;
@@ -1032,7 +1040,7 @@ function startPushReminders() {
                 await markAsSent(tag);
             }
 
-            // ── 2. Citas: recordatorio vence en los próximos 12 min (por timezone del usuario) ──
+            // ── 2. Citas: recordatorio vence en los próximos 15 min (por timezone del usuario) ──
             const citas = await pool.query(`
                 SELECT c.usuario_id, c.titulo, c.fecha, c.hora, c.recordatorio, c.lugar
                 FROM citas c
@@ -1047,7 +1055,7 @@ function startPushReminders() {
                       BETWEEN (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))::timestamp
                               - INTERVAL '2 minutes'
                           AND (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))::timestamp
-                              + INTERVAL '12 minutes'
+                              + INTERVAL '15 minutes'
             `);
             for (const cita of citas.rows) {
                 const tag = `cita-${cita.usuario_id}-${cita.fecha}-${cita.hora}`;
@@ -1065,7 +1073,7 @@ function startPushReminders() {
                 await markAsSent(tag);
             }
 
-            // ── 3. Tareas con hora específica (±12 min, en timezone del usuario) ──
+            // ── 3. Tareas con hora específica (±15 min, en timezone del usuario) ──
             const tareasConHora = await pool.query(`
                 SELECT t.usuario_id, t.titulo, t.hora, t.fecha
                 FROM tareas t
@@ -1079,7 +1087,7 @@ function startPushReminders() {
                       BETWEEN (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))::time
                               - INTERVAL '2 minutes'
                           AND (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))::time
-                              + INTERVAL '12 minutes'
+                              + INTERVAL '15 minutes'
             `);
             for (const tarea of tareasConHora.rows) {
                 const tag = `tarea-${tarea.usuario_id}-${tarea.fecha}-${tarea.hora}`;
@@ -1131,8 +1139,8 @@ function startPushReminders() {
     }
 
     checkAndSendReminders();
-    setInterval(checkAndSendReminders, 10 * 60 * 1000); // cada 10 minutos
-    console.log('✅ Push reminders iniciados (chequeo cada 10 minutos)');
+    setInterval(checkAndSendReminders, 8 * 60 * 1000); // cada 8 minutos — ventana de 15 min garantiza cobertura total
+    console.log('✅ Push reminders iniciados (chequeo cada 8 minutos)');
 }
 
 // ========== MERCADOPAGO ==========
