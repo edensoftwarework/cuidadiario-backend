@@ -1247,7 +1247,10 @@ app.put('/api/profile', authMiddleware, async (req, res) => {
     }
 });
 
-// ========== PAYPAL ==========
+// ========== PAYPAL — deshabilitado temporalmente (restricciones para Argentina) ==========
+// Para reactivar: descomentar todo este bloque y los endpoints de abajo,
+// y habilitar window.PAYPAL_CLIENT_ID/PLAN_ID en index.html
+/*
 const PAYPAL_CLIENT_ID     = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
 const PAYPAL_MODE          = process.env.PAYPAL_MODE || 'sandbox';
@@ -1289,6 +1292,10 @@ async function paypalRequest(path, method, body = null) {
         req.end();
     });
 }
+*/
+
+/* PAYPAL ENDPOINTS — deshabilitado temporalmente (restricciones para Argentina)
+ * Para reactivar: descomentar este bloque completo y el bloque de funciones de arriba.
 
 app.post('/api/paypal/create-order', authMiddleware, async (req, res) => {
     try {
@@ -1352,13 +1359,13 @@ app.post('/api/paypal/webhook', async (req, res) => {
         res.status(200).json({ received: true });
     }
 });
+*/
 
 // ========== INICIAR SERVIDOR ==========
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
     console.log(`✅ Servidor escuchando en puerto ${PORT}`);
     console.log(`📍 http://localhost:${PORT}`);
-    console.log(`💳 PayPal mode: ${PAYPAL_MODE}`);
     await runMigrations();
     startPushReminders(); // ← NUEVO: arranca el chequeo periódico de push
 });
