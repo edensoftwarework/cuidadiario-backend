@@ -168,6 +168,24 @@ async function runMigrations() {
             ADD COLUMN IF NOT EXISTS reset_token_expires  TIMESTAMP
         `);
 
+        // Zona horaria del usuario (para notificaciones push en su hora local)
+        await pool.query(`
+            ALTER TABLE usuarios
+            ADD COLUMN IF NOT EXISTS timezone VARCHAR(50) DEFAULT 'America/Argentina/Buenos_Aires'
+        `);
+
+        // Tabla de deduplicación de notificaciones push
+        // Evita reenvíos si el servidor reinicia dentro de la misma ventana de tiempo
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS push_sent (
+                tag      TEXT      NOT NULL,
+                sent_at  TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        `);
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS idx_push_sent ON push_sent (tag, sent_at)
+        `).catch(() => {});
+
         console.log('✅ Migraciones completadas');
     } catch (err) {
         console.error('❌ Error en migraciones:', err.message);
@@ -904,41 +922,48 @@ async function sendPushToUser(userId, payload) {
     }
 }
 
-// Chequeo periódico de recordatorios — corre cada hora en el servidor
+// Chequeo periódico de recordatorios — corre cada 10 minutos en el servidor
 function startPushReminders() {
     if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
         console.log('ℹ️  Push reminders desactivados (VAPID keys no configuradas)');
         return;
     }
 
-    // Helpers de tiempo para Argentina
-    function nowAR() {
-        // Devuelve un Date ajustado a UTC-3 (America/Argentina/Buenos_Aires)
-        const d = new Date();
-        // Calculamos el offset real del servidor y lo normalizamos a -3h
-        const utc = d.getTime() + d.getTimezoneOffset() * 60000;
-        return new Date(utc - 3 * 3600000);
+    // Helper: hora actual en cualquier zona horaria (usando Intl.DateTimeFormat)
+    function nowInTZ(tz) {
+        const timezone = tz || 'America/Argentina/Buenos_Aires';
+        try {
+            const fmt = new Intl.DateTimeFormat('sv-SE', {
+                timeZone: timezone,
+                year: 'numeric', month: '2-digit', day: '2-digit',
+                hour: '2-digit', minute: '2-digit'
+            });
+            const str = fmt.format(new Date()); // "2024-02-27 15:30"
+            const [date, time] = str.split(' ');
+            const [h, m] = time.split(':').map(Number);
+            return { hours: h, minutes: m, totalMinutes: h * 60 + m, dateStr: date };
+        } catch {
+            const utc = Date.now() + new Date().getTimezoneOffset() * 60000;
+            const ar  = new Date(utc - 3 * 3600000);
+            return {
+                hours: ar.getHours(), minutes: ar.getMinutes(),
+                totalMinutes: ar.getHours() * 60 + ar.getMinutes(),
+                dateStr: ar.toISOString().split('T')[0]
+            };
+        }
     }
 
-    // Genera todos los horarios del día para un medicamento según su frecuencia
+    // Genera todos los horarios del día de un medicamento según su frecuencia
     function getMedHorarios(med) {
         if (!med.hora_inicio) return [];
-
-        // Horarios personalizados (ej: "08:00,14:00,20:00")
         if (med.frecuencia === 'custom' && med.horarios_custom) {
             return med.horarios_custom.split(',').map(h => h.trim()).filter(Boolean);
         }
-
-        const frecuencias = {
-            'cada-4h': 4, 'cada-6h': 6, 'cada-8h': 8, 'cada-12h': 12, 'diaria': 24
-        };
+        const frecuencias = { 'cada-4h': 4, 'cada-6h': 6, 'cada-8h': 8, 'cada-12h': 12, 'diaria': 24 };
         const intervaloHoras = frecuencias[med.frecuencia] || 24;
-
-        // hora_inicio puede venir como "HH:MM:SS" o "HH:MM"
         const [hStr, mStr] = med.hora_inicio.split(':');
         const horaInicio = parseInt(hStr);
         const minInicio  = parseInt(mStr);
-
         const horarios = [];
         let h = horaInicio;
         while (h < 24) {
@@ -948,32 +973,39 @@ function startPushReminders() {
         return horarios;
     }
 
-    // Comprueba si alguno de los horarios cae dentro de la ventana [now, now+windowMin]
-    function esDentroVentana(horarios, nowAR, windowMin = 12) {
-        const nowMinutes = nowAR.getHours() * 60 + nowAR.getMinutes();
-        return horarios.some(h => {
-            const [hh, mm] = h.split(':').map(Number);
-            const medMinutes = hh * 60 + mm;
-            return medMinutes >= nowMinutes && medMinutes < nowMinutes + windowMin;
-        });
+    // Deduplicación: verifica si ya se envió esta notificación en los últimos 20 min
+    async function wasAlreadySent(tag) {
+        try {
+            const r = await pool.query(
+                "SELECT 1 FROM push_sent WHERE tag=$1 AND sent_at > NOW() - INTERVAL '20 minutes'",
+                [tag]
+            );
+            return r.rows.length > 0;
+        } catch { return false; }
+    }
+
+    async function markAsSent(tag) {
+        try {
+            await pool.query('INSERT INTO push_sent (tag, sent_at) VALUES ($1, NOW())', [tag]);
+        } catch { /* OK — entrada duplicada ignorada */ }
     }
 
     async function checkAndSendReminders() {
         try {
-            const now    = new Date();
-            const ar     = nowAR();
-            const nowHHMM = `${String(ar.getHours()).padStart(2,'0')}:${String(ar.getMinutes()).padStart(2,'0')}`;
-            const todayStr = `${ar.getFullYear()}-${String(ar.getMonth()+1).padStart(2,'0')}-${String(ar.getDate()).padStart(2,'0')}`;
+            // Limpiar entradas viejas de deduplicación (> 24h)
+            await pool.query("DELETE FROM push_sent WHERE sent_at < NOW() - INTERVAL '24 hours'").catch(() => {});
 
-            // ── 1. Medicamentos con recordatorio=true ──
-            // Traemos TODOS los medicamentos con recordatorio activo y suscripción push.
-            // Luego calculamos en JS todos sus horarios del día (según frecuencia) y
-            // enviamos notificación si alguno cae en los próximos 12 minutos.
+            // ── 1. Medicamentos — todos los de recordatorio activo ──
+            // En JS se calculan todos los horarios del día según frecuencia del usuario
+            // y se usa la timezone del usuario para saber qué hora es ahora para él.
             const allMeds = await pool.query(`
-                SELECT DISTINCT ON (m.id) m.usuario_id, m.nombre, m.dosis,
-                       m.hora_inicio, m.frecuencia, m.horarios_custom
+                SELECT DISTINCT ON (m.id)
+                    m.usuario_id, m.nombre, m.dosis,
+                    m.hora_inicio, m.frecuencia, m.horarios_custom,
+                    COALESCE(u.timezone, 'America/Argentina/Buenos_Aires') AS timezone
                 FROM medicamentos m
                 INNER JOIN push_subscriptions ps ON ps.usuario_id = m.usuario_id
+                INNER JOIN usuarios u ON u.id = m.usuario_id
                 WHERE m.recordatorio = true
                   AND m.hora_inicio IS NOT NULL
             `);
@@ -981,39 +1013,43 @@ function startPushReminders() {
             for (const med of allMeds.rows) {
                 const horarios = getMedHorarios(med);
                 if (!horarios.length) continue;
-
-                // Buscamos el horario exacto que está en ventana
-                const arNow = nowAR();
-                const arMin = arNow.getHours() * 60 + arNow.getMinutes();
+                const tzNow = nowInTZ(med.timezone);
+                const tzMin = tzNow.totalMinutes;
                 const horaMatch = horarios.find(h => {
                     const [hh, mm] = h.split(':').map(Number);
                     const medMin = hh * 60 + mm;
-                    return medMin >= arMin && medMin < arMin + 12;
+                    return medMin >= tzMin && medMin < tzMin + 12;
                 });
                 if (!horaMatch) continue;
-
+                const tag = `med-${med.usuario_id}-${med.nombre}-${horaMatch}-${tzNow.dateStr}`;
+                if (await wasAlreadySent(tag)) continue;
                 await sendPushToUser(med.usuario_id, {
                     title: '💊 Recordatorio de medicamento',
                     body: `${med.nombre} — ${med.dosis} a las ${horaMatch}`,
-                    tag: `med-${med.usuario_id}-${med.nombre}-${horaMatch}`,
-                    url: '/'
+                    tag, url: '/'
                 });
+                await markAsSent(tag);
             }
 
-            // ── 2. Citas cuyo recordatorio vence en los próximos 12 minutos ──
-            // c.recordatorio = minutos antes de la cita (ej: '30', '60', '1440')
+            // ── 2. Citas: recordatorio vence en los próximos 12 min (por timezone del usuario) ──
             const citas = await pool.query(`
                 SELECT c.usuario_id, c.titulo, c.fecha, c.hora, c.recordatorio, c.lugar
                 FROM citas c
                 INNER JOIN push_subscriptions ps ON ps.usuario_id = c.usuario_id
+                INNER JOIN usuarios u ON u.id = c.usuario_id
                 WHERE c.recordatorio IS NOT NULL
                   AND c.recordatorio <> '0'
                   AND c.hora IS NOT NULL
-                  AND (c.fecha || ' ' || c.hora)::timestamp - (CAST(c.recordatorio AS integer) * INTERVAL '1 minute')
-                      BETWEEN (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Argentina/Buenos_Aires') - INTERVAL '2 minutes'
-                          AND (NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Argentina/Buenos_Aires') + INTERVAL '12 minutes'
+                  AND (c.fecha || ' ' || c.hora)::timestamp
+                      - (CAST(c.recordatorio AS integer) * INTERVAL '1 minute')
+                      BETWEEN (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))::timestamp
+                              - INTERVAL '2 minutes'
+                          AND (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))::timestamp
+                              + INTERVAL '12 minutes'
             `);
             for (const cita of citas.rows) {
+                const tag = `cita-${cita.usuario_id}-${cita.fecha}-${cita.hora}`;
+                if (await wasAlreadySent(tag)) continue;
                 const mins = parseInt(cita.recordatorio);
                 const tiempoTexto = mins < 60 ? `en ${mins} min`
                     : mins === 60 ? 'en 1 hora'
@@ -1022,62 +1058,77 @@ function startPushReminders() {
                 await sendPushToUser(cita.usuario_id, {
                     title: '📅 Recordatorio de cita',
                     body: `${cita.titulo} — ${tiempoTexto}${cita.lugar ? ' en ' + cita.lugar : ''}`,
-                    tag: `cita-${cita.usuario_id}-${cita.fecha}-${cita.hora}`,
-                    url: '/'
+                    tag, url: '/'
                 });
+                await markAsSent(tag);
             }
 
-            // ── 3. Tareas con recordatorio=true y hora específica (±12 min) ──
+            // ── 3. Tareas con hora específica (±12 min, en timezone del usuario) ──
             const tareasConHora = await pool.query(`
                 SELECT t.usuario_id, t.titulo, t.hora, t.fecha
                 FROM tareas t
                 INNER JOIN push_subscriptions ps ON ps.usuario_id = t.usuario_id
+                INNER JOIN usuarios u ON u.id = t.usuario_id
                 WHERE t.completada = false
                   AND t.recordatorio = true
-                  AND t.hora IS NOT NULL
-                  AND t.fecha = $1
+                  AND t.hora IS NOT NULL AND t.hora <> ''
+                  AND t.fecha = (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))::date::text
                   AND t.hora::time
-                      BETWEEN (NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')::time - INTERVAL '2 minutes'
-                          AND (NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')::time + INTERVAL '12 minutes'
-            `, [todayStr]);
+                      BETWEEN (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))::time
+                              - INTERVAL '2 minutes'
+                          AND (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))::time
+                              + INTERVAL '12 minutes'
+            `);
             for (const tarea of tareasConHora.rows) {
+                const tag = `tarea-${tarea.usuario_id}-${tarea.fecha}-${tarea.hora}`;
+                if (await wasAlreadySent(tag)) continue;
                 await sendPushToUser(tarea.usuario_id, {
                     title: '✓ Recordatorio de tarea',
                     body: `${tarea.titulo} — a las ${tarea.hora.substring(0, 5)}`,
-                    tag: `tarea-${tarea.usuario_id}-${tarea.fecha}-${tarea.hora}`,
-                    url: '/'
+                    tag, url: '/'
                 });
+                await markAsSent(tag);
             }
 
-            // ── 4. Tareas sin hora: resumen de pendientes de hoy a las 8 AM ──
-            if (ar.getHours() === 8 && ar.getMinutes() < 10) {
-                const tareasSinHora = await pool.query(`
-                    SELECT t.usuario_id, COUNT(*) as pendientes
-                    FROM tareas t
-                    INNER JOIN push_subscriptions ps ON ps.usuario_id = t.usuario_id
-                    WHERE t.completada = false
-                      AND t.recordatorio = true
-                      AND (t.hora IS NULL OR t.hora = '')
-                      AND t.fecha = $1
-                    GROUP BY t.usuario_id
-                `, [todayStr]);
-                for (const row of tareasSinHora.rows) {
-                    await sendPushToUser(row.usuario_id, {
-                        title: '✓ Tareas pendientes hoy',
-                        body: `Tenés ${row.pendientes} tarea${row.pendientes > 1 ? 's' : ''} pendiente${row.pendientes > 1 ? 's' : ''} para hoy`,
-                        tag: `tareas-resumen-${row.usuario_id}-${todayStr}`,
-                        url: '/'
-                    });
-                }
+            // ── 4. Tareas sin hora: resumen diario a las 8 AM (por timezone del usuario) ──
+            const tareasResumen = await pool.query(`
+                SELECT t.usuario_id,
+                       COALESCE(u.timezone,'America/Argentina/Buenos_Aires') AS timezone
+                FROM tareas t
+                INNER JOIN push_subscriptions ps ON ps.usuario_id = t.usuario_id
+                INNER JOIN usuarios u ON u.id = t.usuario_id
+                WHERE t.completada = false
+                  AND t.recordatorio = true
+                  AND (t.hora IS NULL OR t.hora = '')
+                GROUP BY t.usuario_id, u.timezone
+            `);
+            for (const row of tareasResumen.rows) {
+                const tzNow = nowInTZ(row.timezone);
+                if (tzNow.hours !== 8 || tzNow.minutes >= 10) continue;
+                const cnt = await pool.query(
+                    "SELECT COUNT(*) AS c FROM tareas WHERE usuario_id=$1 AND completada=false AND recordatorio=true AND (hora IS NULL OR hora='') AND fecha=$2",
+                    [row.usuario_id, tzNow.dateStr]
+                );
+                const pendientes = parseInt(cnt.rows[0]?.c || 0);
+                if (pendientes === 0) continue;
+                const tag = `tareas-resumen-${row.usuario_id}-${tzNow.dateStr}`;
+                if (await wasAlreadySent(tag)) continue;
+                await sendPushToUser(row.usuario_id, {
+                    title: '✓ Tareas pendientes hoy',
+                    body: `Tenés ${pendientes} tarea${pendientes > 1 ? 's' : ''} pendiente${pendientes > 1 ? 's' : ''} para hoy`,
+                    tag, url: '/'
+                });
+                await markAsSent(tag);
             }
 
-            console.log(`[Push Reminders] Chequeo completado a las ${nowHHMM}`);
+            const log = nowInTZ('America/Argentina/Buenos_Aires');
+            console.log(`[Push Reminders] Chequeo OK — ${String(log.hours).padStart(2,'0')}:${String(log.minutes).padStart(2,'0')} AR`);
         } catch (err) {
             console.error('[Push Reminders] Error:', err.message);
         }
     }
 
-    checkAndSendReminders(); // correr al arrancar
+    checkAndSendReminders();
     setInterval(checkAndSendReminders, 10 * 60 * 1000); // cada 10 minutos
     console.log('✅ Push reminders iniciados (chequeo cada 10 minutos)');
 }
@@ -1156,7 +1207,10 @@ app.post('/api/webhook/mercadopago', async (req, res) => {
 // ========== PERFIL Y USUARIO ==========
 app.get('/api/me', authMiddleware, async (req, res) => {
     try {
-        const result = await pool.query('SELECT id, nombre, email, premium FROM usuarios WHERE id=$1', [req.user.id]);
+        const result = await pool.query(
+            "SELECT id, nombre, email, premium, COALESCE(timezone,'America/Argentina/Buenos_Aires') AS timezone FROM usuarios WHERE id=$1",
+            [req.user.id]
+        );
         if (result.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
         res.json({ usuario: result.rows[0] });
     } catch (err) {
@@ -1166,21 +1220,22 @@ app.get('/api/me', authMiddleware, async (req, res) => {
 
 app.put('/api/profile', authMiddleware, async (req, res) => {
     try {
-        const { nombre, email, password } = req.body;
+        const { nombre, email, password, timezone } = req.body;
         if (!nombre || !email) return res.status(400).json({ error: 'Nombre y email son requeridos' });
         const existing = await pool.query('SELECT id FROM usuarios WHERE email=$1 AND id!=$2', [email, req.user.id]);
         if (existing.rows.length > 0) return res.status(400).json({ error: 'El email ya está en uso por otra cuenta' });
+        const tz = timezone || 'America/Argentina/Buenos_Aires';
         let result;
         if (password) {
             const password_hash = await bcrypt.hash(password, SALT_ROUNDS);
             result = await pool.query(
-                'UPDATE usuarios SET nombre=$1, email=$2, password_hash=$3 WHERE id=$4 RETURNING id, nombre, email, premium',
-                [nombre, email, password_hash, req.user.id]
+                'UPDATE usuarios SET nombre=$1, email=$2, password_hash=$3, timezone=$4 WHERE id=$5 RETURNING id, nombre, email, premium, timezone',
+                [nombre, email, password_hash, tz, req.user.id]
             );
         } else {
             result = await pool.query(
-                'UPDATE usuarios SET nombre=$1, email=$2 WHERE id=$3 RETURNING id, nombre, email, premium',
-                [nombre, email, req.user.id]
+                'UPDATE usuarios SET nombre=$1, email=$2, timezone=$3 WHERE id=$4 RETURNING id, nombre, email, premium, timezone',
+                [nombre, email, tz, req.user.id]
             );
         }
         res.json({ mensaje: 'Perfil actualizado', usuario: result.rows[0] });
