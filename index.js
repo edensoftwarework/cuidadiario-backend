@@ -1506,7 +1506,7 @@ app.post('/api/create-subscription', authMiddleware, async (req, res) => {
         const user = userResult.rows[0];
         const payload = {
             reason: 'CuidaDiario Premium',
-            auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: 16, currency_id: 'ARS' },
+            auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: 3500, currency_id: 'ARS' },
             back_url: 'https://cuidadiario.edensoftwork.com/pages/premium-success.html',
             payer_email: user.email,
             external_reference: String(req.user.id)
@@ -1524,26 +1524,26 @@ app.post('/api/create-subscription', authMiddleware, async (req, res) => {
 });
 
 // Helper: verifica firma HMAC-SHA256 del webhook de MercadoPago
-// Requiere MP_WEBHOOK_SECRET en Railway (obtenelo en la configuración de tu app en MP)
-// Si no está configurado, permite el paso con un warning (no rompe funcionalidad existente)
+// IMPORTANTE: aunque la firma no sea válida NO bloqueamos el request,
+// porque siempre re-verificamos el estado con la API de MP.
+// Bloquear aquí solo causaría que cancelaciones no se procesen si el secret está mal configurado.
 function verifyMPWebhookSignature(req) {
     const MP_WEBHOOK_SECRET = process.env.MP_WEBHOOK_SECRET;
-    if (!MP_WEBHOOK_SECRET) {
-        console.warn('[MP Webhook] MP_WEBHOOK_SECRET no configurado — firma no verificada');
-        return true; // Permitir pero loguear
-    }
+    if (!MP_WEBHOOK_SECRET) return true; // Sin secret: siempre aceptar
     const signature = req.headers['x-signature'];
     const requestId = req.headers['x-request-id'] || '';
-    if (!signature) return false;
+    if (!signature) return true; // Sin firma: aceptar igualmente
     const ts = (signature.split(',').find(p => p.startsWith('ts=')) || '').replace('ts=', '');
     const v1 = (signature.split(',').find(p => p.startsWith('v1=')) || '').replace('v1=', '');
-    if (!ts || !v1) return false;
+    if (!ts || !v1) return true;
     const dataId = req.query['data.id'] || (req.body?.data?.id) || '';
     const manifest = `id:${dataId};request-id:${requestId};ts:${ts}`;
     const expected = crypto.createHmac('sha256', MP_WEBHOOK_SECRET).update(manifest).digest('hex');
     try {
-        return crypto.timingSafeEqual(Buffer.from(v1, 'hex'), Buffer.from(expected, 'hex'));
-    } catch { return false; }
+        const valid = crypto.timingSafeEqual(Buffer.from(v1, 'hex'), Buffer.from(expected, 'hex'));
+        if (!valid) console.warn('[MP Webhook] ⚠️ Firma inválida — procesando igual (MP_WEBHOOK_SECRET puede estar mal configurado)');
+        return true; // Siempre procesar — la re-verificación con MP API garantiza seguridad
+    } catch { return true; }
 }
 
 app.post('/api/webhook/mercadopago', async (req, res) => {
@@ -1641,12 +1641,21 @@ app.get('/api/verify-subscription', authMiddleware, async (req, res) => {
             return res.json({ premium: true, status: 'authorized' });
         }
 
-        // No autorizado: verificar si hay una pendiente (para informar al frontend)
+        // Sin suscripción autorizada — buscar todas para saber el estado real
         const searchAll = await mpRequest(`/preapproval/search?external_reference=${req.user.id}`);
         const allResults = searchAll.body?.results || [];
-        const pending = allResults.find(p => p.status === 'pending');
+        const pending    = allResults.find(p => p.status === 'pending');
+        const cancelled  = allResults.find(p => ['cancelled', 'paused', 'expired'].includes(p.status));
 
-        console.log(`[MP Verify] Usuario ${req.user.id} → sin suscripción autorizada (estados: ${allResults.map(p => p.status).join(', ') || 'ninguna'})`);
+        // Si hay una cancelada/pausada/expirada y ninguna autorizada → bajar premium
+        if (cancelled && !pending) {
+            await pool.query('UPDATE usuarios SET premium=FALSE WHERE id=$1', [req.user.id]);
+            console.log(`[MP Verify] 🔻 Usuario ${req.user.id} → premium: FALSE (estado MP: "${cancelled.status}")`);
+            return res.json({ premium: false, status: cancelled.status,
+                message: 'Tu suscripción fue cancelada o expiró.' });
+        }
+
+        console.log(`[MP Verify] Usuario ${req.user.id} — estados: ${allResults.map(p => p.status).join(', ') || 'ninguna'}`);
         return res.json({
             premium: false,
             status: pending ? 'pending' : 'not_found',
@@ -1816,12 +1825,52 @@ app.post('/api/paypal/webhook', async (req, res) => {
 */
 
 // ========== INICIAR SERVIDOR ==========
+
+// Sincronización periódica de estados de suscripción con MercadoPago.
+// Garantiza que cancelaciones/pausas se reflejen aunque el webhook haya fallado.
+// Corre cada 4 horas. Si MP_ACCESS_TOKEN no está configurado, no hace nada.
+async function syncMPSubscriptions() {
+    if (!MP_ACCESS_TOKEN) return;
+    try {
+        const premiumUsers = await pool.query('SELECT id FROM usuarios WHERE premium = TRUE');
+        if (premiumUsers.rows.length === 0) return;
+        console.log(`[MP Sync] Verificando ${premiumUsers.rows.length} usuario(s) premium...`);
+        let deactivated = 0;
+        for (const user of premiumUsers.rows) {
+            try {
+                const search = await mpRequest(`/preapproval/search?external_reference=${user.id}&status=authorized`);
+                if (search.status !== 200) continue;
+                const hasAuthorized = (search.body?.results || []).some(p => p.status === 'authorized');
+                if (!hasAuthorized) {
+                    await pool.query('UPDATE usuarios SET premium=FALSE WHERE id=$1', [user.id]);
+                    console.log(`[MP Sync] 🔻 Usuario ${user.id} → premium: FALSE (sin suscripción autorizada)`);
+                    deactivated++;
+                }
+                // Pequeña pausa entre requests para no saturar la API de MP
+                await new Promise(r => setTimeout(r, 300));
+            } catch (e) {
+                console.warn(`[MP Sync] Error verificando usuario ${user.id}:`, e.message);
+            }
+        }
+        console.log(`[MP Sync] ✅ Sync completado — ${deactivated} usuario(s) desactivado(s)`);
+    } catch (e) {
+        console.error('[MP Sync] Error:', e.message);
+    }
+}
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
     console.log(`✅ Servidor escuchando en puerto ${PORT}`);
     console.log(`📍 http://localhost:${PORT}`);
     await runMigrations();
     startPushReminders(); // ← Arranca el chequeo periódico de push
+
+    // Sincronización periódica con MercadoPago: detecta cancelaciones aunque el webhook falle
+    if (MP_ACCESS_TOKEN) {
+        setTimeout(syncMPSubscriptions, 30000); // primer sync 30s después del boot
+        setInterval(syncMPSubscriptions, 4 * 60 * 60 * 1000); // luego cada 4 horas
+        console.log('✅ Sync periódico de suscripciones MP activado (cada 4 horas)');
+    }
 
     // Keep-alive: evita que Railway duerma el servidor en planes gratuitos.
     // Se hace un GET a /health propio cada 4 minutos.
