@@ -1506,7 +1506,7 @@ app.post('/api/create-subscription', authMiddleware, async (req, res) => {
         const user = userResult.rows[0];
         const payload = {
             reason: 'CuidaDiario Premium',
-            auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: 16, currency_id: 'ARS' },
+            auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: 3500, currency_id: 'ARS' },
             back_url: 'https://cuidadiario.edensoftwork.com/pages/premium-success.html',
             payer_email: user.email,
             external_reference: String(req.user.id)
@@ -1598,6 +1598,65 @@ app.post('/api/webhook/mercadopago', async (req, res) => {
     } catch (err) {
         console.error('[MP Webhook] Error:', err.message);
         res.sendStatus(200);
+    }
+});
+
+// ========== VERIFICACIÓN MANUAL DE SUSCRIPCIÓN MP ==========
+// GET /api/verify-subscription — activa premium si MercadoPago tiene una suscripción autorizada.
+// Usado por premium-success.html tras el redirect de MP, y como fallback desde la app.
+// Acepta opcionalmente ?preapproval_id=XXX (viene en el back_url de MP).
+app.get('/api/verify-subscription', authMiddleware, async (req, res) => {
+    if (!MP_ACCESS_TOKEN) {
+        return res.status(400).json({ error: 'MercadoPago no configurado en el servidor' });
+    }
+    try {
+        let authorized = null;
+
+        // Intento 1: preapproval_id específico enviado por el frontend (viene del back_url de MP)
+        const preapprovalId = req.query.preapproval_id;
+        if (preapprovalId) {
+            const mp = await mpRequest(`/preapproval/${preapprovalId}`);
+            if (mp.status === 200 && mp.body.status === 'authorized') {
+                const ref = parseInt(mp.body.external_reference);
+                if (ref === req.user.id) {
+                    authorized = mp.body;
+                } else {
+                    console.warn(`[MP Verify] preapproval ${preapprovalId}: external_reference="${mp.body.external_reference}" no coincide con usuario ${req.user.id}`);
+                }
+            }
+        }
+
+        // Intento 2: buscar por external_reference (cubre cualquier suscripción del usuario)
+        if (!authorized) {
+            const search = await mpRequest(`/preapproval/search?external_reference=${req.user.id}&status=authorized`);
+            if (search.status === 200) {
+                const results = search.body?.results || [];
+                authorized = results.find(p => p.status === 'authorized') || null;
+            }
+        }
+
+        if (authorized) {
+            await pool.query('UPDATE usuarios SET premium=TRUE WHERE id=$1', [req.user.id]);
+            console.log(`[MP Verify] ✅ Usuario ${req.user.id} → premium: TRUE (preapproval: ${authorized.id})`);
+            return res.json({ premium: true, status: 'authorized' });
+        }
+
+        // No autorizado: verificar si hay una pendiente (para informar al frontend)
+        const searchAll = await mpRequest(`/preapproval/search?external_reference=${req.user.id}`);
+        const allResults = searchAll.body?.results || [];
+        const pending = allResults.find(p => p.status === 'pending');
+
+        console.log(`[MP Verify] Usuario ${req.user.id} → sin suscripción autorizada (estados: ${allResults.map(p => p.status).join(', ') || 'ninguna'})`);
+        return res.json({
+            premium: false,
+            status: pending ? 'pending' : 'not_found',
+            message: pending
+                ? 'Tu pago está siendo procesado. Puede demorar unos minutos.'
+                : 'No se encontró suscripción activa en MercadoPago.'
+        });
+    } catch (err) {
+        console.error('[MP Verify] Error:', err.message);
+        res.status(500).json({ error: err.message });
     }
 });
 
