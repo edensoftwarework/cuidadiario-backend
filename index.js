@@ -55,7 +55,37 @@ const bcrypt = require('bcrypt');
 const SALT_ROUNDS = 10;
 const jwt = require('jsonwebtoken');
 const JWT_SECRET = process.env.JWT_SECRET || 'tu_clave_secreta';
+if (!process.env.JWT_SECRET) {
+    console.error('⚠️  CRÍTICO: JWT_SECRET no está configurado en las variables de entorno de Railway. Los tokens pueden ser vulnerables. Configurá esta variable inmediatamente.');
+}
 const cors = require('cors');
+
+// ========== RATE LIMITING (in-memory, sin dependencias externas) ==========
+// Previene ataques de fuerza bruta en endpoints de autenticación.
+// Límite: 10 intentos por IP por ventana de 60 segundos.
+const _rateLimitStore = new Map();
+function rateLimit(maxReq = 10, windowMs = 60000) {
+    return (req, res, next) => {
+        const key = req.ip || req.headers['x-forwarded-for'] || 'unknown';
+        const now = Date.now();
+        const windowStart = now - windowMs;
+        if (!_rateLimitStore.has(key)) _rateLimitStore.set(key, []);
+        const hits = _rateLimitStore.get(key).filter(t => t > windowStart);
+        if (hits.length >= maxReq) {
+            return res.status(429).json({ error: 'Demasiados intentos. Esperá unos minutos e intentá nuevamente.' });
+        }
+        hits.push(now);
+        _rateLimitStore.set(key, hits);
+        // Limpiar entradas viejas periódicamente
+        if (_rateLimitStore.size > 5000) {
+            for (const [k, times] of _rateLimitStore.entries()) {
+                if (times.every(t => t <= windowStart)) _rateLimitStore.delete(k);
+            }
+        }
+        next();
+    };
+}
+const authRateLimit = rateLimit(10, 60000); // 10 intentos / 60 seg
 const https = require('https');
 const crypto = require('crypto');          // ← nativo Node.js, sin instalar nada
 const webPush = require('web-push');       // ← push notifications
@@ -122,7 +152,22 @@ if (RESEND_API_KEY) {
 }
 
 // ========== CONFIGURACIÓN ==========
-app.use(cors({ origin: '*', credentials: true }));
+const ALLOWED_ORIGINS = [
+    'https://cuidadiario.edensoftwork.com',
+    'http://localhost:3000',
+    'http://localhost:5500',
+    'http://127.0.0.1:5500',
+    'http://127.0.0.1:3000'
+];
+app.use(cors({
+    origin: (origin, callback) => {
+        // Permitir requests sin origin (ej: apps móviles, Postman, same-origin)
+        if (!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+        console.warn(`[CORS] Bloqueado: ${origin}`);
+        callback(new Error('No permitido por CORS'));
+    },
+    credentials: true
+}));
 app.use('/api/paypal/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
@@ -186,6 +231,22 @@ async function runMigrations() {
             CREATE INDEX IF NOT EXISTS idx_push_sent ON push_sent (tag, sent_at)
         `).catch(() => {});
 
+        // NUEVO: tabla para co-cuidadores (compartir paciente con otro usuario)
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS paciente_compartidos (
+                id            SERIAL PRIMARY KEY,
+                paciente_id   INTEGER NOT NULL REFERENCES pacientes(id) ON DELETE CASCADE,
+                propietario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+                invitado_email TEXT NOT NULL,
+                invitado_id   INTEGER REFERENCES usuarios(id) ON DELETE SET NULL,
+                rol           TEXT NOT NULL DEFAULT 'viewer',
+                token         TEXT UNIQUE,
+                aceptado      BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at    TIMESTAMP DEFAULT NOW(),
+                UNIQUE(paciente_id, invitado_email)
+            )
+        `);
+
         console.log('✅ Migraciones completadas');
     } catch (err) {
         console.error('❌ Error en migraciones:', err.message);
@@ -221,6 +282,29 @@ async function validatePaciente(pacienteId, usuarioId) {
     return result.rows.length > 0;
 }
 
+// Helper: para co-cuidadores — determina el usuario dueño de los datos de un paciente.
+// Si el requesting user es el dueño → retorna su propio ID.
+// Si el paciente está compartido con él → retorna el ID del dueño original.
+// Si no tiene acceso → retorna null (403).
+async function resolveDataOwnerId(requestingUserId, pacienteId) {
+    if (!pacienteId) return requestingUserId;
+    // Verificar si el usuario es el dueño del paciente
+    const own = await pool.query(
+        'SELECT id FROM pacientes WHERE id=$1 AND usuario_id=$2 AND activo=true',
+        [pacienteId, requestingUserId]
+    );
+    if (own.rows.length > 0) return requestingUserId;
+    // Verificar si el paciente está compartido con este usuario
+    const shared = await pool.query(
+        `SELECT p.usuario_id FROM paciente_compartidos pc
+         JOIN pacientes p ON p.id = pc.paciente_id
+         WHERE pc.paciente_id=$1 AND pc.invitado_id=$2 AND pc.aceptado=TRUE`,
+        [pacienteId, requestingUserId]
+    );
+    if (shared.rows.length > 0) return shared.rows[0].usuario_id;
+    return null; // Sin acceso
+}
+
 // Helper: si no viene paciente_id en el body, intenta auto-asignarlo para usuarios free
 // Esto cubre el caso en que el frontend no pudo setear currentPacienteId a tiempo.
 async function resolvePatientId(pid, userId) {
@@ -241,7 +325,7 @@ async function resolvePatientId(pid, userId) {
 // ========== ENDPOINTS PÚBLICOS ==========
 app.get('/', (req, res) => res.send('Backend funcionando para CuidaDiario!'));
 app.get('/api/test', (req, res) => res.json({ status: 'ok', message: 'Backend funcionando correctamente' }));
-app.get('/dbtest', async (req, res) => {
+app.get('/dbtest', authMiddleware, async (req, res) => {
     try {
         const result = await pool.query('SELECT NOW()');
         res.json({ time: result.rows[0].now, status: 'Database connected' });
@@ -251,7 +335,7 @@ app.get('/dbtest', async (req, res) => {
 });
 
 // ========== AUTENTICACIÓN ==========
-app.post('/api/register', async (req, res) => {
+app.post('/api/register', authRateLimit, async (req, res) => {
     const { nombre, email, password } = req.body;
     if (!nombre || !email || !password)
         return res.status(400).json({ error: 'Todos los campos son requeridos' });
@@ -272,7 +356,7 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', authRateLimit, async (req, res) => {
     const { email, password } = req.body;
     if (!email || !password)
         return res.status(400).json({ error: 'Email y contraseña son requeridos' });
@@ -292,7 +376,7 @@ app.post('/api/login', async (req, res) => {
 });
 
 // ========== RECUPERACIÓN DE CONTRASEÑA ==========
-app.post('/api/forgot-password', async (req, res) => {
+app.post('/api/forgot-password', authRateLimit, async (req, res) => {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email requerido' });
     try {
@@ -377,11 +461,23 @@ app.post('/api/reset-password', async (req, res) => {
 // ========== PACIENTES ==========
 app.get('/api/pacientes', authMiddleware, async (req, res) => {
     try {
-        const result = await pool.query(
-            'SELECT * FROM pacientes WHERE usuario_id=$1 AND activo=true ORDER BY id ASC',
+        // Pacientes propios
+        const own = await pool.query(
+            `SELECT *, false AS es_compartido, NULL AS compartido_por FROM pacientes
+             WHERE usuario_id=$1 AND activo=true ORDER BY id ASC`,
             [req.user.id]
         );
-        res.json(result.rows);
+        // Pacientes compartidos con el usuario (co-cuidador)
+        const shared = await pool.query(
+            `SELECT p.*, true AS es_compartido, u.nombre AS compartido_por
+             FROM paciente_compartidos pc
+             JOIN pacientes p ON p.id = pc.paciente_id
+             JOIN usuarios u ON u.id = p.usuario_id
+             WHERE pc.invitado_id=$1 AND pc.aceptado=TRUE AND p.activo=TRUE
+             ORDER BY p.id ASC`,
+            [req.user.id]
+        );
+        res.json([...own.rows, ...shared.rows]);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -469,9 +565,11 @@ app.post('/api/medicamentos', authMiddleware, async (req, res) => {
 app.get('/api/medicamentos', authMiddleware, async (req, res) => {
     const paciente_id = req.query.paciente_id ? parseInt(req.query.paciente_id) : null;
     try {
+        const ownerId = await resolveDataOwnerId(req.user.id, paciente_id);
+        if (ownerId === null) return res.status(403).json({ error: 'Acceso denegado al paciente' });
         const result = paciente_id
-            ? await pool.query('SELECT * FROM medicamentos WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY id DESC', [req.user.id, paciente_id])
-            : await pool.query('SELECT * FROM medicamentos WHERE usuario_id=$1 ORDER BY id DESC', [req.user.id]);
+            ? await pool.query('SELECT * FROM medicamentos WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY id DESC', [ownerId, paciente_id])
+            : await pool.query('SELECT * FROM medicamentos WHERE usuario_id=$1 ORDER BY id DESC', [ownerId]);
         res.json(result.rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -532,9 +630,11 @@ app.post('/api/citas', authMiddleware, async (req, res) => {
 app.get('/api/citas', authMiddleware, async (req, res) => {
     const paciente_id = req.query.paciente_id ? parseInt(req.query.paciente_id) : null;
     try {
+        const ownerId = await resolveDataOwnerId(req.user.id, paciente_id);
+        if (ownerId === null) return res.status(403).json({ error: 'Acceso denegado al paciente' });
         const result = paciente_id
-            ? await pool.query('SELECT * FROM citas WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY fecha DESC, hora DESC', [req.user.id, paciente_id])
-            : await pool.query('SELECT * FROM citas WHERE usuario_id=$1 ORDER BY fecha DESC, hora DESC', [req.user.id]);
+            ? await pool.query('SELECT * FROM citas WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY fecha DESC, hora DESC', [ownerId, paciente_id])
+            : await pool.query('SELECT * FROM citas WHERE usuario_id=$1 ORDER BY fecha DESC, hora DESC', [ownerId]);
         res.json(result.rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -595,9 +695,11 @@ app.post('/api/tareas', authMiddleware, async (req, res) => {
 app.get('/api/tareas', authMiddleware, async (req, res) => {
     const paciente_id = req.query.paciente_id ? parseInt(req.query.paciente_id) : null;
     try {
+        const ownerId = await resolveDataOwnerId(req.user.id, paciente_id);
+        if (ownerId === null) return res.status(403).json({ error: 'Acceso denegado al paciente' });
         const result = paciente_id
-            ? await pool.query('SELECT * FROM tareas WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY fecha ASC, hora ASC', [req.user.id, paciente_id])
-            : await pool.query('SELECT * FROM tareas WHERE usuario_id=$1 ORDER BY fecha ASC, hora ASC', [req.user.id]);
+            ? await pool.query('SELECT * FROM tareas WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY fecha ASC, hora ASC', [ownerId, paciente_id])
+            : await pool.query('SELECT * FROM tareas WHERE usuario_id=$1 ORDER BY fecha ASC, hora ASC', [ownerId]);
         res.json(result.rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -672,9 +774,11 @@ app.post('/api/sintomas', authMiddleware, async (req, res) => {
 app.get('/api/sintomas', authMiddleware, async (req, res) => {
     const paciente_id = req.query.paciente_id ? parseInt(req.query.paciente_id) : null;
     try {
+        const ownerId = await resolveDataOwnerId(req.user.id, paciente_id);
+        if (ownerId === null) return res.status(403).json({ error: 'Acceso denegado al paciente' });
         const result = paciente_id
-            ? await pool.query('SELECT * FROM sintomas WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY fecha DESC', [req.user.id, paciente_id])
-            : await pool.query('SELECT * FROM sintomas WHERE usuario_id=$1 ORDER BY fecha DESC', [req.user.id]);
+            ? await pool.query('SELECT * FROM sintomas WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY fecha DESC', [ownerId, paciente_id])
+            : await pool.query('SELECT * FROM sintomas WHERE usuario_id=$1 ORDER BY fecha DESC', [ownerId]);
         res.json(result.rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -735,9 +839,11 @@ app.post('/api/contactos', authMiddleware, async (req, res) => {
 app.get('/api/contactos', authMiddleware, async (req, res) => {
     const paciente_id = req.query.paciente_id ? parseInt(req.query.paciente_id) : null;
     try {
+        const ownerId = await resolveDataOwnerId(req.user.id, paciente_id);
+        if (ownerId === null) return res.status(403).json({ error: 'Acceso denegado al paciente' });
         const result = paciente_id
-            ? await pool.query('SELECT * FROM contactos WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY nombre ASC', [req.user.id, paciente_id])
-            : await pool.query('SELECT * FROM contactos WHERE usuario_id=$1 ORDER BY nombre ASC', [req.user.id]);
+            ? await pool.query('SELECT * FROM contactos WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY nombre ASC', [ownerId, paciente_id])
+            : await pool.query('SELECT * FROM contactos WHERE usuario_id=$1 ORDER BY nombre ASC', [ownerId]);
         res.json(result.rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -798,9 +904,11 @@ app.post('/api/signos-vitales', authMiddleware, async (req, res) => {
 app.get('/api/signos-vitales', authMiddleware, async (req, res) => {
     const paciente_id = req.query.paciente_id ? parseInt(req.query.paciente_id) : null;
     try {
+        const ownerId = await resolveDataOwnerId(req.user.id, paciente_id);
+        if (ownerId === null) return res.status(403).json({ error: 'Acceso denegado al paciente' });
         const result = paciente_id
-            ? await pool.query('SELECT * FROM signos_vitales WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY fecha DESC', [req.user.id, paciente_id])
-            : await pool.query('SELECT * FROM signos_vitales WHERE usuario_id=$1 ORDER BY fecha DESC', [req.user.id]);
+            ? await pool.query('SELECT * FROM signos_vitales WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY fecha DESC', [ownerId, paciente_id])
+            : await pool.query('SELECT * FROM signos_vitales WHERE usuario_id=$1 ORDER BY fecha DESC', [ownerId]);
         res.json(result.rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -837,9 +945,11 @@ app.post('/api/historial-medicamentos', authMiddleware, async (req, res) => {
 app.get('/api/historial-medicamentos', authMiddleware, async (req, res) => {
     const paciente_id = req.query.paciente_id ? parseInt(req.query.paciente_id) : null;
     try {
+        const ownerId = await resolveDataOwnerId(req.user.id, paciente_id);
+        if (ownerId === null) return res.status(403).json({ error: 'Acceso denegado al paciente' });
         const result = paciente_id
-            ? await pool.query('SELECT * FROM historial_medicamentos WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY fecha DESC LIMIT 100', [req.user.id, paciente_id])
-            : await pool.query('SELECT * FROM historial_medicamentos WHERE usuario_id=$1 ORDER BY fecha DESC LIMIT 100', [req.user.id]);
+            ? await pool.query('SELECT * FROM historial_medicamentos WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY fecha DESC LIMIT 100', [ownerId, paciente_id])
+            : await pool.query('SELECT * FROM historial_medicamentos WHERE usuario_id=$1 ORDER BY fecha DESC LIMIT 100', [ownerId]);
         res.json(result.rows);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -993,9 +1103,8 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', uptime: process.uptime(), time: new Date().toISOString() });
 });
 
-// GET /api/push/debug — diagnóstico público del sistema de push (no requiere auth)
-// Permite verificar desde el navegador si el cron está corriendo y cuántas suscripciones hay
-app.get('/api/push/debug', async (req, res) => {
+// GET /api/push/debug — diagnóstico del sistema de push (requiere auth)
+app.get('/api/push/debug', authMiddleware, async (req, res) => {
     try {
         const subsCount = await pool.query('SELECT COUNT(*) AS c FROM push_subscriptions');
         const medsCount = await pool.query('SELECT COUNT(*) AS c FROM medicamentos WHERE recordatorio = true');
@@ -1251,6 +1360,120 @@ function startPushReminders() {
     console.log('✅ Push reminders iniciados (chequeo cada 8 minutos)');
 }
 
+// ========== CO-CUIDADOR: COMPARTIR ACCESO A PACIENTE (PREMIUM) ==========
+
+// POST /api/share/:pacienteId/invite — el dueño invita a otro email
+app.post('/api/share/:pacienteId/invite', authMiddleware, async (req, res) => {
+    try {
+        const { email } = req.body;
+        if (!email) return res.status(400).json({ error: 'El email del invitado es requerido' });
+        const pacienteId = parseInt(req.params.pacienteId);
+        // Verificar que el paciente pertenece al usuario
+        const pac = await pool.query('SELECT * FROM pacientes WHERE id=$1 AND usuario_id=$2 AND activo=true', [pacienteId, req.user.id]);
+        if (pac.rows.length === 0) return res.status(404).json({ error: 'Paciente no encontrado' });
+        // Solo premium puede compartir
+        const userRes = await pool.query('SELECT premium, nombre FROM usuarios WHERE id=$1', [req.user.id]);
+        if (!userRes.rows[0]?.premium) return res.status(403).json({ error: 'El co-cuidador es una función exclusiva de Premium' });
+        // Verificar que no se invita a sí mismo
+        const propietario = await pool.query('SELECT email FROM usuarios WHERE id=$1', [req.user.id]);
+        if (propietario.rows[0]?.email === email) return res.status(400).json({ error: 'No podés invitarte a vos mismo' });
+        // Generar token de invitación
+        const inviteToken = crypto.randomBytes(32).toString('hex');
+        // Buscar si el invitado ya tiene cuenta
+        const invitado = await pool.query('SELECT id FROM usuarios WHERE email=$1', [email]);
+        const invitadoId = invitado.rows[0]?.id || null;
+        // Insertar o actualizar invitación (ON CONFLICT actualiza token)
+        await pool.query(
+            `INSERT INTO paciente_compartidos (paciente_id, propietario_id, invitado_email, invitado_id, token)
+             VALUES ($1,$2,$3,$4,$5)
+             ON CONFLICT (paciente_id, invitado_email) DO UPDATE SET token=$5, aceptado=FALSE, invitado_id=$4`,
+            [pacienteId, req.user.id, email, invitadoId, inviteToken]
+        );
+        // Enviar email de invitación
+        const acceptLink = `${FRONTEND_URL || 'https://cuidadiario.edensoftwork.com'}/index.html?share=${inviteToken}`;
+        try {
+            await sendEmail({
+                to: email,
+                subject: `👨‍👩‍👧 ${userRes.rows[0].nombre} te invitó a CuidaDiario`,
+                html: `
+                    <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:24px;border:1px solid #e0e0e0;border-radius:8px;">
+                        <h2 style="color:#667eea;">CuidaDiario</h2>
+                        <p><strong>${userRes.rows[0].nombre}</strong> te invitó a colaborar en el cuidado de <strong>${pac.rows[0].nombre}</strong>.</p>
+                        <p>Con este acceso, podrás ver medicamentos, citas, tareas y más.</p>
+                        <div style="text-align:center;margin:28px 0;">
+                            <a href="${acceptLink}" style="background:linear-gradient(135deg,#667eea,#764ba2);color:white;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:600;">Aceptar invitación</a>
+                        </div>
+                        <p style="color:#777;font-size:0.85rem;">Si no conocés a ${userRes.rows[0].nombre}, podés ignorar este email.</p>
+                        <hr style="border:none;border-top:1px solid #eee;margin:20px 0;">
+                        <p style="color:#aaa;font-size:0.78rem;">CuidaDiario by EDEN SoftWork</p>
+                    </div>
+                `
+            });
+        } catch (emailErr) {
+            console.warn('[Share] Email no enviado:', emailErr.message);
+        }
+        res.json({ ok: true, message: `Invitación enviada a ${email}` });
+    } catch (err) {
+        if (err.code === '23505') return res.status(400).json({ error: 'Ya existe una invitación para ese email y paciente' });
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET /api/share/accept?token=... — el invitado acepta la invitación
+app.get('/api/share/accept', authMiddleware, async (req, res) => {
+    const { token } = req.query;
+    if (!token) return res.status(400).json({ error: 'Token requerido' });
+    try {
+        const share = await pool.query('SELECT * FROM paciente_compartidos WHERE token=$1', [token]);
+        if (share.rows.length === 0) return res.status(404).json({ error: 'Invitación no encontrada o ya utilizada' });
+        const s = share.rows[0];
+        // Verificar que el email del usuario autenticado coincide con la invitación
+        const userEmail = await pool.query('SELECT email FROM usuarios WHERE id=$1', [req.user.id]);
+        if (userEmail.rows[0]?.email !== s.invitado_email)
+            return res.status(403).json({ error: 'Esta invitación no es para tu cuenta' });
+        await pool.query(
+            'UPDATE paciente_compartidos SET aceptado=TRUE, invitado_id=$1, token=NULL WHERE id=$2',
+            [req.user.id, s.id]
+        );
+        // Obtener datos del paciente para mostrarlo al aceptar
+        const pac = await pool.query('SELECT nombre FROM pacientes WHERE id=$1', [s.paciente_id]);
+        res.json({ ok: true, paciente: pac.rows[0]?.nombre || 'Paciente', mensaje: '¡Invitación aceptada! Ya podés ver los datos del paciente.' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET /api/share/list/:pacienteId — lista los co-cuidadores de un paciente
+app.get('/api/share/list/:pacienteId', authMiddleware, async (req, res) => {
+    try {
+        const pac = await pool.query('SELECT id FROM pacientes WHERE id=$1 AND usuario_id=$2', [req.params.pacienteId, req.user.id]);
+        if (pac.rows.length === 0) return res.status(403).json({ error: 'No tenés permiso para ver este paciente' });
+        const result = await pool.query(
+            'SELECT id, invitado_email, aceptado, created_at FROM paciente_compartidos WHERE paciente_id=$1 ORDER BY created_at DESC',
+            [req.params.pacienteId]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// DELETE /api/share/:id — el dueño revoca el acceso de un co-cuidador
+app.delete('/api/share/:id', authMiddleware, async (req, res) => {
+    try {
+        // Verificar que el share pertenece a un paciente del usuario
+        const result = await pool.query(
+            `DELETE FROM paciente_compartidos pc USING pacientes p
+             WHERE pc.id=$1 AND pc.paciente_id=p.id AND p.usuario_id=$2 RETURNING pc.id`,
+            [req.params.id, req.user.id]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Acceso compartido no encontrado' });
+        res.json({ ok: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ========== MERCADOPAGO ==========
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 
@@ -1300,8 +1523,35 @@ app.post('/api/create-subscription', authMiddleware, async (req, res) => {
     }
 });
 
+// Helper: verifica firma HMAC-SHA256 del webhook de MercadoPago
+// Requiere MP_WEBHOOK_SECRET en Railway (obtenelo en la configuración de tu app en MP)
+// Si no está configurado, permite el paso con un warning (no rompe funcionalidad existente)
+function verifyMPWebhookSignature(req) {
+    const MP_WEBHOOK_SECRET = process.env.MP_WEBHOOK_SECRET;
+    if (!MP_WEBHOOK_SECRET) {
+        console.warn('[MP Webhook] MP_WEBHOOK_SECRET no configurado — firma no verificada');
+        return true; // Permitir pero loguear
+    }
+    const signature = req.headers['x-signature'];
+    const requestId = req.headers['x-request-id'] || '';
+    if (!signature) return false;
+    const ts = (signature.split(',').find(p => p.startsWith('ts=')) || '').replace('ts=', '');
+    const v1 = (signature.split(',').find(p => p.startsWith('v1=')) || '').replace('v1=', '');
+    if (!ts || !v1) return false;
+    const dataId = req.query['data.id'] || (req.body?.data?.id) || '';
+    const manifest = `id:${dataId};request-id:${requestId};ts:${ts}`;
+    const expected = crypto.createHmac('sha256', MP_WEBHOOK_SECRET).update(manifest).digest('hex');
+    try {
+        return crypto.timingSafeEqual(Buffer.from(v1, 'hex'), Buffer.from(expected, 'hex'));
+    } catch { return false; }
+}
+
 app.post('/api/webhook/mercadopago', async (req, res) => {
     try {
+        if (!verifyMPWebhookSignature(req)) {
+            console.warn('[MP Webhook] Firma inválida — request rechazado');
+            return res.sendStatus(401);
+        }
         const { type, data } = req.body;
         if (type === 'subscription_preapproval' && data?.id) {
             const mp = await mpRequest(`/preapproval/${data.id}`);
