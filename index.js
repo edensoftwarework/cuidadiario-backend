@@ -949,6 +949,16 @@ app.post('/api/push/test', authMiddleware, async (req, res) => {
 });
 
 // Helper: envía una notificación push a todos los dispositivos de un usuario
+// urgency: 'high' → le indica a FCM/Mozilla Push que entregue INMEDIATAMENTE,
+//   bypaseando el Doze Mode de Android (batería optimizada, pantalla apagada).
+//   Sin esto, Android puede retener la notificación hasta que el usuario desbloquee.
+// TTL: 3600 → si el dispositivo está sin conexión, el servidor push reintenta
+//   durante 1 hora. Pasada esa hora, la descarta (el recordatorio ya no tiene sentido).
+const PUSH_OPTIONS = {
+    urgency: 'high',   // ← CRÍTICO para Android con pantalla apagada
+    TTL: 3600          // 1 hora de reintento si el dispositivo está offline
+};
+
 async function sendPushToUser(userId, payload) {
     if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
     try {
@@ -958,7 +968,7 @@ async function sendPushToUser(userId, payload) {
         );
         const promises = subs.rows.map(sub => {
             const subscription = { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } };
-            return webPush.sendNotification(subscription, JSON.stringify(payload))
+            return webPush.sendNotification(subscription, JSON.stringify(payload), PUSH_OPTIONS)
                 .catch(async err => {
                     // Endpoint caducado → eliminar automáticamente
                     if (err.statusCode === 410 || err.statusCode === 404) {
