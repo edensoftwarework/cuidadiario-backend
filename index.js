@@ -973,7 +973,46 @@ async function sendPushToUser(userId, payload) {
     }
 }
 
-// Chequeo periódico de recordatorios — corre cada 10 minutos en el servidor
+// Estado del cron (para endpoint de debug)
+let _cronLastRun = null;
+let _cronRunCount = 0;
+let _cronStartedAt = null;
+
+// GET /health — keep-alive y health check (Railway, UptimeRobot, etc.)
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', uptime: process.uptime(), time: new Date().toISOString() });
+});
+
+// GET /api/push/debug — diagnóstico público del sistema de push (no requiere auth)
+// Permite verificar desde el navegador si el cron está corriendo y cuántas suscripciones hay
+app.get('/api/push/debug', async (req, res) => {
+    try {
+        const subsCount = await pool.query('SELECT COUNT(*) AS c FROM push_subscriptions');
+        const medsCount = await pool.query('SELECT COUNT(*) AS c FROM medicamentos WHERE recordatorio = true');
+        const citasCount = await pool.query('SELECT COUNT(*) AS c FROM citas WHERE recordatorio IS NOT NULL AND recordatorio <> \'0\'');
+        const tareasCount = await pool.query('SELECT COUNT(*) AS c FROM tareas WHERE recordatorio = true AND completada = false');
+        res.json({
+            vapidConfigured: !!(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY),
+            cronRunning: _cronStartedAt !== null,
+            cronStartedAt: _cronStartedAt,
+            cronLastRun: _cronLastRun,
+            cronRunCount: _cronRunCount,
+            subscriptions: parseInt(subsCount.rows[0].c),
+            medicamentosConRecordatorio: parseInt(medsCount.rows[0].c),
+            citasConRecordatorio: parseInt(citasCount.rows[0].c),
+            tareasConRecordatorio: parseInt(tareasCount.rows[0].c),
+            serverTime: new Date().toISOString(),
+            timezoneAR: new Intl.DateTimeFormat('sv-SE', {
+                timeZone: 'America/Argentina/Buenos_Aires',
+                hour: '2-digit', minute: '2-digit', second: '2-digit'
+            }).format(new Date())
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message, vapidConfigured: !!(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) });
+    }
+});
+
+// Chequeo periódico de recordatorios — corre cada 8 minutos en el servidor
 function startPushReminders() {
     if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
         console.log('ℹ️  Push reminders desactivados (VAPID keys no configuradas)');
@@ -1077,8 +1116,10 @@ function startPushReminders() {
                 const horaMatch = horarios.find(h => {
                     const [hh, mm] = h.split(':').map(Number);
                     const medMin = hh * 60 + mm;
-                    // Ventana de 15 min (el cron corre cada 8 min → siempre hay overlap)
-                    return medMin >= tzMin && medMin < tzMin + 15;
+                    // Ventana: hasta 8 min atrás + 15 min adelante.
+                    // Cubre reinicios del servidor (si arrancó 5 min tarde, igual atrapa el horario)
+                    // La deduplicación (push_sent) garantiza que no se envíe dos veces.
+                    return medMin >= tzMin - 8 && medMin < tzMin + 15;
                 });
                 if (!horaMatch) continue;
                 const tag = `med-${med.usuario_id}-${med.nombre}-${horaMatch}-${tzNow.dateStr}`;
@@ -1183,14 +1224,17 @@ function startPushReminders() {
             }
 
             const log = nowInTZ('America/Argentina/Buenos_Aires');
-            console.log(`[Push Reminders] Chequeo OK — ${String(log.hours).padStart(2,'0')}:${String(log.minutes).padStart(2,'0')} AR`);
+            _cronLastRun = new Date().toISOString();
+            _cronRunCount++;
+            console.log(`[Push Reminders] Chequeo OK — ${String(log.hours).padStart(2,'0')}:${String(log.minutes).padStart(2,'0')} AR — #${_cronRunCount}`);
         } catch (err) {
             console.error('[Push Reminders] Error:', err.message);
         }
     }
 
     checkAndSendReminders();
-    setInterval(checkAndSendReminders, 8 * 60 * 1000); // cada 8 minutos — ventana de 15 min garantiza cobertura total
+    _cronStartedAt = new Date().toISOString();
+    setInterval(checkAndSendReminders, 8 * 60 * 1000); // cada 8 minutos — ventana ±8+15 min garantiza cobertura total
     console.log('✅ Push reminders iniciados (chequeo cada 8 minutos)');
 }
 
@@ -1426,5 +1470,20 @@ app.listen(PORT, async () => {
     console.log(`✅ Servidor escuchando en puerto ${PORT}`);
     console.log(`📍 http://localhost:${PORT}`);
     await runMigrations();
-    startPushReminders(); // ← NUEVO: arranca el chequeo periódico de push
+    startPushReminders(); // ← Arranca el chequeo periódico de push
+
+    // Keep-alive: evita que Railway duerma el servidor en planes gratuitos.
+    // Se hace un GET a /health propio cada 4 minutos.
+    const BACKEND_URL = process.env.RAILWAY_STATIC_URL
+        ? `https://${process.env.RAILWAY_STATIC_URL}`
+        : (process.env.BACKEND_URL || null);
+    if (BACKEND_URL) {
+        setInterval(() => {
+            https.get(`${BACKEND_URL}/health`, (res) => {
+                // Solo para mantener vivo el proceso, no necesitamos la respuesta
+                res.resume();
+            }).on('error', () => { /* silencioso — el servidor sigue corriendo */ });
+        }, 4 * 60 * 1000); // cada 4 minutos
+        console.log(`🏓 Keep-alive activado → ${BACKEND_URL}/health`);
+    }
 });
