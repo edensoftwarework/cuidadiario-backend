@@ -897,6 +897,57 @@ app.delete('/api/push/unsubscribe', authMiddleware, async (req, res) => {
     }
 });
 
+// GET /api/push/status — devuelve cuántos dispositivos tiene suscritos el usuario
+app.get('/api/push/status', authMiddleware, async (req, res) => {
+    try {
+        const subs = await pool.query(
+            'SELECT endpoint, created_at FROM push_subscriptions WHERE usuario_id=$1',
+            [req.user.id]
+        );
+        res.json({
+            vapidConfigured: !!(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY),
+            devices: subs.rows.length,
+            subscriptions: subs.rows.map(s => ({
+                endpoint: s.endpoint.substring(0, 50) + '...',
+                since: s.created_at
+            }))
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/push/test — envía una notificación push de prueba al usuario autenticado
+app.post('/api/push/test', authMiddleware, async (req, res) => {
+    try {
+        if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+            return res.status(503).json({
+                error: 'VAPID keys no configuradas en el servidor. Ejecutá setup-vapid.js y agregá las variables a Railway.'
+            });
+        }
+        const subs = await pool.query(
+            'SELECT endpoint FROM push_subscriptions WHERE usuario_id=$1',
+            [req.user.id]
+        );
+        if (subs.rows.length === 0) {
+            return res.status(404).json({
+                error: 'No hay suscripción push para este dispositivo. Activá las notificaciones primero.',
+                devices: 0
+            });
+        }
+        await sendPushToUser(req.user.id, {
+            title: '✅ ¡Notificaciones funcionando!',
+            body: 'Si ves esto, los recordatorios van a llegar aunque tengas la app cerrada.',
+            tag: `test-${req.user.id}-${Date.now()}`,
+            url: '/'
+        });
+        res.json({ ok: true, devices: subs.rows.length });
+    } catch (err) {
+        console.error('[Push] Error en test push:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Helper: envía una notificación push a todos los dispositivos de un usuario
 async function sendPushToUser(userId, payload) {
     if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
