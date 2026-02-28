@@ -1187,7 +1187,7 @@ function startPushReminders() {
                 INNER JOIN usuarios u ON u.id = t.usuario_id
                 WHERE t.completada = false
                   AND t.recordatorio = true
-                  AND t.hora IS NOT NULL AND t.hora <> ''
+                  AND t.hora IS NOT NULL
                   AND (t.fecha::date + t.hora::time)
                       BETWEEN (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))
                               - INTERVAL '8 minutes'
