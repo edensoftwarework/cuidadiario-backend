@@ -1506,7 +1506,7 @@ app.post('/api/create-subscription', authMiddleware, async (req, res) => {
         const user = userResult.rows[0];
         const payload = {
             reason: 'CuidaDiario Premium',
-            auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: 16, currency_id: 'ARS' },
+            auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: 3500, currency_id: 'ARS' },
             back_url: 'https://cuidadiario.edensoftwork.com/pages/premium-success.html',
             payer_email: user.email,
             external_reference: String(req.user.id)
@@ -1552,19 +1552,48 @@ app.post('/api/webhook/mercadopago', async (req, res) => {
             console.warn('[MP Webhook] Firma inválida — request rechazado');
             return res.sendStatus(401);
         }
-        const { type, data } = req.body;
-        if (type === 'subscription_preapproval' && data?.id) {
-            const mp = await mpRequest(`/preapproval/${data.id}`);
+
+        const body = req.body || {};
+
+        // ── Soporta AMBOS sistemas de notificación de MercadoPago ──────────────
+        // 1) Nuevo sistema (Webhooks API): body JSON con type y data.id
+        // 2) IPN clásico: query params ?topic=preapproval&id=PREAPPROVAL_ID
+        const type  = body.type  || null;
+        const topic = req.query.topic || body.topic || null;
+
+        // ID del preapproval: viene en body (nuevo) O en query params (IPN)
+        const dataId = body.data?.id
+            || req.query['data.id']
+            || req.query.id
+            || null;
+
+        const isPreapprovalEvent =
+            type  === 'subscription_preapproval' ||
+            type  === 'preapproval'              ||
+            topic === 'preapproval';
+
+        console.log(`[MP Webhook] Recibido — type="${type}" topic="${topic}" dataId="${dataId}"`);
+
+        if (isPreapprovalEvent && dataId) {
+            const mp = await mpRequest(`/preapproval/${dataId}`);
             if (mp.status === 200) {
                 const preapproval = mp.body;
                 const userId = parseInt(preapproval.external_reference);
                 if (userId && !isNaN(userId)) {
                     const isPremium = preapproval.status === 'authorized';
                     await pool.query('UPDATE usuarios SET premium=$1 WHERE id=$2', [isPremium, userId]);
-                    console.log(`[MP Webhook] Usuario ${userId} → premium: ${isPremium} (estado: ${preapproval.status})`);
+                    console.log(`[MP Webhook] ✅ Usuario ${userId} → premium: ${isPremium} (estado MP: "${preapproval.status}")`);
+                } else {
+                    console.warn(`[MP Webhook] external_reference inválido: "${preapproval.external_reference}"`);
                 }
+            } else {
+                console.warn(`[MP Webhook] No se pudo obtener preapproval "${dataId}" — HTTP ${mp.status}`);
             }
+        } else {
+            // Evento que no es de preapproval (pagos, etc.) — ignorar silenciosamente
+            console.log(`[MP Webhook] Evento ignorado (no es preapproval)`);
         }
+
         res.sendStatus(200);
     } catch (err) {
         console.error('[MP Webhook] Error:', err.message);
