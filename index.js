@@ -1142,7 +1142,10 @@ function startPushReminders() {
                 await markAsSent(tag);
             }
 
-            // ── 2. Citas: recordatorio vence en los próximos 15 min (por timezone del usuario) ──
+            // ── 2. Citas: recordatorio vence en la ventana actual (±8/+15 min por timezone) ──
+            // Usamos c.fecha + c.hora::time (suma DATE + TIME en PostgreSQL = TIMESTAMP WITHOUT TZ)
+            // en vez de concatenación de strings para evitar errores de formato con tipos nativos.
+            // Ventana: -8 min (cubre reinicios del servidor) + 15 min adelante.
             const citas = await pool.query(`
                 SELECT c.usuario_id, c.titulo, c.fecha, c.hora, c.recordatorio, c.lugar
                 FROM citas c
@@ -1151,12 +1154,11 @@ function startPushReminders() {
                 WHERE c.recordatorio IS NOT NULL
                   AND c.recordatorio <> '0'
                   AND c.hora IS NOT NULL
-                  AND c.hora <> ''
-                  AND (c.fecha || ' ' || c.hora)::timestamp
+                  AND (c.fecha::date + c.hora::time)
                       - (CAST(c.recordatorio AS integer) * INTERVAL '1 minute')
-                      BETWEEN (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))::timestamp
-                              - INTERVAL '2 minutes'
-                          AND (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))::timestamp
+                      BETWEEN (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))
+                              - INTERVAL '8 minutes'
+                          AND (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))
                               + INTERVAL '15 minutes'
             `);
             for (const cita of citas.rows) {
@@ -1175,7 +1177,9 @@ function startPushReminders() {
                 await markAsSent(tag);
             }
 
-            // ── 3. Tareas con hora específica (±15 min, en timezone del usuario) ──
+            // ── 3. Tareas con hora específica (ventana -8/+15 min, en timezone del usuario) ──
+            // Compara fecha+hora completa como TIMESTAMP para consistencia con citas.
+            // La ventana -8 min cubre reinicios del servidor igual que medicamentos y citas.
             const tareasConHora = await pool.query(`
                 SELECT t.usuario_id, t.titulo, t.hora, t.fecha
                 FROM tareas t
@@ -1184,11 +1188,10 @@ function startPushReminders() {
                 WHERE t.completada = false
                   AND t.recordatorio = true
                   AND t.hora IS NOT NULL AND t.hora <> ''
-                  AND t.fecha = (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))::date::text
-                  AND t.hora::time
-                      BETWEEN (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))::time
-                              - INTERVAL '2 minutes'
-                          AND (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))::time
+                  AND (t.fecha::date + t.hora::time)
+                      BETWEEN (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))
+                              - INTERVAL '8 minutes'
+                          AND (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))
                               + INTERVAL '15 minutes'
             `);
             for (const tarea of tareasConHora.rows) {
