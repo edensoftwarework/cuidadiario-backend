@@ -1506,7 +1506,7 @@ app.post('/api/create-subscription', authMiddleware, async (req, res) => {
         const user = userResult.rows[0];
         const payload = {
             reason: 'CuidaDiario Premium',
-            auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: 16, currency_id: 'ARS' },
+            auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: 3500, currency_id: 'ARS' },
             back_url: 'https://cuidadiario.edensoftwork.com/pages/premium-success.html',
             payer_email: user.email,
             external_reference: String(req.user.id)
@@ -1631,7 +1631,13 @@ app.get('/api/verify-subscription', authMiddleware, async (req, res) => {
             const search = await mpRequest(`/preapproval/search?external_reference=${req.user.id}&status=authorized`);
             if (search.status === 200) {
                 const results = search.body?.results || [];
-                authorized = results.find(p => p.status === 'authorized') || null;
+                // CRÍTICO: verificar que external_reference coincide con el usuario solicitante.
+                // Sin esta verificación, un bug de la API de MP podría retornar suscripciones ajenas
+                // (ej: en entornos de prueba), otorgando premium a co-cuidadores sin suscripción.
+                authorized = results.find(p =>
+                    p.status === 'authorized' &&
+                    parseInt(p.external_reference) === req.user.id
+                ) || null;
             }
         }
 
