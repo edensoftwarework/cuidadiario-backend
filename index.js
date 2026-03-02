@@ -1183,15 +1183,24 @@ function startPushReminders() {
         const [hI, mI] = horaInicioStr.split(':').map(n => parseInt(n) || 0);
         const [hF, mF] = horaFinStr.split(':').map(n => parseInt(n) || 0);
         const inicioMin = hI * 60 + mI;
-        const finMin    = hF * 60 + mF;
+        let finMin      = hF * 60 + mF;
+
+        // 23:59 = fin de día → extender a 1440 para incluir toma de medianoche (00:00)
+        if (finMin === 1439) finMin = 1440;
+        // Detectar ventana que cruza medianoche (ej. 23:39 → 06:00)
+        const crossesMidnight = inicioMin > finMin;
+        const windowMinutes = crossesMidnight
+            ? (1440 - inicioMin) + finMin + 1
+            : finMin - inicioMin + 1;
 
         const horarios = [];
-        let t = inicioMin;
-        while (t <= finMin) {
+        let elapsed = 0;
+        while (elapsed < windowMinutes) {
+            const t = (inicioMin + elapsed) % 1440;
             const h = Math.floor(t / 60);
             const m = t % 60;
-            if (h < 24) horarios.push(`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`);
-            t += intervaloHoras * 60;
+            horarios.push(`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`);
+            elapsed += intervaloHoras * 60;
         }
         // Garantizar al menos un horario aunque hora_inicio sea >= hora_fin
         if (horarios.length === 0) {
@@ -1228,7 +1237,7 @@ function startPushReminders() {
             const allMeds = await pool.query(`
                 SELECT DISTINCT ON (m.id)
                     m.usuario_id, m.nombre, m.dosis,
-                    m.hora_inicio, m.frecuencia, m.horarios_custom,
+                    m.hora_inicio, m.hora_fin, m.frecuencia, m.horarios_custom,
                     COALESCE(u.timezone, 'America/Argentina/Buenos_Aires') AS timezone
                 FROM medicamentos m
                 INNER JOIN push_subscriptions ps ON ps.usuario_id = m.usuario_id
@@ -1244,10 +1253,10 @@ function startPushReminders() {
                 const horaMatch = horarios.find(h => {
                     const [hh, mm] = h.split(':').map(Number);
                     const medMin = hh * 60 + mm;
-                    // Ventana: hasta 8 min atrás + 15 min adelante.
-                    // Cubre reinicios del servidor (si arrancó 5 min tarde, igual atrapa el horario)
-                    // La deduplicación (push_sent) garantiza que no se envíe dos veces.
-                    return medMin >= tzMin - 8 && medMin < tzMin + 15;
+                    // Comparación circular: cubre horarios cerca de medianoche (ej. 00:00)
+                    // Ventana: -8 min pasados a +15 min adelante (modular sobre 1440).
+                    const diff = (medMin - tzMin + 1440) % 1440;
+                    return diff < 15 || diff >= 1432;
                 });
                 if (!horaMatch) continue;
                 const tag = `med-${med.usuario_id}-${med.nombre}-${horaMatch}-${tzNow.dateStr}`;
@@ -1515,7 +1524,7 @@ app.post('/api/create-subscription', authMiddleware, async (req, res) => {
         const user = userResult.rows[0];
         const payload = {
             reason: 'CuidaDiario Premium',
-            auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: 16, currency_id: 'ARS' },
+            auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: 3500, currency_id: 'ARS' },
             back_url: 'https://cuidadiario.edensoftwork.com/pages/premium-success.html',
             payer_email: user.email,
             external_reference: String(req.user.id)
