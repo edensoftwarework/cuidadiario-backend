@@ -1515,7 +1515,7 @@ app.post('/api/create-subscription', authMiddleware, async (req, res) => {
         const user = userResult.rows[0];
         const payload = {
             reason: 'CuidaDiario Premium',
-            auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: 3500, currency_id: 'ARS' },
+            auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: 16, currency_id: 'ARS' },
             back_url: 'https://cuidadiario.edensoftwork.com/pages/premium-success.html',
             payer_email: user.email,
             external_reference: String(req.user.id)
