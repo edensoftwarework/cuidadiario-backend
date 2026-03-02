@@ -247,6 +247,12 @@ async function runMigrations() {
             )
         `);
 
+        // NUEVO: columna hora_fin en medicamentos (ventana de vigilia)
+        await pool.query(`
+            ALTER TABLE medicamentos
+            ADD COLUMN IF NOT EXISTS hora_fin VARCHAR(5)
+        `);
+
         console.log('✅ Migraciones completadas');
     } catch (err) {
         console.error('❌ Error en migraciones:', err.message);
@@ -547,14 +553,14 @@ app.delete('/api/pacientes/:id', authMiddleware, async (req, res) => {
 
 // ========== MEDICAMENTOS ==========
 app.post('/api/medicamentos', authMiddleware, async (req, res) => {
-    const { nombre, dosis, frecuencia, horaInicio, hora_inicio, recordatorio, notas, horariosCustom, horarios_custom, paciente_id, pacienteId } = req.body;
+    const { nombre, dosis, frecuencia, horaInicio, hora_inicio, horaFin, hora_fin, recordatorio, notas, horariosCustom, horarios_custom, paciente_id, pacienteId } = req.body;
     try {
         const pid = await resolvePatientId(paciente_id || pacienteId || null, req.user.id);
         if (pid && !(await validatePaciente(pid, req.user.id)))
             return res.status(403).json({ error: 'El paciente no pertenece a este usuario' });
         const result = await pool.query(
-            'INSERT INTO medicamentos (usuario_id, paciente_id, nombre, dosis, frecuencia, hora_inicio, recordatorio, notas, horarios_custom) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
-            [req.user.id, pid, nombre, dosis, frecuencia, horaInicio || hora_inicio || null, recordatorio || false, notas || null, horariosCustom || horarios_custom || null]
+            'INSERT INTO medicamentos (usuario_id, paciente_id, nombre, dosis, frecuencia, hora_inicio, hora_fin, recordatorio, notas, horarios_custom) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
+            [req.user.id, pid, nombre, dosis, frecuencia, horaInicio || hora_inicio || null, horaFin || hora_fin || null, recordatorio || false, notas || null, horariosCustom || horarios_custom || null]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -587,11 +593,11 @@ app.get('/api/medicamentos/:id', authMiddleware, async (req, res) => {
 });
 
 app.put('/api/medicamentos/:id', authMiddleware, async (req, res) => {
-    const { nombre, dosis, frecuencia, horaInicio, hora_inicio, recordatorio, notas, horariosCustom, horarios_custom } = req.body;
+    const { nombre, dosis, frecuencia, horaInicio, hora_inicio, horaFin, hora_fin, recordatorio, notas, horariosCustom, horarios_custom } = req.body;
     try {
         const result = await pool.query(
-            'UPDATE medicamentos SET nombre=$1, dosis=$2, frecuencia=$3, hora_inicio=$4, recordatorio=$5, notas=$6, horarios_custom=$7 WHERE id=$8 AND usuario_id=$9 RETURNING *',
-            [nombre, dosis, frecuencia, horaInicio || hora_inicio || null, recordatorio, notas || null, horariosCustom || horarios_custom || null, req.params.id, req.user.id]
+            'UPDATE medicamentos SET nombre=$1, dosis=$2, frecuencia=$3, hora_inicio=$4, hora_fin=$5, recordatorio=$6, notas=$7, horarios_custom=$8 WHERE id=$9 AND usuario_id=$10 RETURNING *',
+            [nombre, dosis, frecuencia, horaInicio || hora_inicio || null, horaFin || hora_fin || null, recordatorio, notas || null, horariosCustom || horarios_custom || null, req.params.id, req.user.id]
         );
         if (result.rows.length === 0) return res.status(404).json({ error: 'Medicamento no encontrado' });
         res.json(result.rows[0]);
@@ -1162,8 +1168,9 @@ function startPushReminders() {
         }
     }
 
-    // Genera todos los horarios del día de un medicamento según su frecuencia
-    // Si no tiene hora_inicio usa 08:00 como punto de partida; nunca pasa de las 22:00
+    // Genera todos los horarios del día de un medicamento respetando la ventana de vigilia.
+    // hora_inicio (def. 08:00) → hora_fin (def. 22:00). No genera horarios fuera de esa ventana.
+    // Ejemplo: inicio=12:00, cada-6h, fin=22:00 → [12:00, 18:00]
     function getMedHorarios(med) {
         if (med.frecuencia === 'custom' && med.horarios_custom) {
             return med.horarios_custom.split(',').map(h => h.trim()).filter(Boolean);
@@ -1171,22 +1178,24 @@ function startPushReminders() {
         const frecuencias = { 'cada-4h': 4, 'cada-6h': 6, 'cada-8h': 8, 'cada-12h': 12, 'diaria': 24 };
         const intervaloHoras = frecuencias[med.frecuencia] || 24;
 
-        // Si no tiene hora_inicio configurada, arrancar a las 08:00
         const horaInicioStr = (med.hora_inicio && med.hora_inicio !== '') ? med.hora_inicio : '08:00';
-        const [hStr, mStr] = horaInicioStr.split(':');
-        const horaInicio = parseInt(hStr) || 8;
-        const minInicio  = parseInt(mStr) || 0;
+        const horaFinStr    = (med.hora_fin    && med.hora_fin    !== '') ? med.hora_fin    : '22:00';
+        const [hI, mI] = horaInicioStr.split(':').map(n => parseInt(n) || 0);
+        const [hF, mF] = horaFinStr.split(':').map(n => parseInt(n) || 0);
+        const inicioMin = hI * 60 + mI;
+        const finMin    = hF * 60 + mF;
 
         const horarios = [];
-        let h = horaInicio;
-        // Generar horarios hasta las 22:00 (10 PM) — no molestar de madrugada
-        while (h < 22) {
-            horarios.push(`${String(h).padStart(2,'0')}:${String(minInicio).padStart(2,'0')}`);
-            h += intervaloHoras;
+        let t = inicioMin;
+        while (t <= finMin) {
+            const h = Math.floor(t / 60);
+            const m = t % 60;
+            if (h < 24) horarios.push(`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`);
+            t += intervaloHoras * 60;
         }
-        // Garantizar al menos un horario aunque hora_inicio sea >= 22
+        // Garantizar al menos un horario aunque hora_inicio sea >= hora_fin
         if (horarios.length === 0) {
-            horarios.push(`${String(horaInicio).padStart(2,'0')}:${String(minInicio).padStart(2,'0')}`);
+            horarios.push(`${String(hI).padStart(2,'0')}:${String(mI).padStart(2,'0')}`);
         }
         return horarios;
     }
@@ -1506,7 +1515,7 @@ app.post('/api/create-subscription', authMiddleware, async (req, res) => {
         const user = userResult.rows[0];
         const payload = {
             reason: 'CuidaDiario Premium',
-            auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: 16, currency_id: 'ARS' },
+            auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: 3500, currency_id: 'ARS' },
             back_url: 'https://cuidadiario.edensoftwork.com/pages/premium-success.html',
             payer_email: user.email,
             external_reference: String(req.user.id)
