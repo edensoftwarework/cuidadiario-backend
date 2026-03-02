@@ -253,6 +253,28 @@ async function runMigrations() {
             ADD COLUMN IF NOT EXISTS hora_fin VARCHAR(5)
         `);
 
+        // NUEVO: tabla historial de tareas realizadas (similar a historial_medicamentos)
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS historial_tareas (
+                id              SERIAL PRIMARY KEY,
+                usuario_id      INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+                paciente_id     INTEGER REFERENCES pacientes(id) ON DELETE SET NULL,
+                tarea_id        INTEGER,
+                tarea_titulo    TEXT,
+                notas           TEXT,
+                fecha           TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        `);
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS idx_historial_tareas_usuario ON historial_tareas (usuario_id, fecha DESC)
+        `).catch(() => {});
+
+        // NUEVO: flag servidor para modal de bienvenida premium (multi-dispositivo)
+        await pool.query(`
+            ALTER TABLE usuarios
+            ADD COLUMN IF NOT EXISTS premium_welcome_pending BOOLEAN DEFAULT FALSE
+        `);
+
         console.log('✅ Migraciones completadas');
     } catch (err) {
         console.error('❌ Error en migraciones:', err.message);
@@ -972,7 +994,46 @@ app.delete('/api/historial-medicamentos/:id', authMiddleware, async (req, res) =
     }
 });
 
-// ========== PUSH NOTIFICATIONS (NUEVO) ==========
+// ========== HISTORIAL TAREAS ==========
+app.post('/api/historial-tareas', authMiddleware, async (req, res) => {
+    const { tarea_id, tareaId, tarea_titulo, tareaTitulo, notas, fecha, paciente_id, pacienteId } = req.body;
+    try {
+        const pid = await resolvePatientId(paciente_id || pacienteId || null, req.user.id);
+        if (pid && !(await validatePaciente(pid, req.user.id)))
+            return res.status(403).json({ error: 'El paciente no pertenece a este usuario' });
+        const result = await pool.query(
+            'INSERT INTO historial_tareas (usuario_id, paciente_id, tarea_id, tarea_titulo, notas, fecha) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
+            [req.user.id, pid, tarea_id || tareaId || null, tarea_titulo || tareaTitulo || null, notas || null, fecha ? new Date(fecha) : new Date()]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/historial-tareas', authMiddleware, async (req, res) => {
+    const paciente_id = req.query.paciente_id ? parseInt(req.query.paciente_id) : null;
+    try {
+        const ownerId = await resolveDataOwnerId(req.user.id, paciente_id);
+        if (ownerId === null) return res.status(403).json({ error: 'Acceso denegado al paciente' });
+        const result = paciente_id
+            ? await pool.query('SELECT * FROM historial_tareas WHERE usuario_id=$1 AND paciente_id=$2 ORDER BY fecha DESC LIMIT 100', [ownerId, paciente_id])
+            : await pool.query('SELECT * FROM historial_tareas WHERE usuario_id=$1 ORDER BY fecha DESC LIMIT 100', [ownerId]);
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.delete('/api/historial-tareas/:id', authMiddleware, async (req, res) => {
+    try {
+        const result = await pool.query('DELETE FROM historial_tareas WHERE id=$1 AND usuario_id=$2 RETURNING *', [req.params.id, req.user.id]);
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Registro no encontrado' });
+        res.json({ message: 'Registro eliminado' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 
 // GET /api/push/vapid-key — devuelve la clave pública VAPID al frontend
 app.get('/api/push/vapid-key', (req, res) => {
@@ -1599,7 +1660,11 @@ app.post('/api/webhook/mercadopago', async (req, res) => {
                 const userId = parseInt(preapproval.external_reference);
                 if (userId && !isNaN(userId)) {
                     const isPremium = preapproval.status === 'authorized';
-                    await pool.query('UPDATE usuarios SET premium=$1 WHERE id=$2', [isPremium, userId]);
+                    if (isPremium) {
+                        await pool.query('UPDATE usuarios SET premium=TRUE, premium_welcome_pending=TRUE WHERE id=$1', [userId]);
+                    } else {
+                        await pool.query('UPDATE usuarios SET premium=FALSE WHERE id=$1', [userId]);
+                    }
                     console.log(`[MP Webhook] ✅ Usuario ${userId} → premium: ${isPremium} (estado MP: "${preapproval.status}")`);
                 } else {
                     console.warn(`[MP Webhook] external_reference inválido: "${preapproval.external_reference}"`);
@@ -1660,7 +1725,7 @@ app.get('/api/verify-subscription', authMiddleware, async (req, res) => {
         }
 
         if (authorized) {
-            await pool.query('UPDATE usuarios SET premium=TRUE WHERE id=$1', [req.user.id]);
+            await pool.query('UPDATE usuarios SET premium=TRUE, premium_welcome_pending=TRUE WHERE id=$1', [req.user.id]);
             console.log(`[MP Verify] ✅ Usuario ${req.user.id} → premium: TRUE (preapproval: ${authorized.id})`);
             return res.json({ premium: true, status: 'authorized' });
         }
@@ -1697,11 +1762,22 @@ app.get('/api/verify-subscription', authMiddleware, async (req, res) => {
 app.get('/api/me', authMiddleware, async (req, res) => {
     try {
         const result = await pool.query(
-            "SELECT id, nombre, email, premium, COALESCE(timezone,'America/Argentina/Buenos_Aires') AS timezone FROM usuarios WHERE id=$1",
+            "SELECT id, nombre, email, premium, COALESCE(premium_welcome_pending,FALSE) AS premium_welcome_pending, COALESCE(timezone,'America/Argentina/Buenos_Aires') AS timezone FROM usuarios WHERE id=$1",
             [req.user.id]
         );
         if (result.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
         res.json({ usuario: result.rows[0] });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/premium/acknowledge-welcome — el frontend lo llama tras mostrar el modal.
+// Evita que el modal se repita en otras sesiones/dispositivos del mismo usuario.
+app.post('/api/premium/acknowledge-welcome', authMiddleware, async (req, res) => {
+    try {
+        await pool.query('UPDATE usuarios SET premium_welcome_pending=FALSE WHERE id=$1', [req.user.id]);
+        res.json({ ok: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
