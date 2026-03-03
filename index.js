@@ -1153,6 +1153,26 @@ const PUSH_OPTIONS = {
     TTL: 7200
 };
 
+// ── DEDUPLICACIÓN A NIVEL MÓDULO ──
+// CRÍTICO: deben estar aquí (módulo) para que sendPushToUser pueda accederlas.
+// Estaban dentro de startPushReminders() — eso causaba ReferenceError silencioso
+// y ninguna notificación era enviada.
+async function wasAlreadySent(tag) {
+    try {
+        const r = await pool.query(
+            "SELECT 1 FROM push_sent WHERE tag=$1 AND sent_at > NOW() - INTERVAL '25 minutes'",
+            [tag]
+        );
+        return r.rows.length > 0;
+    } catch { return false; }
+}
+
+async function markAsSent(tag) {
+    try {
+        await pool.query('INSERT INTO push_sent (tag, sent_at) VALUES ($1, NOW())', [tag]);
+    } catch { /* OK — entrada duplicada ignorada */ }
+}
+
 async function sendPushToUser(userId, payload, deduplicationBaseTag = null) {
     if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return { sent: 0, failed: 0, skipped: 0, total: 0 };
     try {
@@ -1324,24 +1344,6 @@ function startPushReminders() {
             horarios.push(`${String(hI).padStart(2,'0')}:${String(mI).padStart(2,'0')}`);
         }
         return horarios;
-    }
-
-    // Deduplicación: verifica si ya se envió esta notificación en los últimos 25 min
-    // Ventana mayor que el lookback (20 min) para garantizar sin duplicados aún con delays
-    async function wasAlreadySent(tag) {
-        try {
-            const r = await pool.query(
-                "SELECT 1 FROM push_sent WHERE tag=$1 AND sent_at > NOW() - INTERVAL '25 minutes'",
-                [tag]
-            );
-            return r.rows.length > 0;
-        } catch { return false; }
-    }
-
-    async function markAsSent(tag) {
-        try {
-            await pool.query('INSERT INTO push_sent (tag, sent_at) VALUES ($1, NOW())', [tag]);
-        } catch { /* OK — entrada duplicada ignorada */ }
     }
 
     async function checkAndSendReminders() {
