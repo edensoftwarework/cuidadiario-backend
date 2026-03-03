@@ -1430,14 +1430,16 @@ function startPushReminders() {
                 }, tag);
             }
 
-            // ── 3. Tareas con hora específica (ventana -20/+15 min, en timezone del usuario) ──
-            const tareasConHora = await pool.query(`
-                SELECT t.usuario_id, t.titulo, t.hora, t.fecha
+            // ── 3. Tareas ÚNICAS: el datetime exacto (fecha + hora) cae en la ventana actual ──
+            // Funciona igual que citas: dispara una única vez cuando fecha+hora coincide.
+            const tareasUnicas = await pool.query(`
+                SELECT t.id, t.usuario_id, t.titulo, t.hora, t.fecha
                 FROM tareas t
                 INNER JOIN push_subscriptions ps ON ps.usuario_id = t.usuario_id
                 INNER JOIN usuarios u ON u.id = t.usuario_id
                 WHERE t.completada = false
                   AND t.recordatorio = true
+                  AND t.frecuencia = 'unica'
                   AND t.hora IS NOT NULL
                   AND (t.fecha::date + t.hora::time)
                       BETWEEN (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))
@@ -1445,8 +1447,9 @@ function startPushReminders() {
                           AND (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))
                               + INTERVAL '15 minutes'
             `);
-            for (const tarea of tareasConHora.rows) {
-                const tag = `tarea-${tarea.usuario_id}-${tarea.fecha}-${tarea.hora}`;
+            for (const tarea of tareasUnicas.rows) {
+                // Tag fijo con fecha+hora: solo dispara una vez en toda la vida de esta tarea
+                const tag = `tarea-unica-${tarea.usuario_id}-${tarea.id}-${tarea.fecha}-${tarea.hora.substring(0,5)}`;
                 await sendPushToUser(tarea.usuario_id, {
                     title: '✓ Recordatorio de tarea',
                     body: `${tarea.titulo} — a las ${tarea.hora.substring(0, 5)}`,
@@ -1454,31 +1457,35 @@ function startPushReminders() {
                 }, tag);
             }
 
-            // ── 4. Tareas sin hora: resumen diario a las 8 AM (por timezone del usuario) ──
-            const tareasResumen = await pool.query(`
-                SELECT t.usuario_id,
+            // ── 4. Tareas DIARIAS: la hora coincide con la ventana actual Y hoy está dentro del rango activo ──
+            // fecha = fecha de inicio (primer día), hasta_fecha = último día (NULL = indefinido).
+            // El tag incluye tzNow.dateStr → se resetea cada día → notifica todos los días del rango.
+            const tareasDiarias = await pool.query(`
+                SELECT t.id, t.usuario_id, t.titulo, t.hora, t.fecha, t.hasta_fecha,
                        COALESCE(u.timezone,'America/Argentina/Buenos_Aires') AS timezone
                 FROM tareas t
                 INNER JOIN push_subscriptions ps ON ps.usuario_id = t.usuario_id
                 INNER JOIN usuarios u ON u.id = t.usuario_id
                 WHERE t.completada = false
                   AND t.recordatorio = true
-                  AND (t.hora IS NULL OR t.hora = '')
-                GROUP BY t.usuario_id, u.timezone
+                  AND t.frecuencia = 'diaria'
+                  AND t.hora IS NOT NULL
             `);
-            for (const row of tareasResumen.rows) {
-                const tzNow = nowInTZ(row.timezone);
-                if (tzNow.hours !== 8 || tzNow.minutes >= 10) continue;
-                const cnt = await pool.query(
-                    "SELECT COUNT(*) AS c FROM tareas WHERE usuario_id=$1 AND completada=false AND recordatorio=true AND (hora IS NULL OR hora='') AND fecha=$2",
-                    [row.usuario_id, tzNow.dateStr]
-                );
-                const pendientes = parseInt(cnt.rows[0]?.c || 0);
-                if (pendientes === 0) continue;
-                const tag = `tareas-resumen-${row.usuario_id}-${tzNow.dateStr}`;
-                await sendPushToUser(row.usuario_id, {
-                    title: '✓ Tareas pendientes hoy',
-                    body: `Tenés ${pendientes} tarea${pendientes > 1 ? 's' : ''} pendiente${pendientes > 1 ? 's' : ''} para hoy`,
+            for (const tarea of tareasDiarias.rows) {
+                const tzNow = nowInTZ(tarea.timezone);
+                // ¿Hoy está dentro del rango activo?
+                if (tarea.fecha > tzNow.dateStr) continue;       // aún no empezó
+                if (tarea.hasta_fecha && tarea.hasta_fecha < tzNow.dateStr) continue; // ya terminó
+                // ¿La hora coincide con la ventana actual? (igual que medicamentos, ventana circular)
+                const [hh, mm] = tarea.hora.substring(0, 5).split(':').map(Number);
+                const tareaMin = hh * 60 + mm;
+                const diff = (tareaMin - tzNow.totalMinutes + 1440) % 1440;
+                if (!(diff < 15 || diff >= 1420)) continue;
+                // Tag con fecha de hoy → se resetea cada día garantizando notificación diaria
+                const tag = `tarea-diaria-${tarea.usuario_id}-${tarea.id}-${tzNow.dateStr}`;
+                await sendPushToUser(tarea.usuario_id, {
+                    title: '✓ Recordatorio de tarea',
+                    body: `${tarea.titulo} — a las ${tarea.hora.substring(0, 5)}`,
                     tag, url: '/'
                 }, tag);
             }
