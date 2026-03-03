@@ -196,15 +196,20 @@ async function runMigrations() {
         // NUEVO: tabla de suscripciones push
         await pool.query(`
             CREATE TABLE IF NOT EXISTS push_subscriptions (
-                id           SERIAL PRIMARY KEY,
-                usuario_id   INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
-                endpoint     TEXT    NOT NULL,
-                p256dh       TEXT,
-                auth         TEXT,
-                created_at   TIMESTAMP DEFAULT NOW(),
+                id               SERIAL PRIMARY KEY,
+                usuario_id       INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+                endpoint         TEXT    NOT NULL,
+                p256dh           TEXT,
+                auth             TEXT,
+                created_at       TIMESTAMP DEFAULT NOW(),
+                last_success_at  TIMESTAMP,
                 UNIQUE(usuario_id, endpoint)
             )
         `);
+        // Migración: agregar last_success_at si ya existía la tabla sin esa columna
+        await pool.query(`
+            ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS last_success_at TIMESTAMP
+        `).catch(() => {});
 
         // NUEVO: columnas para recuperación de contraseña
         await pool.query(`
@@ -1125,38 +1130,89 @@ app.post('/api/push/test', authMiddleware, async (req, res) => {
     }
 });
 
-// Helper: envía una notificación push a todos los dispositivos de un usuario
-// urgency: 'high' → le indica a FCM/Mozilla Push que entregue INMEDIATAMENTE,
-//   bypaseando el Doze Mode de Android (batería optimizada, pantalla apagada).
-//   Sin esto, Android puede retener la notificación hasta que el usuario desbloquee.
-// TTL: 3600 → si el dispositivo está sin conexión, el servidor push reintenta
-//   durante 1 hora. Pasada esa hora, la descarta (el recordatorio ya no tiene sentido).
+// Helper: envía una notificación push a TODOS los dispositivos de un usuario.
+//
+// Parámetros:
+//   userId              — ID del usuario destino
+//   payload             — objeto { title, body, tag, url } de la notificación
+//   deduplicationBaseTag — CLAVE PARA DEDUP POR DISPOSITIVO (opcional pero recomendado).
+//
+// Cómo funciona el dedup por dispositivo:
+//   En vez de un solo tag global por usuario, se crea un tag único para
+//   cada dispositivo (“baseTag:d:sufijo_endpoint”). Esto significa que:
+//     • Si notebook recibe la notificación → se marca solo para notebook.
+//     • Si celular falla (transitoriamente) → NO se marca → el siguiente ciclo
+//       del cron (8 min después) reintenta solo el celular.
+//     • Si celular expira (410) → se borra de la DB → cuando el usuario abre
+//       la app, el frontend la renueva automáticamente.
+//
+// urgency 'high' + TTL 7200: entrega inmediata en Android con pantalla apagada
+//   y reintento de 2h si el dispositivo está temporalmente offline.
 const PUSH_OPTIONS = {
-    urgency: 'high',   // ← CRÍTICO para Android con pantalla apagada
-    TTL: 3600          // 1 hora de reintento si el dispositivo está offline
+    urgency: 'high',
+    TTL: 7200
 };
 
-async function sendPushToUser(userId, payload) {
-    if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
+async function sendPushToUser(userId, payload, deduplicationBaseTag = null) {
+    if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return { sent: 0, failed: 0, skipped: 0, total: 0 };
     try {
         const subs = await pool.query(
             'SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE usuario_id=$1',
             [userId]
         );
-        const promises = subs.rows.map(sub => {
-            const subscription = { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } };
-            return webPush.sendNotification(subscription, JSON.stringify(payload), PUSH_OPTIONS)
-                .catch(async err => {
-                    // Endpoint caducado → eliminar automáticamente
-                    if (err.statusCode === 410 || err.statusCode === 404) {
-                        await pool.query('DELETE FROM push_subscriptions WHERE endpoint=$1', [sub.endpoint]);
-                    }
-                    console.warn(`[Push] Error enviando a ${sub.endpoint.substring(0, 40)}:`, err.message);
-                });
-        });
-        await Promise.all(promises);
+        let sent = 0, failed = 0, skipped = 0;
+
+        // Procesar cada dispositivo individualmente (no Promise.all) para que el dedup
+        // por dispositivo sea correcto y no haya race conditions en los INSERT de push_sent.
+        for (const sub of subs.rows) {
+            // Tag único para este dispositivo: sufijo del endpoint lo identifica
+            const deviceTag = deduplicationBaseTag
+                ? `${deduplicationBaseTag}:d:${sub.endpoint.slice(-20)}`
+                : null;
+
+            // ¿Este dispositivo específico ya recibió la notificación en este ciclo?
+            if (deviceTag && await wasAlreadySent(deviceTag)) {
+                skipped++;
+                continue;
+            }
+
+            const subscription = {
+                endpoint: sub.endpoint,
+                keys: { p256dh: sub.p256dh, auth: sub.auth }
+            };
+
+            try {
+                await webPush.sendNotification(subscription, JSON.stringify(payload), PUSH_OPTIONS);
+                sent++;
+                // Marcar ESTE dispositivo como notificado (dedup)
+                if (deviceTag) await markAsSent(deviceTag);
+                // Registrar último éxito (para cleanup de endpoints obsoletos)
+                await pool.query(
+                    'UPDATE push_subscriptions SET last_success_at = NOW() WHERE endpoint=$1',
+                    [sub.endpoint]
+                ).catch(() => {});
+            } catch (err) {
+                if (err.statusCode === 410 || err.statusCode === 404) {
+                    // Suscripción confirmada expirada → borrar de DB
+                    // El frontend la renueva en el próximo inicio de sesión
+                    await pool.query('DELETE FROM push_subscriptions WHERE endpoint=$1', [sub.endpoint]);
+                    console.warn(`[Push] Suscripción expirada eliminada: ${sub.endpoint.substring(0, 50)}`);
+                } else {
+                    // Error transitorio (red, rate limit, servidor del operador caído, etc.)
+                    // NO marcar deviceTag → el próximo ciclo del cron reintenta este dispositivo
+                    failed++;
+                    console.warn(`[Push] Error transitorio dispositivo ${sub.endpoint.substring(0, 50)}: HTTP ${err.statusCode || 'N/A'} — ${err.message}`);
+                }
+            }
+        }
+
+        if (subs.rows.length > 0) {
+            console.log(`[Push] userId=${userId} → ${sent} enviados, ${failed} fallidos (reintentarán), ${skipped} ya enviados (de ${subs.rows.length} dispositivos)`);
+        }
+        return { sent, failed, skipped, total: subs.rows.length };
     } catch (err) {
         console.error('[Push] Error en sendPushToUser:', err.message);
+        return { sent: 0, failed: 0, skipped: 0, total: 0 };
     }
 }
 
@@ -1270,11 +1326,12 @@ function startPushReminders() {
         return horarios;
     }
 
-    // Deduplicación: verifica si ya se envió esta notificación en los últimos 20 min
+    // Deduplicación: verifica si ya se envió esta notificación en los últimos 25 min
+    // Ventana mayor que el lookback (20 min) para garantizar sin duplicados aún con delays
     async function wasAlreadySent(tag) {
         try {
             const r = await pool.query(
-                "SELECT 1 FROM push_sent WHERE tag=$1 AND sent_at > NOW() - INTERVAL '20 minutes'",
+                "SELECT 1 FROM push_sent WHERE tag=$1 AND sent_at > NOW() - INTERVAL '25 minutes'",
                 [tag]
             );
             return r.rows.length > 0;
@@ -1291,6 +1348,14 @@ function startPushReminders() {
         try {
             // Limpiar entradas viejas de deduplicación (> 24h)
             await pool.query("DELETE FROM push_sent WHERE sent_at < NOW() - INTERVAL '24 hours'").catch(() => {});
+
+            // Limpiar suscripciones que llevan 14+ días sin entrega exitosa (expiradas silenciosamente)
+            // Esto previene acumulación de endpoints obsoletos en la tabla push_subscriptions
+            await pool.query(`
+                DELETE FROM push_subscriptions
+                WHERE last_success_at IS NOT NULL
+                  AND last_success_at < NOW() - INTERVAL '14 days'
+            `).catch(() => {});
 
             // ── 1. Medicamentos — todos los de recordatorio activo ──
             // getMedHorarios() calcula los horarios del día según frecuencia.
@@ -1314,26 +1379,26 @@ function startPushReminders() {
                 const horaMatch = horarios.find(h => {
                     const [hh, mm] = h.split(':').map(Number);
                     const medMin = hh * 60 + mm;
-                    // Comparación circular: cubre horarios cerca de medianoche (ej. 00:00)
-                    // Ventana: -8 min pasados a +15 min adelante (modular sobre 1440).
+                    // Ventana de cobertura circular sobre 1440 min/día:
+                    //   diff < 15  → hasta 15 min ANTES del horario (cron anticipa la toma)
+                    //   diff >= 1420 → hasta 20 min DESPUÉS del horario (cubre reinicios de Railway)
+                    // La ventana de deduplicación (25 min) garantiza que no haya duplicados.
                     const diff = (medMin - tzMin + 1440) % 1440;
-                    return diff < 15 || diff >= 1432;
+                    return diff < 15 || diff >= 1420;
                 });
                 if (!horaMatch) continue;
                 const tag = `med-${med.usuario_id}-${med.nombre}-${horaMatch}-${tzNow.dateStr}`;
-                if (await wasAlreadySent(tag)) continue;
+                // sendPushToUser maneja el dedup por dispositivo internamente.
+                // Cada dispositivo tiene su propio tag → si uno falla, el siguiente ciclo lo reintenta.
                 await sendPushToUser(med.usuario_id, {
                     title: '💊 Recordatorio de medicamento',
                     body: `${med.nombre} — ${med.dosis} a las ${horaMatch}`,
                     tag, url: '/'
-                });
-                await markAsSent(tag);
+                }, tag);
             }
 
-            // ── 2. Citas: recordatorio vence en la ventana actual (±8/+15 min por timezone) ──
-            // Usamos c.fecha + c.hora::time (suma DATE + TIME en PostgreSQL = TIMESTAMP WITHOUT TZ)
-            // en vez de concatenación de strings para evitar errores de formato con tipos nativos.
-            // Ventana: -8 min (cubre reinicios del servidor) + 15 min adelante.
+            // ── 2. Citas: recordatorio vence en la ventana actual (±20/+15 min por timezone) ──
+            // Ventana: -20 min (cubre reinicios de Railway) + 15 min adelante.
             const citas = await pool.query(`
                 SELECT c.usuario_id, c.titulo, c.fecha, c.hora, c.recordatorio, c.lugar
                 FROM citas c
@@ -1345,13 +1410,12 @@ function startPushReminders() {
                   AND (c.fecha::date + c.hora::time)
                       - (CAST(c.recordatorio AS integer) * INTERVAL '1 minute')
                       BETWEEN (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))
-                              - INTERVAL '8 minutes'
+                              - INTERVAL '20 minutes'
                           AND (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))
                               + INTERVAL '15 minutes'
             `);
             for (const cita of citas.rows) {
                 const tag = `cita-${cita.usuario_id}-${cita.fecha}-${cita.hora}`;
-                if (await wasAlreadySent(tag)) continue;
                 const mins = parseInt(cita.recordatorio);
                 const tiempoTexto = mins < 60 ? `en ${mins} min`
                     : mins === 60 ? 'en 1 hora'
@@ -1361,13 +1425,10 @@ function startPushReminders() {
                     title: '📅 Recordatorio de cita',
                     body: `${cita.titulo} — ${tiempoTexto}${cita.lugar ? ' en ' + cita.lugar : ''}`,
                     tag, url: '/'
-                });
-                await markAsSent(tag);
+                }, tag);
             }
 
-            // ── 3. Tareas con hora específica (ventana -8/+15 min, en timezone del usuario) ──
-            // Compara fecha+hora completa como TIMESTAMP para consistencia con citas.
-            // La ventana -8 min cubre reinicios del servidor igual que medicamentos y citas.
+            // ── 3. Tareas con hora específica (ventana -20/+15 min, en timezone del usuario) ──
             const tareasConHora = await pool.query(`
                 SELECT t.usuario_id, t.titulo, t.hora, t.fecha
                 FROM tareas t
@@ -1378,19 +1439,17 @@ function startPushReminders() {
                   AND t.hora IS NOT NULL
                   AND (t.fecha::date + t.hora::time)
                       BETWEEN (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))
-                              - INTERVAL '8 minutes'
+                              - INTERVAL '20 minutes'
                           AND (NOW() AT TIME ZONE COALESCE(u.timezone,'America/Argentina/Buenos_Aires'))
                               + INTERVAL '15 minutes'
             `);
             for (const tarea of tareasConHora.rows) {
                 const tag = `tarea-${tarea.usuario_id}-${tarea.fecha}-${tarea.hora}`;
-                if (await wasAlreadySent(tag)) continue;
                 await sendPushToUser(tarea.usuario_id, {
                     title: '✓ Recordatorio de tarea',
                     body: `${tarea.titulo} — a las ${tarea.hora.substring(0, 5)}`,
                     tag, url: '/'
-                });
-                await markAsSent(tag);
+                }, tag);
             }
 
             // ── 4. Tareas sin hora: resumen diario a las 8 AM (por timezone del usuario) ──
@@ -1415,13 +1474,11 @@ function startPushReminders() {
                 const pendientes = parseInt(cnt.rows[0]?.c || 0);
                 if (pendientes === 0) continue;
                 const tag = `tareas-resumen-${row.usuario_id}-${tzNow.dateStr}`;
-                if (await wasAlreadySent(tag)) continue;
                 await sendPushToUser(row.usuario_id, {
                     title: '✓ Tareas pendientes hoy',
                     body: `Tenés ${pendientes} tarea${pendientes > 1 ? 's' : ''} pendiente${pendientes > 1 ? 's' : ''} para hoy`,
                     tag, url: '/'
-                });
-                await markAsSent(tag);
+                }, tag);
             }
 
             const log = nowInTZ('America/Argentina/Buenos_Aires');
@@ -1435,7 +1492,7 @@ function startPushReminders() {
 
     checkAndSendReminders();
     _cronStartedAt = new Date().toISOString();
-    setInterval(checkAndSendReminders, 8 * 60 * 1000); // cada 8 minutos — ventana ±8+15 min garantiza cobertura total
+    setInterval(checkAndSendReminders, 8 * 60 * 1000); // cada 8 minutos — ventana de 20 min atrás + 15 min adelante garantiza cobertura total
     console.log('✅ Push reminders iniciados (chequeo cada 8 minutos)');
 }
 
