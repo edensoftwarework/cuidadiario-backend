@@ -1146,11 +1146,12 @@ app.post('/api/push/test', authMiddleware, async (req, res) => {
 //     • Si celular expira (410) → se borra de la DB → cuando el usuario abre
 //       la app, el frontend la renueva automáticamente.
 //
-// urgency 'high' + TTL 7200: entrega inmediata en Android con pantalla apagada
-//   y reintento de 2h si el dispositivo está temporalmente offline.
+// urgency 'high' + TTL 86400: entrega inmediata en Android con pantalla apagada.
+// TTL = 24 horas: si el dispositivo está apagado/hibernando toda la noche,
+// cuando vuelva a conectarse recibe las notificaciones pendientes del día.
 const PUSH_OPTIONS = {
     urgency: 'high',
-    TTL: 7200
+    TTL: 86400
 };
 
 // ── DEDUPLICACIÓN A NIVEL MÓDULO ──
@@ -1212,11 +1213,15 @@ async function sendPushToUser(userId, payload, deduplicationBaseTag = null) {
                     [sub.endpoint]
                 ).catch(() => {});
             } catch (err) {
-                if (err.statusCode === 410 || err.statusCode === 404) {
-                    // Suscripción confirmada expirada → borrar de DB
-                    // El frontend la renueva en el próximo inicio de sesión
+                if (err.statusCode === 410 || err.statusCode === 404 ||
+                    err.statusCode === 400 || err.statusCode === 401 || err.statusCode === 403) {
+                    // Suscripción permanentemente inválida → borrar de DB.
+                    // 410/404 = expirada. 400/401/403 = clave VAPID no coincide con la
+                    // que se usó al crear la suscripción (el device se suscribió con
+                    // otras claves). En ambos casos, reintentar es inútil — hay que
+                    // borrarla y dejar que el frontend la re-registre al abrir la app.
                     await pool.query('DELETE FROM push_subscriptions WHERE endpoint=$1', [sub.endpoint]);
-                    console.warn(`[Push] Suscripción expirada eliminada: ${sub.endpoint.substring(0, 50)}`);
+                    console.warn(`[Push] Suscripción inválida eliminada (HTTP ${err.statusCode}): ${sub.endpoint.substring(0, 60)}`);
                 } else {
                     // Error transitorio (red, rate limit, servidor del operador caído, etc.)
                     // NO marcar deviceTag → el próximo ciclo del cron reintenta este dispositivo
