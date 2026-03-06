@@ -1,50 +1,50 @@
-/**
- * index.js — Backend CuidaDiario (VERSIÓN COMPLETA)
+﻿/**
+ * index.js â€” Backend CuidaDiario (VERSIÃ“N COMPLETA)
  * by EDEN SoftWork
  *
  * ============================================================
  * FUNCIONALIDADES INCLUIDAS:
  *
  * PUSH NOTIFICATIONS (web-push):
- * 1. require('web-push') — librería para enviar notificaciones push
- * 2. Constantes VAPID — leen las claves de las variables de entorno de Railway
- * 3. webPush.setVapidDetails() — configura la librería al iniciar
- * 4. runMigrations() — crea la tabla push_subscriptions
- * 5. GET  /api/push/vapid-key      — devuelve la clave pública al frontend
- * 6. POST /api/push/subscribe      — guarda la suscripción push del usuario
- * 7. DELETE /api/push/unsubscribe  — elimina la suscripción push del usuario
- * 8. sendPushToUser(userId, payload) — helper interno para enviar push
- * 9. startPushReminders() — chequea cada hora y envía recordatorios de
- *      medicamentos (±35 min), citas del día siguiente, tareas del día (8 AM)
+ * 1. require('web-push') â€” librerÃ­a para enviar notificaciones push
+ * 2. Constantes VAPID â€” leen las claves de las variables de entorno de Railway
+ * 3. webPush.setVapidDetails() â€” configura la librerÃ­a al iniciar
+ * 4. runMigrations() â€” crea la tabla push_subscriptions
+ * 5. GET  /api/push/vapid-key      â€” devuelve la clave pÃºblica al frontend
+ * 6. POST /api/push/subscribe      â€” guarda la suscripciÃ³n push del usuario
+ * 7. DELETE /api/push/unsubscribe  â€” elimina la suscripciÃ³n push del usuario
+ * 8. sendPushToUser(userId, payload) â€” helper interno para enviar push
+ * 9. startPushReminders() â€” chequea cada hora y envÃ­a recordatorios de
+ *      medicamentos (Â±35 min), citas del dÃ­a siguiente, tareas del dÃ­a (8 AM)
  *
- * RECUPERACIÓN DE CONTRASEÑA (Resend HTTP API — sin SMTP, funciona en Railway):
- * 10. POST /api/forgot-password  — genera token, guarda en DB, envía email
- * 11. POST /api/reset-password   — valida token, actualiza password_hash
- *     → Requiere: RESEND_API_KEY, FRONTEND_URL en Railway env vars
+ * RECUPERACIÃ“N DE CONTRASEÃ‘A (Resend HTTP API â€” sin SMTP, funciona en Railway):
+ * 10. POST /api/forgot-password  â€” genera token, guarda en DB, envÃ­a email
+ * 11. POST /api/reset-password   â€” valida token, actualiza password_hash
+ *     â†’ Requiere: RESEND_API_KEY, FRONTEND_URL en Railway env vars
  *
  * SEGURIDAD paciente_id:
- * 12. validatePaciente()   — verifica que el paciente pertenece al usuario
- * 13. resolvePatientId()   — auto-asigna paciente a usuarios free si no viene en el body
+ * 12. validatePaciente()   â€” verifica que el paciente pertenece al usuario
+ * 13. resolvePatientId()   â€” auto-asigna paciente a usuarios free si no viene en el body
  *     Cubre el caso de carrera donde el frontend no setea currentPacienteId a tiempo
  *
  * ANTES DE HACER DEPLOY EN RAILWAY:
  *   package.json dependencies:
  *     "web-push": "^3.6.7"
- *     (nodemailer ya NO es necesario — se usa Resend via HTTPS nativo)
+ *     (nodemailer ya NO es necesario â€” se usa Resend via HTTPS nativo)
  *
  *   Variables de entorno:
- *     VAPID_PUBLIC_KEY   = <tu clave pública VAPID>
+ *     VAPID_PUBLIC_KEY   = <tu clave pÃºblica VAPID>
  *     VAPID_PRIVATE_KEY  = <tu clave privada VAPID>
  *     VAPID_EMAIL        = mailto:edensoftwarework@gmail.com
  *     RESEND_API_KEY     = re_xxxxxxxxxx  (de https://resend.com/api-keys)
- *     EMAIL_FROM         = "CuidaDiario <onboarding@resend.dev>"   ← sin dominio propio
- *                        o "CuidaDiario <noreply@tudominio.com>"   ← con dominio verificado
+ *     EMAIL_FROM         = "CuidaDiario <onboarding@resend.dev>"   â† sin dominio propio
+ *                        o "CuidaDiario <noreply@tudominio.com>"   â† con dominio verificado
  *     FRONTEND_URL       = https://tu-frontend.com  (sin barra final)
  *
  *   Crear API Key de Resend (gratis, 3000 emails/mes):
  *     1. Registrate en https://resend.com
- *     2. Generá una API Key en https://resend.com/api-keys
- *     3. Agregá RESEND_API_KEY en las variables de entorno de Railway
+ *     2. GenerÃ¡ una API Key en https://resend.com/api-keys
+ *     3. AgregÃ¡ RESEND_API_KEY en las variables de entorno de Railway
  * ============================================================
  */
 
@@ -56,13 +56,13 @@ const SALT_ROUNDS = 10;
 const jwt = require('jsonwebtoken');
 const JWT_SECRET = process.env.JWT_SECRET || 'tu_clave_secreta';
 if (!process.env.JWT_SECRET) {
-    console.error('⚠️  CRÍTICO: JWT_SECRET no está configurado en las variables de entorno de Railway. Los tokens pueden ser vulnerables. Configurá esta variable inmediatamente.');
+    console.error('âš ï¸  CRÃTICO: JWT_SECRET no estÃ¡ configurado en las variables de entorno de Railway. Los tokens pueden ser vulnerables. ConfigurÃ¡ esta variable inmediatamente.');
 }
 const cors = require('cors');
 
 // ========== RATE LIMITING (in-memory, sin dependencias externas) ==========
-// Previene ataques de fuerza bruta en endpoints de autenticación.
-// Límite: 10 intentos por IP por ventana de 60 segundos.
+// Previene ataques de fuerza bruta en endpoints de autenticaciÃ³n.
+// LÃ­mite: 10 intentos por IP por ventana de 60 segundos.
 const _rateLimitStore = new Map();
 function rateLimit(maxReq = 10, windowMs = 60000) {
     return (req, res, next) => {
@@ -72,11 +72,11 @@ function rateLimit(maxReq = 10, windowMs = 60000) {
         if (!_rateLimitStore.has(key)) _rateLimitStore.set(key, []);
         const hits = _rateLimitStore.get(key).filter(t => t > windowStart);
         if (hits.length >= maxReq) {
-            return res.status(429).json({ error: 'Demasiados intentos. Esperá unos minutos e intentá nuevamente.' });
+            return res.status(429).json({ error: 'Demasiados intentos. EsperÃ¡ unos minutos e intentÃ¡ nuevamente.' });
         }
         hits.push(now);
         _rateLimitStore.set(key, hits);
-        // Limpiar entradas viejas periódicamente
+        // Limpiar entradas viejas periÃ³dicamente
         if (_rateLimitStore.size > 5000) {
             for (const [k, times] of _rateLimitStore.entries()) {
                 if (times.every(t => t <= windowStart)) _rateLimitStore.delete(k);
@@ -87,17 +87,17 @@ function rateLimit(maxReq = 10, windowMs = 60000) {
 }
 const authRateLimit = rateLimit(10, 60000); // 10 intentos / 60 seg
 const https = require('https');
-const crypto = require('crypto');          // ← nativo Node.js, sin instalar nada
-const webPush = require('web-push');       // ← push notifications
+const crypto = require('crypto');          // â† nativo Node.js, sin instalar nada
+const webPush = require('web-push');       // â† push notifications
 
-// ========== EMAIL VIA RESEND API (HTTP puro — Railway no bloquea puerto 443) ==========
-// Railway bloquea puertos SMTP (587/465). Resend usa HTTPS (443) → siempre funciona.
-// Plan gratuito: 3000 emails/mes — https://resend.com/
+// ========== EMAIL VIA RESEND API (HTTP puro â€” Railway no bloquea puerto 443) ==========
+// Railway bloquea puertos SMTP (587/465). Resend usa HTTPS (443) â†’ siempre funciona.
+// Plan gratuito: 3000 emails/mes â€” https://resend.com/
 //
 // Variables requeridas en Railway:
 //   RESEND_API_KEY  = re_xxxxxxxxxx   (de https://resend.com/api-keys)
-//   EMAIL_FROM      = "CuidaDiario <onboarding@resend.dev>"   ← sin dominio propio
-//                   o "CuidaDiario <noreply@tudominio.com>"   ← con dominio verificado en Resend
+//   EMAIL_FROM      = "CuidaDiario <onboarding@resend.dev>"   â† sin dominio propio
+//                   o "CuidaDiario <noreply@tudominio.com>"   â† con dominio verificado en Resend
 //   FRONTEND_URL    = https://tu-frontend.com  (sin barra final)
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
@@ -107,7 +107,7 @@ const FRONTEND_URL   = (process.env.FRONTEND_URL || '').replace(/\/$/, '');
 // Enviar email via Resend HTTP API (sin nodemailer, sin SMTP)
 async function sendEmail({ to, subject, html }) {
     if (!RESEND_API_KEY) {
-        console.warn('⚠️  RESEND_API_KEY no configurada — email no enviado');
+        console.warn('âš ï¸  RESEND_API_KEY no configurada â€” email no enviado');
         return false;
     }
     const from = EMAIL_FROM.includes('<') ? EMAIL_FROM : `CuidaDiario <${EMAIL_FROM}>`;
@@ -146,12 +146,12 @@ async function sendEmail({ to, subject, html }) {
 }
 
 if (RESEND_API_KEY) {
-    console.log('✅ Email via Resend API configurado');
+    console.log('âœ… Email via Resend API configurado');
 } else {
-    console.warn('⚠️  RESEND_API_KEY no configurada — envío de emails desactivado');
+    console.warn('âš ï¸  RESEND_API_KEY no configurada â€” envÃ­o de emails desactivado');
 }
 
-// ========== CONFIGURACIÓN ==========
+// ========== CONFIGURACIÃ“N ==========
 const ALLOWED_ORIGINS = [
     'https://cuidadiario.edensoftwork.com',
     'http://localhost:3000',
@@ -161,7 +161,7 @@ const ALLOWED_ORIGINS = [
 ];
 app.use(cors({
     origin: (origin, callback) => {
-        // Permitir requests sin origin (ej: apps móviles, Postman, same-origin)
+        // Permitir requests sin origin (ej: apps mÃ³viles, Postman, same-origin)
         if (!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
         console.warn(`[CORS] Bloqueado: ${origin}`);
         callback(new Error('No permitido por CORS'));
@@ -171,7 +171,7 @@ app.use(cors({
 app.use('/api/paypal/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
-// ========== VAPID — Web Push (NUEVO) ==========
+// ========== VAPID â€” Web Push (NUEVO) ==========
 const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY;
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
 const _vapidEmailRaw    = process.env.VAPID_EMAIL || 'edensoftwarework@gmail.com';
@@ -179,12 +179,12 @@ const VAPID_EMAIL       = _vapidEmailRaw.startsWith('mailto:') ? _vapidEmailRaw 
 
 if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
     webPush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
-    console.log('✅ Web Push VAPID configurado');
+    console.log('âœ… Web Push VAPID configurado');
 } else {
-    console.warn('⚠️  VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY no configuradas — Push notifications desactivadas');
+    console.warn('âš ï¸  VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY no configuradas â€” Push notifications desactivadas');
 }
 
-// ========== MIGRACIÓN AUTOMÁTICA ==========
+// ========== MIGRACIÃ“N AUTOMÃTICA ==========
 async function runMigrations() {
     try {
         // Columna paypal_subscription_id (existente)
@@ -206,12 +206,12 @@ async function runMigrations() {
                 UNIQUE(usuario_id, endpoint)
             )
         `);
-        // Migración: agregar last_success_at si ya existía la tabla sin esa columna
+        // MigraciÃ³n: agregar last_success_at si ya existÃ­a la tabla sin esa columna
         await pool.query(`
             ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS last_success_at TIMESTAMP
         `).catch(() => {});
 
-        // NUEVO: columnas para recuperación de contraseña
+        // NUEVO: columnas para recuperaciÃ³n de contraseÃ±a
         await pool.query(`
             ALTER TABLE usuarios
             ADD COLUMN IF NOT EXISTS reset_token          VARCHAR(128),
@@ -224,8 +224,8 @@ async function runMigrations() {
             ADD COLUMN IF NOT EXISTS timezone VARCHAR(50) DEFAULT 'America/Argentina/Buenos_Aires'
         `);
 
-        // Tabla de deduplicación de notificaciones push
-        // Evita reenvíos si el servidor reinicia dentro de la misma ventana de tiempo
+        // Tabla de deduplicaciÃ³n de notificaciones push
+        // Evita reenvÃ­os si el servidor reinicia dentro de la misma ventana de tiempo
         await pool.query(`
             CREATE TABLE IF NOT EXISTS push_sent (
                 tag      TEXT      NOT NULL,
@@ -279,14 +279,20 @@ async function runMigrations() {
             ALTER TABLE usuarios
             ADD COLUMN IF NOT EXISTS premium_welcome_pending BOOLEAN DEFAULT FALSE
         `);
+        // FIX: cambiar fecha en sintomas de DATE a TIMESTAMP para guardar hora correcta
+        await pool.query(`
+            ALTER TABLE sintomas
+            ALTER COLUMN fecha TYPE TIMESTAMP USING fecha::timestamp
+        `).catch(() => {});
 
-        console.log('✅ Migraciones completadas');
+
+        console.log('âœ… Migraciones completadas');
     } catch (err) {
-        console.error('❌ Error en migraciones:', err.message);
+        console.error('âŒ Error en migraciones:', err.message);
     }
 }
 
-// ========== MIDDLEWARE DE AUTENTICACIÓN ==========
+// ========== MIDDLEWARE DE AUTENTICACIÃ“N ==========
 function authMiddleware(req, res, next) {
     const auth = req.headers.authorization;
     if (!auth) return res.status(401).json({ error: 'Token requerido' });
@@ -295,7 +301,7 @@ function authMiddleware(req, res, next) {
         req.user = jwt.verify(token, JWT_SECRET);
         next();
     } catch (err) {
-        res.status(401).json({ error: 'Token inválido' });
+        res.status(401).json({ error: 'Token invÃ¡lido' });
     }
 }
 
@@ -315,19 +321,19 @@ async function validatePaciente(pacienteId, usuarioId) {
     return result.rows.length > 0;
 }
 
-// Helper: para co-cuidadores — determina el usuario dueño de los datos de un paciente.
-// Si el requesting user es el dueño → retorna su propio ID.
-// Si el paciente está compartido con él → retorna el ID del dueño original.
-// Si no tiene acceso → retorna null (403).
+// Helper: para co-cuidadores â€” determina el usuario dueÃ±o de los datos de un paciente.
+// Si el requesting user es el dueÃ±o â†’ retorna su propio ID.
+// Si el paciente estÃ¡ compartido con Ã©l â†’ retorna el ID del dueÃ±o original.
+// Si no tiene acceso â†’ retorna null (403).
 async function resolveDataOwnerId(requestingUserId, pacienteId) {
     if (!pacienteId) return requestingUserId;
-    // Verificar si el usuario es el dueño del paciente
+    // Verificar si el usuario es el dueÃ±o del paciente
     const own = await pool.query(
         'SELECT id FROM pacientes WHERE id=$1 AND usuario_id=$2 AND activo=true',
         [pacienteId, requestingUserId]
     );
     if (own.rows.length > 0) return requestingUserId;
-    // Verificar si el paciente está compartido con este usuario
+    // Verificar si el paciente estÃ¡ compartido con este usuario
     const shared = await pool.query(
         `SELECT p.usuario_id FROM paciente_compartidos pc
          JOIN pacientes p ON p.id = pc.paciente_id
@@ -355,7 +361,7 @@ async function resolvePatientId(pid, userId) {
     return null;
 }
 
-// ========== ENDPOINTS PÚBLICOS ==========
+// ========== ENDPOINTS PÃšBLICOS ==========
 app.get('/', (req, res) => res.send('Backend funcionando para CuidaDiario!'));
 app.get('/api/test', (req, res) => res.json({ status: 'ok', message: 'Backend funcionando correctamente' }));
 app.get('/dbtest', authMiddleware, async (req, res) => {
@@ -367,7 +373,7 @@ app.get('/dbtest', authMiddleware, async (req, res) => {
     }
 });
 
-// ========== AUTENTICACIÓN ==========
+// ========== AUTENTICACIÃ“N ==========
 app.post('/api/register', authRateLimit, async (req, res) => {
     const { nombre, email, password } = req.body;
     if (!nombre || !email || !password)
@@ -375,7 +381,7 @@ app.post('/api/register', authRateLimit, async (req, res) => {
     try {
         const existing = await pool.query('SELECT id FROM usuarios WHERE email = $1', [email]);
         if (existing.rows.length > 0)
-            return res.status(400).json({ error: 'El email ya está registrado' });
+            return res.status(400).json({ error: 'El email ya estÃ¡ registrado' });
         const password_hash = await bcrypt.hash(password, SALT_ROUNDS);
         const result = await pool.query(
             'INSERT INTO usuarios (nombre, email, password_hash, premium) VALUES ($1, $2, $3, $4) RETURNING id, nombre, email, premium',
@@ -392,15 +398,15 @@ app.post('/api/register', authRateLimit, async (req, res) => {
 app.post('/api/login', authRateLimit, async (req, res) => {
     const { email, password } = req.body;
     if (!email || !password)
-        return res.status(400).json({ error: 'Email y contraseña son requeridos' });
+        return res.status(400).json({ error: 'Email y contraseÃ±a son requeridos' });
     try {
         const result = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email]);
         if (result.rows.length === 0)
-            return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+            return res.status(401).json({ error: 'Usuario o contraseÃ±a incorrectos' });
         const user = result.rows[0];
         const valid = await bcrypt.compare(password, user.password_hash);
         if (!valid)
-            return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+            return res.status(401).json({ error: 'Usuario o contraseÃ±a incorrectos' });
         const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
         res.json({ token, usuario: { id: user.id, nombre: user.nombre, email: user.email, premium: user.premium } });
     } catch (err) {
@@ -408,15 +414,15 @@ app.post('/api/login', authRateLimit, async (req, res) => {
     }
 });
 
-// ========== RECUPERACIÓN DE CONTRASEÑA ==========
+// ========== RECUPERACIÃ“N DE CONTRASEÃ‘A ==========
 app.post('/api/forgot-password', authRateLimit, async (req, res) => {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'Email requerido' });
     try {
         const result = await pool.query('SELECT id, nombre FROM usuarios WHERE email=$1', [email]);
-        // Responder siempre con éxito para no revelar si el email existe (seguridad)
+        // Responder siempre con Ã©xito para no revelar si el email existe (seguridad)
         if (result.rows.length === 0)
-            return res.json({ message: 'Si ese email está registrado, recibirás un correo con instrucciones.' });
+            return res.json({ message: 'Si ese email estÃ¡ registrado, recibirÃ¡s un correo con instrucciones.' });
 
         const user = result.rows[0];
         const token = crypto.randomBytes(48).toString('hex'); // 96 chars hex
@@ -434,32 +440,32 @@ app.post('/api/forgot-password', authRateLimit, async (req, res) => {
         try {
             await sendEmail({
                 to: email,
-                subject: '🔑 Restablecer contraseña — CuidaDiario',
+                subject: 'ðŸ”‘ Restablecer contraseÃ±a â€” CuidaDiario',
                 html: `
                     <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:24px;border:1px solid #e0e0e0;border-radius:8px;">
                         <h2 style="color:#667eea;">CuidaDiario</h2>
                         <p>Hola <strong>${user.nombre}</strong>,</p>
-                        <p>Recibimos una solicitud para restablecer tu contraseña. Hacé clic en el botón de abajo para crear una nueva:</p>
+                        <p>Recibimos una solicitud para restablecer tu contraseÃ±a. HacÃ© clic en el botÃ³n de abajo para crear una nueva:</p>
                         <div style="text-align:center;margin:28px 0;">
                             <a href="${resetLink}"
                                style="background:linear-gradient(135deg,#667eea,#764ba2);color:white;padding:14px 28px;
                                       border-radius:8px;text-decoration:none;font-weight:600;font-size:1rem;">
-                                Restablecer contraseña
+                                Restablecer contraseÃ±a
                             </a>
                         </div>
                         <p style="color:#777;font-size:0.85rem;">Este enlace expira en <strong>1 hora</strong>.</p>
-                        <p style="color:#777;font-size:0.85rem;">Si no solicitaste este cambio, podés ignorar este email. Tu contraseña actual no cambiará.</p>
+                        <p style="color:#777;font-size:0.85rem;">Si no solicitaste este cambio, podÃ©s ignorar este email. Tu contraseÃ±a actual no cambiarÃ¡.</p>
                         <hr style="border:none;border-top:1px solid #eee;margin:20px 0;">
                         <p style="color:#aaa;font-size:0.78rem;">CuidaDiario by EDEN SoftWork</p>
                     </div>
                 `
             });
-            console.log(`[Email] Instrucciones de recuperación enviadas a ${email}`);
+            console.log(`[Email] Instrucciones de recuperaciÃ³n enviadas a ${email}`);
         } catch (emailErr) {
-            console.warn('⚠️  Email no enviado:', emailErr.message, '— Token debug:', token);
+            console.warn('âš ï¸  Email no enviado:', emailErr.message, 'â€” Token debug:', token);
         }
 
-        res.json({ message: 'Si ese email está registrado, recibirás un correo con instrucciones.' });
+        res.json({ message: 'Si ese email estÃ¡ registrado, recibirÃ¡s un correo con instrucciones.' });
     } catch (err) {
         console.error('Error en forgot-password:', err.message);
         res.status(500).json({ error: 'Error al procesar la solicitud' });
@@ -468,15 +474,15 @@ app.post('/api/forgot-password', authRateLimit, async (req, res) => {
 
 app.post('/api/reset-password', async (req, res) => {
     const { token, password } = req.body;
-    if (!token || !password) return res.status(400).json({ error: 'Token y nueva contraseña son requeridos' });
-    if (password.length < 6) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
+    if (!token || !password) return res.status(400).json({ error: 'Token y nueva contraseÃ±a son requeridos' });
+    if (password.length < 6) return res.status(400).json({ error: 'La contraseÃ±a debe tener al menos 6 caracteres' });
     try {
         const result = await pool.query(
             'SELECT id FROM usuarios WHERE reset_token=$1 AND reset_token_expires > NOW()',
             [token]
         );
         if (result.rows.length === 0)
-            return res.status(400).json({ error: 'El enlace es inválido o ya expiró. Solicitá uno nuevo.' });
+            return res.status(400).json({ error: 'El enlace es invÃ¡lido o ya expirÃ³. SolicitÃ¡ uno nuevo.' });
 
         const userId = result.rows[0].id;
         const hash = await bcrypt.hash(password, SALT_ROUNDS);
@@ -484,10 +490,10 @@ app.post('/api/reset-password', async (req, res) => {
             'UPDATE usuarios SET password_hash=$1, reset_token=NULL, reset_token_expires=NULL WHERE id=$2',
             [hash, userId]
         );
-        res.json({ message: 'Contraseña actualizada correctamente. Ya podés iniciar sesión.' });
+        res.json({ message: 'ContraseÃ±a actualizada correctamente. Ya podÃ©s iniciar sesiÃ³n.' });
     } catch (err) {
         console.error('Error en reset-password:', err.message);
-        res.status(500).json({ error: 'Error al actualizar la contraseña' });
+        res.status(500).json({ error: 'Error al actualizar la contraseÃ±a' });
     }
 });
 
@@ -528,7 +534,7 @@ app.post('/api/pacientes', authMiddleware, async (req, res) => {
                 [req.user.id]
             );
             if (parseInt(count.rows[0].count) >= 1)
-                return res.status(403).json({ error: 'La versión gratuita permite solo 1 paciente. Actualiza a Premium para agregar más.' });
+                return res.status(403).json({ error: 'La versiÃ³n gratuita permite solo 1 paciente. Actualiza a Premium para agregar mÃ¡s.' });
         }
         const result = await pool.query(
             'INSERT INTO pacientes (usuario_id, nombre, relacion, fecha_nacimiento, notas) VALUES ($1,$2,$3,$4,$5) RETURNING *',
@@ -787,7 +793,7 @@ app.delete('/api/tareas/:id', authMiddleware, async (req, res) => {
     }
 });
 
-// ========== SÍNTOMAS ==========
+// ========== SÃNTOMAS ==========
 app.post('/api/sintomas', authMiddleware, async (req, res) => {
     const { tipo, nombre, intensidad, estadoAnimo, estado_animo, descripcion, fecha, paciente_id, pacienteId } = req.body;
     try {
@@ -821,7 +827,7 @@ app.get('/api/sintomas', authMiddleware, async (req, res) => {
 app.get('/api/sintomas/:id', authMiddleware, async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM sintomas WHERE id=$1 AND usuario_id=$2', [req.params.id, req.user.id]);
-        if (result.rows.length === 0) return res.status(404).json({ error: 'Síntoma no encontrado' });
+        if (result.rows.length === 0) return res.status(404).json({ error: 'SÃ­ntoma no encontrado' });
         res.json(result.rows[0]);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -835,7 +841,7 @@ app.put('/api/sintomas/:id', authMiddleware, async (req, res) => {
             'UPDATE sintomas SET tipo=$1, intensidad=$2, estado_animo=$3, descripcion=$4, fecha=$5 WHERE id=$6 AND usuario_id=$7 RETURNING *',
             [tipo || nombre, intensidad, estadoAnimo || estado_animo || null, descripcion || null, fecha ? new Date(fecha) : new Date(), req.params.id, req.user.id]
         );
-        if (result.rows.length === 0) return res.status(404).json({ error: 'Síntoma no encontrado' });
+        if (result.rows.length === 0) return res.status(404).json({ error: 'SÃ­ntoma no encontrado' });
         res.json(result.rows[0]);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -845,8 +851,8 @@ app.put('/api/sintomas/:id', authMiddleware, async (req, res) => {
 app.delete('/api/sintomas/:id', authMiddleware, async (req, res) => {
     try {
         const result = await pool.query('DELETE FROM sintomas WHERE id=$1 AND usuario_id=$2 RETURNING *', [req.params.id, req.user.id]);
-        if (result.rows.length === 0) return res.status(404).json({ error: 'Síntoma no encontrado' });
-        res.json({ message: 'Síntoma eliminado' });
+        if (result.rows.length === 0) return res.status(404).json({ error: 'SÃ­ntoma no encontrado' });
+        res.json({ message: 'SÃ­ntoma eliminado' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -1040,18 +1046,18 @@ app.delete('/api/historial-tareas/:id', authMiddleware, async (req, res) => {
     }
 });
 
-// GET /api/push/vapid-key — devuelve la clave pública VAPID al frontend
+// GET /api/push/vapid-key â€” devuelve la clave pÃºblica VAPID al frontend
 app.get('/api/push/vapid-key', (req, res) => {
     if (!VAPID_PUBLIC_KEY) return res.status(503).json({ error: 'Push no configurado' });
     res.json({ publicKey: VAPID_PUBLIC_KEY });
 });
 
-// POST /api/push/subscribe — guarda la suscripción push del usuario autenticado
+// POST /api/push/subscribe â€” guarda la suscripciÃ³n push del usuario autenticado
 app.post('/api/push/subscribe', authMiddleware, async (req, res) => {
     try {
         const { endpoint, keys } = req.body;
         if (!endpoint || !keys?.p256dh || !keys?.auth)
-            return res.status(400).json({ error: 'Suscripción inválida' });
+            return res.status(400).json({ error: 'SuscripciÃ³n invÃ¡lida' });
         await pool.query(`
             INSERT INTO push_subscriptions (usuario_id, endpoint, p256dh, auth)
             VALUES ($1, $2, $3, $4)
@@ -1064,7 +1070,7 @@ app.post('/api/push/subscribe', authMiddleware, async (req, res) => {
     }
 });
 
-// DELETE /api/push/unsubscribe — elimina la suscripción push del usuario autenticado
+// DELETE /api/push/unsubscribe â€” elimina la suscripciÃ³n push del usuario autenticado
 app.delete('/api/push/unsubscribe', authMiddleware, async (req, res) => {
     try {
         const { endpoint } = req.body;
@@ -1079,7 +1085,7 @@ app.delete('/api/push/unsubscribe', authMiddleware, async (req, res) => {
     }
 });
 
-// GET /api/push/status — devuelve cuántos dispositivos tiene suscritos el usuario
+// GET /api/push/status â€” devuelve cuÃ¡ntos dispositivos tiene suscritos el usuario
 app.get('/api/push/status', authMiddleware, async (req, res) => {
     try {
         const subs = await pool.query(
@@ -1099,12 +1105,12 @@ app.get('/api/push/status', authMiddleware, async (req, res) => {
     }
 });
 
-// POST /api/push/test — envía una notificación push de prueba al usuario autenticado
+// POST /api/push/test â€” envÃ­a una notificaciÃ³n push de prueba al usuario autenticado
 app.post('/api/push/test', authMiddleware, async (req, res) => {
     try {
         if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
             return res.status(503).json({
-                error: 'VAPID keys no configuradas en el servidor. Ejecutá setup-vapid.js y agregá las variables a Railway.'
+                error: 'VAPID keys no configuradas en el servidor. EjecutÃ¡ setup-vapid.js y agregÃ¡ las variables a Railway.'
             });
         }
         const subs = await pool.query(
@@ -1113,12 +1119,12 @@ app.post('/api/push/test', authMiddleware, async (req, res) => {
         );
         if (subs.rows.length === 0) {
             return res.status(404).json({
-                error: 'No hay suscripción push para este dispositivo. Activá las notificaciones primero.',
+                error: 'No hay suscripciÃ³n push para este dispositivo. ActivÃ¡ las notificaciones primero.',
                 devices: 0
             });
         }
         await sendPushToUser(req.user.id, {
-            title: '✅ ¡Notificaciones funcionando!',
+            title: 'âœ… Â¡Notificaciones funcionando!',
             body: 'Si ves esto, los recordatorios van a llegar aunque tengas la app cerrada.',
             tag: `test-${req.user.id}-${Date.now()}`,
             url: '/'
@@ -1130,34 +1136,34 @@ app.post('/api/push/test', authMiddleware, async (req, res) => {
     }
 });
 
-// Helper: envía una notificación push a TODOS los dispositivos de un usuario.
+// Helper: envÃ­a una notificaciÃ³n push a TODOS los dispositivos de un usuario.
 //
-// Parámetros:
-//   userId              — ID del usuario destino
-//   payload             — objeto { title, body, tag, url } de la notificación
-//   deduplicationBaseTag — CLAVE PARA DEDUP POR DISPOSITIVO (opcional pero recomendado).
+// ParÃ¡metros:
+//   userId              â€” ID del usuario destino
+//   payload             â€” objeto { title, body, tag, url } de la notificaciÃ³n
+//   deduplicationBaseTag â€” CLAVE PARA DEDUP POR DISPOSITIVO (opcional pero recomendado).
 //
-// Cómo funciona el dedup por dispositivo:
-//   En vez de un solo tag global por usuario, se crea un tag único para
-//   cada dispositivo (“baseTag:d:sufijo_endpoint”). Esto significa que:
-//     • Si notebook recibe la notificación → se marca solo para notebook.
-//     • Si celular falla (transitoriamente) → NO se marca → el siguiente ciclo
-//       del cron (8 min después) reintenta solo el celular.
-//     • Si celular expira (410) → se borra de la DB → cuando el usuario abre
-//       la app, el frontend la renueva automáticamente.
+// CÃ³mo funciona el dedup por dispositivo:
+//   En vez de un solo tag global por usuario, se crea un tag Ãºnico para
+//   cada dispositivo (â€œbaseTag:d:sufijo_endpointâ€). Esto significa que:
+//     â€¢ Si notebook recibe la notificaciÃ³n â†’ se marca solo para notebook.
+//     â€¢ Si celular falla (transitoriamente) â†’ NO se marca â†’ el siguiente ciclo
+//       del cron (8 min despuÃ©s) reintenta solo el celular.
+//     â€¢ Si celular expira (410) â†’ se borra de la DB â†’ cuando el usuario abre
+//       la app, el frontend la renueva automÃ¡ticamente.
 //
 // urgency 'high' + TTL 86400: entrega inmediata en Android con pantalla apagada.
-// TTL = 24 horas: si el dispositivo está apagado/hibernando toda la noche,
-// cuando vuelva a conectarse recibe las notificaciones pendientes del día.
+// TTL = 24 horas: si el dispositivo estÃ¡ apagado/hibernando toda la noche,
+// cuando vuelva a conectarse recibe las notificaciones pendientes del dÃ­a.
 const PUSH_OPTIONS = {
     urgency: 'high',
     TTL: 86400
 };
 
-// ── DEDUPLICACIÓN A NIVEL MÓDULO ──
-// CRÍTICO: deben estar aquí (módulo) para que sendPushToUser pueda accederlas.
-// Estaban dentro de startPushReminders() — eso causaba ReferenceError silencioso
-// y ninguna notificación era enviada.
+// â”€â”€ DEDUPLICACIÃ“N A NIVEL MÃ“DULO â”€â”€
+// CRÃTICO: deben estar aquÃ­ (mÃ³dulo) para que sendPushToUser pueda accederlas.
+// Estaban dentro de startPushReminders() â€” eso causaba ReferenceError silencioso
+// y ninguna notificaciÃ³n era enviada.
 async function wasAlreadySent(tag) {
     try {
         const r = await pool.query(
@@ -1171,7 +1177,7 @@ async function wasAlreadySent(tag) {
 async function markAsSent(tag) {
     try {
         await pool.query('INSERT INTO push_sent (tag, sent_at) VALUES ($1, NOW())', [tag]);
-    } catch { /* OK — entrada duplicada ignorada */ }
+    } catch { /* OK â€” entrada duplicada ignorada */ }
 }
 
 async function sendPushToUser(userId, payload, deduplicationBaseTag = null) {
@@ -1186,12 +1192,12 @@ async function sendPushToUser(userId, payload, deduplicationBaseTag = null) {
         // Procesar cada dispositivo individualmente (no Promise.all) para que el dedup
         // por dispositivo sea correcto y no haya race conditions en los INSERT de push_sent.
         for (const sub of subs.rows) {
-            // Tag único para este dispositivo: sufijo del endpoint lo identifica
+            // Tag Ãºnico para este dispositivo: sufijo del endpoint lo identifica
             const deviceTag = deduplicationBaseTag
                 ? `${deduplicationBaseTag}:d:${sub.endpoint.slice(-20)}`
                 : null;
 
-            // ¿Este dispositivo específico ya recibió la notificación en este ciclo?
+            // Â¿Este dispositivo especÃ­fico ya recibiÃ³ la notificaciÃ³n en este ciclo?
             if (deviceTag && await wasAlreadySent(deviceTag)) {
                 skipped++;
                 continue;
@@ -1207,7 +1213,7 @@ async function sendPushToUser(userId, payload, deduplicationBaseTag = null) {
                 sent++;
                 // Marcar ESTE dispositivo como notificado (dedup)
                 if (deviceTag) await markAsSent(deviceTag);
-                // Registrar último éxito (para cleanup de endpoints obsoletos)
+                // Registrar Ãºltimo Ã©xito (para cleanup de endpoints obsoletos)
                 await pool.query(
                     'UPDATE push_subscriptions SET last_success_at = NOW() WHERE endpoint=$1',
                     [sub.endpoint]
@@ -1215,24 +1221,24 @@ async function sendPushToUser(userId, payload, deduplicationBaseTag = null) {
             } catch (err) {
                 if (err.statusCode === 410 || err.statusCode === 404 ||
                     err.statusCode === 400 || err.statusCode === 401 || err.statusCode === 403) {
-                    // Suscripción permanentemente inválida → borrar de DB.
+                    // SuscripciÃ³n permanentemente invÃ¡lida â†’ borrar de DB.
                     // 410/404 = expirada. 400/401/403 = clave VAPID no coincide con la
-                    // que se usó al crear la suscripción (el device se suscribió con
-                    // otras claves). En ambos casos, reintentar es inútil — hay que
+                    // que se usÃ³ al crear la suscripciÃ³n (el device se suscribiÃ³ con
+                    // otras claves). En ambos casos, reintentar es inÃºtil â€” hay que
                     // borrarla y dejar que el frontend la re-registre al abrir la app.
                     await pool.query('DELETE FROM push_subscriptions WHERE endpoint=$1', [sub.endpoint]);
-                    console.warn(`[Push] Suscripción inválida eliminada (HTTP ${err.statusCode}): ${sub.endpoint.substring(0, 60)}`);
+                    console.warn(`[Push] SuscripciÃ³n invÃ¡lida eliminada (HTTP ${err.statusCode}): ${sub.endpoint.substring(0, 60)}`);
                 } else {
-                    // Error transitorio (red, rate limit, servidor del operador caído, etc.)
-                    // NO marcar deviceTag → el próximo ciclo del cron reintenta este dispositivo
+                    // Error transitorio (red, rate limit, servidor del operador caÃ­do, etc.)
+                    // NO marcar deviceTag â†’ el prÃ³ximo ciclo del cron reintenta este dispositivo
                     failed++;
-                    console.warn(`[Push] Error transitorio dispositivo ${sub.endpoint.substring(0, 50)}: HTTP ${err.statusCode || 'N/A'} — ${err.message}`);
+                    console.warn(`[Push] Error transitorio dispositivo ${sub.endpoint.substring(0, 50)}: HTTP ${err.statusCode || 'N/A'} â€” ${err.message}`);
                 }
             }
         }
 
         if (subs.rows.length > 0) {
-            console.log(`[Push] userId=${userId} → ${sent} enviados, ${failed} fallidos (reintentarán), ${skipped} ya enviados (de ${subs.rows.length} dispositivos)`);
+            console.log(`[Push] userId=${userId} â†’ ${sent} enviados, ${failed} fallidos (reintentarÃ¡n), ${skipped} ya enviados (de ${subs.rows.length} dispositivos)`);
         }
         return { sent, failed, skipped, total: subs.rows.length };
     } catch (err) {
@@ -1246,12 +1252,12 @@ let _cronLastRun = null;
 let _cronRunCount = 0;
 let _cronStartedAt = null;
 
-// GET /health — keep-alive y health check (Railway, UptimeRobot, etc.)
+// GET /health â€” keep-alive y health check (Railway, UptimeRobot, etc.)
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', uptime: process.uptime(), time: new Date().toISOString() });
 });
 
-// GET /api/push/debug — diagnóstico del sistema de push (requiere auth)
+// GET /api/push/debug â€” diagnÃ³stico del sistema de push (requiere auth)
 app.get('/api/push/debug', authMiddleware, async (req, res) => {
     try {
         const subsCount = await pool.query('SELECT COUNT(*) AS c FROM push_subscriptions');
@@ -1279,10 +1285,10 @@ app.get('/api/push/debug', authMiddleware, async (req, res) => {
     }
 });
 
-// Chequeo periódico de recordatorios — corre cada 8 minutos en el servidor
+// Chequeo periÃ³dico de recordatorios â€” corre cada 8 minutos en el servidor
 function startPushReminders() {
     if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
-        console.log('ℹ️  Push reminders desactivados (VAPID keys no configuradas)');
+        console.log('â„¹ï¸  Push reminders desactivados (VAPID keys no configuradas)');
         return;
     }
 
@@ -1310,9 +1316,9 @@ function startPushReminders() {
         }
     }
 
-    // Genera todos los horarios del día de un medicamento respetando la ventana de vigilia.
-    // hora_inicio (def. 08:00) → hora_fin (def. 22:00). No genera horarios fuera de esa ventana.
-    // Ejemplo: inicio=12:00, cada-6h, fin=22:00 → [12:00, 18:00]
+    // Genera todos los horarios del dÃ­a de un medicamento respetando la ventana de vigilia.
+    // hora_inicio (def. 08:00) â†’ hora_fin (def. 22:00). No genera horarios fuera de esa ventana.
+    // Ejemplo: inicio=12:00, cada-6h, fin=22:00 â†’ [12:00, 18:00]
     function getMedHorarios(med) {
         if (med.frecuencia === 'custom' && med.horarios_custom) {
             return med.horarios_custom.split(',').map(h => h.trim()).filter(Boolean);
@@ -1327,9 +1333,9 @@ function startPushReminders() {
         const inicioMin = hI * 60 + mI;
         let finMin      = hF * 60 + mF;
 
-        // 23:59 = fin de día → extender a 1440 para incluir toma de medianoche (00:00)
+        // 23:59 = fin de dÃ­a â†’ extender a 1440 para incluir toma de medianoche (00:00)
         if (finMin === 1439) finMin = 1440;
-        // Detectar ventana que cruza medianoche (ej. 23:39 → 06:00)
+        // Detectar ventana que cruza medianoche (ej. 23:39 â†’ 06:00)
         const crossesMidnight = inicioMin > finMin;
         const windowMinutes = crossesMidnight
             ? (1440 - inicioMin) + finMin + 1
@@ -1353,19 +1359,19 @@ function startPushReminders() {
 
     async function checkAndSendReminders() {
         try {
-            // Limpiar entradas viejas de deduplicación (> 24h)
+            // Limpiar entradas viejas de deduplicaciÃ³n (> 24h)
             await pool.query("DELETE FROM push_sent WHERE sent_at < NOW() - INTERVAL '24 hours'").catch(() => {});
 
-            // Limpiar suscripciones que llevan 14+ días sin entrega exitosa (expiradas silenciosamente)
-            // Esto previene acumulación de endpoints obsoletos en la tabla push_subscriptions
+            // Limpiar suscripciones que llevan 14+ dÃ­as sin entrega exitosa (expiradas silenciosamente)
+            // Esto previene acumulaciÃ³n de endpoints obsoletos en la tabla push_subscriptions
             await pool.query(`
                 DELETE FROM push_subscriptions
                 WHERE last_success_at IS NOT NULL
                   AND last_success_at < NOW() - INTERVAL '14 days'
             `).catch(() => {});
 
-            // ── 1. Medicamentos — todos los de recordatorio activo ──
-            // getMedHorarios() calcula los horarios del día según frecuencia.
+            // â”€â”€ 1. Medicamentos â€” todos los de recordatorio activo â”€â”€
+            // getMedHorarios() calcula los horarios del dÃ­a segÃºn frecuencia.
             // Si el med no tiene hora_inicio, usa 08:00 como inicio por defecto.
             const allMeds = await pool.query(`
                 SELECT DISTINCT ON (m.id)
@@ -1386,25 +1392,25 @@ function startPushReminders() {
                 const horaMatch = horarios.find(h => {
                     const [hh, mm] = h.split(':').map(Number);
                     const medMin = hh * 60 + mm;
-                    // Ventana de cobertura circular sobre 1440 min/día:
-                    //   diff < 15  → hasta 15 min ANTES del horario (cron anticipa la toma)
-                    //   diff >= 1420 → hasta 20 min DESPUÉS del horario (cubre reinicios de Railway)
-                    // La ventana de deduplicación (25 min) garantiza que no haya duplicados.
+                    // Ventana de cobertura circular sobre 1440 min/dÃ­a:
+                    //   diff < 15  â†’ hasta 15 min ANTES del horario (cron anticipa la toma)
+                    //   diff >= 1420 â†’ hasta 20 min DESPUÃ‰S del horario (cubre reinicios de Railway)
+                    // La ventana de deduplicaciÃ³n (25 min) garantiza que no haya duplicados.
                     const diff = (medMin - tzMin + 1440) % 1440;
                     return diff < 15 || diff >= 1420;
                 });
                 if (!horaMatch) continue;
                 const tag = `med-${med.usuario_id}-${med.nombre}-${horaMatch}-${tzNow.dateStr}`;
                 // sendPushToUser maneja el dedup por dispositivo internamente.
-                // Cada dispositivo tiene su propio tag → si uno falla, el siguiente ciclo lo reintenta.
+                // Cada dispositivo tiene su propio tag â†’ si uno falla, el siguiente ciclo lo reintenta.
                 await sendPushToUser(med.usuario_id, {
-                    title: '💊 Recordatorio de medicamento',
-                    body: `${med.nombre} — ${med.dosis} a las ${horaMatch}`,
+                    title: 'ðŸ’Š Recordatorio de medicamento',
+                    body: `${med.nombre} â€” ${med.dosis} a las ${horaMatch}`,
                     tag, url: '/'
                 }, tag);
             }
 
-            // ── 2. Citas: recordatorio vence en la ventana actual (±20/+15 min por timezone) ──
+            // â”€â”€ 2. Citas: recordatorio vence en la ventana actual (Â±20/+15 min por timezone) â”€â”€
             // Ventana: -20 min (cubre reinicios de Railway) + 15 min adelante.
             const citas = await pool.query(`
                 SELECT c.usuario_id, c.titulo, c.fecha, c.hora, c.recordatorio, c.lugar
@@ -1426,17 +1432,17 @@ function startPushReminders() {
                 const mins = parseInt(cita.recordatorio);
                 const tiempoTexto = mins < 60 ? `en ${mins} min`
                     : mins === 60 ? 'en 1 hora'
-                    : mins === 1440 ? 'mañana'
+                    : mins === 1440 ? 'maÃ±ana'
                     : `en ${Math.round(mins / 60)}h`;
                 await sendPushToUser(cita.usuario_id, {
-                    title: '📅 Recordatorio de cita',
-                    body: `${cita.titulo} — ${tiempoTexto}${cita.lugar ? ' en ' + cita.lugar : ''}`,
+                    title: 'ðŸ“… Recordatorio de cita',
+                    body: `${cita.titulo} â€” ${tiempoTexto}${cita.lugar ? ' en ' + cita.lugar : ''}`,
                     tag, url: '/'
                 }, tag);
             }
 
-            // ── 3. Tareas ÚNICAS: el datetime exacto (fecha + hora) cae en la ventana actual ──
-            // Funciona igual que citas: dispara una única vez cuando fecha+hora coincide.
+            // â”€â”€ 3. Tareas ÃšNICAS: el datetime exacto (fecha + hora) cae en la ventana actual â”€â”€
+            // Funciona igual que citas: dispara una Ãºnica vez cuando fecha+hora coincide.
             const tareasUnicas = await pool.query(`
                 SELECT t.id, t.usuario_id, t.titulo, t.hora, t.fecha
                 FROM tareas t
@@ -1456,15 +1462,15 @@ function startPushReminders() {
                 // Tag fijo con fecha+hora: solo dispara una vez en toda la vida de esta tarea
                 const tag = `tarea-unica-${tarea.usuario_id}-${tarea.id}-${tarea.fecha}-${tarea.hora.substring(0,5)}`;
                 await sendPushToUser(tarea.usuario_id, {
-                    title: '✓ Recordatorio de tarea',
-                    body: `${tarea.titulo} — a las ${tarea.hora.substring(0, 5)}`,
+                    title: 'âœ“ Recordatorio de tarea',
+                    body: `${tarea.titulo} â€” a las ${tarea.hora.substring(0, 5)}`,
                     tag, url: '/'
                 }, tag);
             }
 
-            // ── 4. Tareas DIARIAS: la hora coincide con la ventana actual Y hoy está dentro del rango activo ──
-            // fecha = fecha de inicio (primer día), hasta_fecha = último día (NULL = indefinido).
-            // El tag incluye tzNow.dateStr → se resetea cada día → notifica todos los días del rango.
+            // â”€â”€ 4. Tareas DIARIAS: la hora coincide con la ventana actual Y hoy estÃ¡ dentro del rango activo â”€â”€
+            // fecha = fecha de inicio (primer dÃ­a), hasta_fecha = Ãºltimo dÃ­a (NULL = indefinido).
+            // El tag incluye tzNow.dateStr â†’ se resetea cada dÃ­a â†’ notifica todos los dÃ­as del rango.
             const tareasDiarias = await pool.query(`
                 SELECT t.id, t.usuario_id, t.titulo, t.hora, t.fecha, t.hasta_fecha,
                        COALESCE(u.timezone,'America/Argentina/Buenos_Aires') AS timezone
@@ -1478,19 +1484,19 @@ function startPushReminders() {
             `);
             for (const tarea of tareasDiarias.rows) {
                 const tzNow = nowInTZ(tarea.timezone);
-                // ¿Hoy está dentro del rango activo?
-                if (tarea.fecha > tzNow.dateStr) continue;       // aún no empezó
-                if (tarea.hasta_fecha && tarea.hasta_fecha < tzNow.dateStr) continue; // ya terminó
-                // ¿La hora coincide con la ventana actual? (igual que medicamentos, ventana circular)
+                // Â¿Hoy estÃ¡ dentro del rango activo?
+                if (tarea.fecha > tzNow.dateStr) continue;       // aÃºn no empezÃ³
+                if (tarea.hasta_fecha && tarea.hasta_fecha < tzNow.dateStr) continue; // ya terminÃ³
+                // Â¿La hora coincide con la ventana actual? (igual que medicamentos, ventana circular)
                 const [hh, mm] = tarea.hora.substring(0, 5).split(':').map(Number);
                 const tareaMin = hh * 60 + mm;
                 const diff = (tareaMin - tzNow.totalMinutes + 1440) % 1440;
                 if (!(diff < 15 || diff >= 1420)) continue;
-                // Tag con fecha de hoy → se resetea cada día garantizando notificación diaria
+                // Tag con fecha de hoy â†’ se resetea cada dÃ­a garantizando notificaciÃ³n diaria
                 const tag = `tarea-diaria-${tarea.usuario_id}-${tarea.id}-${tzNow.dateStr}`;
                 await sendPushToUser(tarea.usuario_id, {
-                    title: '✓ Recordatorio de tarea',
-                    body: `${tarea.titulo} — a las ${tarea.hora.substring(0, 5)}`,
+                    title: 'âœ“ Recordatorio de tarea',
+                    body: `${tarea.titulo} â€” a las ${tarea.hora.substring(0, 5)}`,
                     tag, url: '/'
                 }, tag);
             }
@@ -1498,7 +1504,7 @@ function startPushReminders() {
             const log = nowInTZ('America/Argentina/Buenos_Aires');
             _cronLastRun = new Date().toISOString();
             _cronRunCount++;
-            console.log(`[Push Reminders] Chequeo OK — ${String(log.hours).padStart(2,'0')}:${String(log.minutes).padStart(2,'0')} AR — #${_cronRunCount}`);
+            console.log(`[Push Reminders] Chequeo OK â€” ${String(log.hours).padStart(2,'0')}:${String(log.minutes).padStart(2,'0')} AR â€” #${_cronRunCount}`);
         } catch (err) {
             console.error('[Push Reminders] Error:', err.message);
         }
@@ -1506,13 +1512,13 @@ function startPushReminders() {
 
     checkAndSendReminders();
     _cronStartedAt = new Date().toISOString();
-    setInterval(checkAndSendReminders, 8 * 60 * 1000); // cada 8 minutos — ventana de 20 min atrás + 15 min adelante garantiza cobertura total
-    console.log('✅ Push reminders iniciados (chequeo cada 8 minutos)');
+    setInterval(checkAndSendReminders, 8 * 60 * 1000); // cada 8 minutos â€” ventana de 20 min atrÃ¡s + 15 min adelante garantiza cobertura total
+    console.log('âœ… Push reminders iniciados (chequeo cada 8 minutos)');
 }
 
 // ========== CO-CUIDADOR: COMPARTIR ACCESO A PACIENTE (PREMIUM) ==========
 
-// POST /api/share/:pacienteId/invite — el dueño invita a otro email
+// POST /api/share/:pacienteId/invite â€” el dueÃ±o invita a otro email
 app.post('/api/share/:pacienteId/invite', authMiddleware, async (req, res) => {
     try {
         const { email } = req.body;
@@ -1523,37 +1529,37 @@ app.post('/api/share/:pacienteId/invite', authMiddleware, async (req, res) => {
         if (pac.rows.length === 0) return res.status(404).json({ error: 'Paciente no encontrado' });
         // Solo premium puede compartir
         const userRes = await pool.query('SELECT premium, nombre FROM usuarios WHERE id=$1', [req.user.id]);
-        if (!userRes.rows[0]?.premium) return res.status(403).json({ error: 'El co-cuidador es una función exclusiva de Premium' });
-        // Verificar que no se invita a sí mismo
+        if (!userRes.rows[0]?.premium) return res.status(403).json({ error: 'El co-cuidador es una funciÃ³n exclusiva de Premium' });
+        // Verificar que no se invita a sÃ­ mismo
         const propietario = await pool.query('SELECT email FROM usuarios WHERE id=$1', [req.user.id]);
-        if (propietario.rows[0]?.email === email) return res.status(400).json({ error: 'No podés invitarte a vos mismo' });
-        // Generar token de invitación
+        if (propietario.rows[0]?.email === email) return res.status(400).json({ error: 'No podÃ©s invitarte a vos mismo' });
+        // Generar token de invitaciÃ³n
         const inviteToken = crypto.randomBytes(32).toString('hex');
         // Buscar si el invitado ya tiene cuenta
         const invitado = await pool.query('SELECT id FROM usuarios WHERE email=$1', [email]);
         const invitadoId = invitado.rows[0]?.id || null;
-        // Insertar o actualizar invitación (ON CONFLICT actualiza token)
+        // Insertar o actualizar invitaciÃ³n (ON CONFLICT actualiza token)
         await pool.query(
             `INSERT INTO paciente_compartidos (paciente_id, propietario_id, invitado_email, invitado_id, token)
              VALUES ($1,$2,$3,$4,$5)
              ON CONFLICT (paciente_id, invitado_email) DO UPDATE SET token=$5, aceptado=FALSE, invitado_id=$4`,
             [pacienteId, req.user.id, email, invitadoId, inviteToken]
         );
-        // Enviar email de invitación
+        // Enviar email de invitaciÃ³n
         const acceptLink = `${FRONTEND_URL || 'https://cuidadiario.edensoftwork.com'}/index.html?share=${inviteToken}`;
         try {
             await sendEmail({
                 to: email,
-                subject: `👨‍👩‍👧 ${userRes.rows[0].nombre} te invitó a CuidaDiario`,
+                subject: `ðŸ‘¨â€ðŸ‘©â€ðŸ‘§ ${userRes.rows[0].nombre} te invitÃ³ a CuidaDiario`,
                 html: `
                     <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:24px;border:1px solid #e0e0e0;border-radius:8px;">
                         <h2 style="color:#667eea;">CuidaDiario</h2>
-                        <p><strong>${userRes.rows[0].nombre}</strong> te invitó a colaborar en el cuidado de <strong>${pac.rows[0].nombre}</strong>.</p>
-                        <p>Con este acceso, podrás ver medicamentos, citas, tareas y más.</p>
+                        <p><strong>${userRes.rows[0].nombre}</strong> te invitÃ³ a colaborar en el cuidado de <strong>${pac.rows[0].nombre}</strong>.</p>
+                        <p>Con este acceso, podrÃ¡s ver medicamentos, citas, tareas y mÃ¡s.</p>
                         <div style="text-align:center;margin:28px 0;">
-                            <a href="${acceptLink}" style="background:linear-gradient(135deg,#667eea,#764ba2);color:white;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:600;">Aceptar invitación</a>
+                            <a href="${acceptLink}" style="background:linear-gradient(135deg,#667eea,#764ba2);color:white;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:600;">Aceptar invitaciÃ³n</a>
                         </div>
-                        <p style="color:#777;font-size:0.85rem;">Si no conocés a ${userRes.rows[0].nombre}, podés ignorar este email.</p>
+                        <p style="color:#777;font-size:0.85rem;">Si no conocÃ©s a ${userRes.rows[0].nombre}, podÃ©s ignorar este email.</p>
                         <hr style="border:none;border-top:1px solid #eee;margin:20px 0;">
                         <p style="color:#aaa;font-size:0.78rem;">CuidaDiario by EDEN SoftWork</p>
                     </div>
@@ -1562,42 +1568,42 @@ app.post('/api/share/:pacienteId/invite', authMiddleware, async (req, res) => {
         } catch (emailErr) {
             console.warn('[Share] Email no enviado:', emailErr.message);
         }
-        res.json({ ok: true, message: `Invitación enviada a ${email}` });
+        res.json({ ok: true, message: `InvitaciÃ³n enviada a ${email}` });
     } catch (err) {
-        if (err.code === '23505') return res.status(400).json({ error: 'Ya existe una invitación para ese email y paciente' });
+        if (err.code === '23505') return res.status(400).json({ error: 'Ya existe una invitaciÃ³n para ese email y paciente' });
         res.status(500).json({ error: err.message });
     }
 });
 
-// GET /api/share/accept?token=... — el invitado acepta la invitación
+// GET /api/share/accept?token=... â€” el invitado acepta la invitaciÃ³n
 app.get('/api/share/accept', authMiddleware, async (req, res) => {
     const { token } = req.query;
     if (!token) return res.status(400).json({ error: 'Token requerido' });
     try {
         const share = await pool.query('SELECT * FROM paciente_compartidos WHERE token=$1', [token]);
-        if (share.rows.length === 0) return res.status(404).json({ error: 'Invitación no encontrada o ya utilizada' });
+        if (share.rows.length === 0) return res.status(404).json({ error: 'InvitaciÃ³n no encontrada o ya utilizada' });
         const s = share.rows[0];
-        // Verificar que el email del usuario autenticado coincide con la invitación
+        // Verificar que el email del usuario autenticado coincide con la invitaciÃ³n
         const userEmail = await pool.query('SELECT email FROM usuarios WHERE id=$1', [req.user.id]);
         if (userEmail.rows[0]?.email !== s.invitado_email)
-            return res.status(403).json({ error: 'Esta invitación no es para tu cuenta' });
+            return res.status(403).json({ error: 'Esta invitaciÃ³n no es para tu cuenta' });
         await pool.query(
             'UPDATE paciente_compartidos SET aceptado=TRUE, invitado_id=$1, token=NULL WHERE id=$2',
             [req.user.id, s.id]
         );
         // Obtener datos del paciente para mostrarlo al aceptar
         const pac = await pool.query('SELECT nombre FROM pacientes WHERE id=$1', [s.paciente_id]);
-        res.json({ ok: true, paciente: pac.rows[0]?.nombre || 'Paciente', mensaje: '¡Invitación aceptada! Ya podés ver los datos del paciente.' });
+        res.json({ ok: true, paciente: pac.rows[0]?.nombre || 'Paciente', mensaje: 'Â¡InvitaciÃ³n aceptada! Ya podÃ©s ver los datos del paciente.' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// GET /api/share/list/:pacienteId — lista los co-cuidadores de un paciente
+// GET /api/share/list/:pacienteId â€” lista los co-cuidadores de un paciente
 app.get('/api/share/list/:pacienteId', authMiddleware, async (req, res) => {
     try {
         const pac = await pool.query('SELECT id FROM pacientes WHERE id=$1 AND usuario_id=$2', [req.params.pacienteId, req.user.id]);
-        if (pac.rows.length === 0) return res.status(403).json({ error: 'No tenés permiso para ver este paciente' });
+        if (pac.rows.length === 0) return res.status(403).json({ error: 'No tenÃ©s permiso para ver este paciente' });
         const result = await pool.query(
             'SELECT id, invitado_email, aceptado, created_at FROM paciente_compartidos WHERE paciente_id=$1 ORDER BY created_at DESC',
             [req.params.pacienteId]
@@ -1608,7 +1614,7 @@ app.get('/api/share/list/:pacienteId', authMiddleware, async (req, res) => {
     }
 });
 
-// DELETE /api/share/:id — el dueño revoca el acceso de un co-cuidador
+// DELETE /api/share/:id â€” el dueÃ±o revoca el acceso de un co-cuidador
 app.delete('/api/share/:id', authMiddleware, async (req, res) => {
     try {
         // Verificar que el share pertenece a un paciente del usuario
@@ -1664,7 +1670,7 @@ app.post('/api/create-subscription', authMiddleware, async (req, res) => {
         const mp = await mpRequest('/preapproval', 'POST', payload);
         if (mp.status !== 200 && mp.status !== 201) {
             console.error('Error MP create-subscription:', mp.body);
-            return res.status(400).json({ error: mp.body?.message || 'Error al crear suscripción en MercadoPago' });
+            return res.status(400).json({ error: mp.body?.message || 'Error al crear suscripciÃ³n en MercadoPago' });
         }
         res.json({ init_point: mp.body.init_point, preapproval_id: mp.body.id });
     } catch (err) {
@@ -1674,9 +1680,9 @@ app.post('/api/create-subscription', authMiddleware, async (req, res) => {
 });
 
 // Helper: verifica firma HMAC-SHA256 del webhook de MercadoPago
-// IMPORTANTE: aunque la firma no sea válida NO bloqueamos el request,
+// IMPORTANTE: aunque la firma no sea vÃ¡lida NO bloqueamos el request,
 // porque siempre re-verificamos el estado con la API de MP.
-// Bloquear aquí solo causaría que cancelaciones no se procesen si el secret está mal configurado.
+// Bloquear aquÃ­ solo causarÃ­a que cancelaciones no se procesen si el secret estÃ¡ mal configurado.
 function verifyMPWebhookSignature(req) {
     const MP_WEBHOOK_SECRET = process.env.MP_WEBHOOK_SECRET;
     if (!MP_WEBHOOK_SECRET) return true; // Sin secret: siempre aceptar
@@ -1691,23 +1697,23 @@ function verifyMPWebhookSignature(req) {
     const expected = crypto.createHmac('sha256', MP_WEBHOOK_SECRET).update(manifest).digest('hex');
     try {
         const valid = crypto.timingSafeEqual(Buffer.from(v1, 'hex'), Buffer.from(expected, 'hex'));
-        if (!valid) console.warn('[MP Webhook] ⚠️ Firma inválida — procesando igual (MP_WEBHOOK_SECRET puede estar mal configurado)');
-        return true; // Siempre procesar — la re-verificación con MP API garantiza seguridad
+        if (!valid) console.warn('[MP Webhook] âš ï¸ Firma invÃ¡lida â€” procesando igual (MP_WEBHOOK_SECRET puede estar mal configurado)');
+        return true; // Siempre procesar â€” la re-verificaciÃ³n con MP API garantiza seguridad
     } catch { return true; }
 }
 
 app.post('/api/webhook/mercadopago', async (req, res) => {
     try {
         if (!verifyMPWebhookSignature(req)) {
-            console.warn('[MP Webhook] Firma inválida — request rechazado');
+            console.warn('[MP Webhook] Firma invÃ¡lida â€” request rechazado');
             return res.sendStatus(401);
         }
 
         const body = req.body || {};
 
-        // ── Soporta AMBOS sistemas de notificación de MercadoPago ──────────────
+        // â”€â”€ Soporta AMBOS sistemas de notificaciÃ³n de MercadoPago â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         // 1) Nuevo sistema (Webhooks API): body JSON con type y data.id
-        // 2) IPN clásico: query params ?topic=preapproval&id=PREAPPROVAL_ID
+        // 2) IPN clÃ¡sico: query params ?topic=preapproval&id=PREAPPROVAL_ID
         const type  = body.type  || null;
         const topic = req.query.topic || body.topic || null;
 
@@ -1722,7 +1728,7 @@ app.post('/api/webhook/mercadopago', async (req, res) => {
             type  === 'preapproval'              ||
             topic === 'preapproval';
 
-        console.log(`[MP Webhook] Recibido — type="${type}" topic="${topic}" dataId="${dataId}"`);
+        console.log(`[MP Webhook] Recibido â€” type="${type}" topic="${topic}" dataId="${dataId}"`);
 
         if (isPreapprovalEvent && dataId) {
             const mp = await mpRequest(`/preapproval/${dataId}`);
@@ -1736,15 +1742,15 @@ app.post('/api/webhook/mercadopago', async (req, res) => {
                     } else {
                         await pool.query('UPDATE usuarios SET premium=FALSE WHERE id=$1', [userId]);
                     }
-                    console.log(`[MP Webhook] ✅ Usuario ${userId} → premium: ${isPremium} (estado MP: "${preapproval.status}")`);
+                    console.log(`[MP Webhook] âœ… Usuario ${userId} â†’ premium: ${isPremium} (estado MP: "${preapproval.status}")`);
                 } else {
-                    console.warn(`[MP Webhook] external_reference inválido: "${preapproval.external_reference}"`);
+                    console.warn(`[MP Webhook] external_reference invÃ¡lido: "${preapproval.external_reference}"`);
                 }
             } else {
-                console.warn(`[MP Webhook] No se pudo obtener preapproval "${dataId}" — HTTP ${mp.status}`);
+                console.warn(`[MP Webhook] No se pudo obtener preapproval "${dataId}" â€” HTTP ${mp.status}`);
             }
         } else {
-            // Evento que no es de preapproval (pagos, etc.) — ignorar silenciosamente
+            // Evento que no es de preapproval (pagos, etc.) â€” ignorar silenciosamente
             console.log(`[MP Webhook] Evento ignorado (no es preapproval)`);
         }
 
@@ -1755,8 +1761,8 @@ app.post('/api/webhook/mercadopago', async (req, res) => {
     }
 });
 
-// ========== VERIFICACIÓN MANUAL DE SUSCRIPCIÓN MP ==========
-// GET /api/verify-subscription — activa premium si MercadoPago tiene una suscripción autorizada.
+// ========== VERIFICACIÃ“N MANUAL DE SUSCRIPCIÃ“N MP ==========
+// GET /api/verify-subscription â€” activa premium si MercadoPago tiene una suscripciÃ³n autorizada.
 // Usado por premium-success.html tras el redirect de MP, y como fallback desde la app.
 // Acepta opcionalmente ?preapproval_id=XXX (viene en el back_url de MP).
 app.get('/api/verify-subscription', authMiddleware, async (req, res) => {
@@ -1766,7 +1772,7 @@ app.get('/api/verify-subscription', authMiddleware, async (req, res) => {
     try {
         let authorized = null;
 
-        // Intento 1: preapproval_id específico enviado por el frontend (viene del back_url de MP)
+        // Intento 1: preapproval_id especÃ­fico enviado por el frontend (viene del back_url de MP)
         const preapprovalId = req.query.preapproval_id;
         if (preapprovalId) {
             const mp = await mpRequest(`/preapproval/${preapprovalId}`);
@@ -1780,14 +1786,14 @@ app.get('/api/verify-subscription', authMiddleware, async (req, res) => {
             }
         }
 
-        // Intento 2: buscar por external_reference (cubre cualquier suscripción del usuario)
+        // Intento 2: buscar por external_reference (cubre cualquier suscripciÃ³n del usuario)
         if (!authorized) {
             const search = await mpRequest(`/preapproval/search?external_reference=${req.user.id}&status=authorized`);
             if (search.status === 200) {
                 const results = search.body?.results || [];
-                // CRÍTICO: verificar que external_reference coincide con el usuario solicitante.
-                // Sin esta verificación, un bug de la API de MP podría retornar suscripciones ajenas
-                // (ej: en entornos de prueba), otorgando premium a co-cuidadores sin suscripción.
+                // CRÃTICO: verificar que external_reference coincide con el usuario solicitante.
+                // Sin esta verificaciÃ³n, un bug de la API de MP podrÃ­a retornar suscripciones ajenas
+                // (ej: en entornos de prueba), otorgando premium a co-cuidadores sin suscripciÃ³n.
                 authorized = results.find(p =>
                     p.status === 'authorized' &&
                     parseInt(p.external_reference) === req.user.id
@@ -1797,31 +1803,31 @@ app.get('/api/verify-subscription', authMiddleware, async (req, res) => {
 
         if (authorized) {
             await pool.query('UPDATE usuarios SET premium=TRUE, premium_welcome_pending=TRUE WHERE id=$1', [req.user.id]);
-            console.log(`[MP Verify] ✅ Usuario ${req.user.id} → premium: TRUE (preapproval: ${authorized.id})`);
+            console.log(`[MP Verify] âœ… Usuario ${req.user.id} â†’ premium: TRUE (preapproval: ${authorized.id})`);
             return res.json({ premium: true, status: 'authorized' });
         }
 
-        // Sin suscripción autorizada — buscar todas para saber el estado real
+        // Sin suscripciÃ³n autorizada â€” buscar todas para saber el estado real
         const searchAll = await mpRequest(`/preapproval/search?external_reference=${req.user.id}`);
         const allResults = searchAll.body?.results || [];
         const pending    = allResults.find(p => p.status === 'pending');
         const cancelled  = allResults.find(p => ['cancelled', 'paused', 'expired'].includes(p.status));
 
-        // Si hay una cancelada/pausada/expirada y ninguna autorizada → bajar premium
+        // Si hay una cancelada/pausada/expirada y ninguna autorizada â†’ bajar premium
         if (cancelled && !pending) {
             await pool.query('UPDATE usuarios SET premium=FALSE WHERE id=$1', [req.user.id]);
-            console.log(`[MP Verify] 🔻 Usuario ${req.user.id} → premium: FALSE (estado MP: "${cancelled.status}")`);
+            console.log(`[MP Verify] ðŸ”» Usuario ${req.user.id} â†’ premium: FALSE (estado MP: "${cancelled.status}")`);
             return res.json({ premium: false, status: cancelled.status,
-                message: 'Tu suscripción fue cancelada o expiró.' });
+                message: 'Tu suscripciÃ³n fue cancelada o expirÃ³.' });
         }
 
-        console.log(`[MP Verify] Usuario ${req.user.id} — estados: ${allResults.map(p => p.status).join(', ') || 'ninguna'}`);
+        console.log(`[MP Verify] Usuario ${req.user.id} â€” estados: ${allResults.map(p => p.status).join(', ') || 'ninguna'}`);
         return res.json({
             premium: false,
             status: pending ? 'pending' : 'not_found',
             message: pending
-                ? 'Tu pago está siendo procesado. Puede demorar unos minutos.'
-                : 'No se encontró suscripción activa en MercadoPago.'
+                ? 'Tu pago estÃ¡ siendo procesado. Puede demorar unos minutos.'
+                : 'No se encontrÃ³ suscripciÃ³n activa en MercadoPago.'
         });
     } catch (err) {
         console.error('[MP Verify] Error:', err.message);
@@ -1843,7 +1849,7 @@ app.get('/api/me', authMiddleware, async (req, res) => {
     }
 });
 
-// POST /api/premium/acknowledge-welcome — el frontend lo llama tras mostrar el modal.
+// POST /api/premium/acknowledge-welcome â€” el frontend lo llama tras mostrar el modal.
 // Evita que el modal se repita en otras sesiones/dispositivos del mismo usuario.
 app.post('/api/premium/acknowledge-welcome', authMiddleware, async (req, res) => {
     try {
@@ -1859,7 +1865,7 @@ app.put('/api/profile', authMiddleware, async (req, res) => {
         const { nombre, email, password, timezone } = req.body;
         if (!nombre || !email) return res.status(400).json({ error: 'Nombre y email son requeridos' });
         const existing = await pool.query('SELECT id FROM usuarios WHERE email=$1 AND id!=$2', [email, req.user.id]);
-        if (existing.rows.length > 0) return res.status(400).json({ error: 'El email ya está en uso por otra cuenta' });
+        if (existing.rows.length > 0) return res.status(400).json({ error: 'El email ya estÃ¡ en uso por otra cuenta' });
         const tz = timezone || 'America/Argentina/Buenos_Aires';
         let result;
         if (password) {
@@ -1881,7 +1887,7 @@ app.put('/api/profile', authMiddleware, async (req, res) => {
     }
 });
 
-// ========== PAYPAL — deshabilitado temporalmente (restricciones para Argentina) ==========
+// ========== PAYPAL â€” deshabilitado temporalmente (restricciones para Argentina) ==========
 // Para reactivar: descomentar todo este bloque y los endpoints de abajo,
 // y habilitar window.PAYPAL_CLIENT_ID/PLAN_ID en index.html
 /*
@@ -1928,7 +1934,7 @@ async function paypalRequest(path, method, body = null) {
 }
 */
 
-/* PAYPAL ENDPOINTS — deshabilitado temporalmente (restricciones para Argentina)
+/* PAYPAL ENDPOINTS â€” deshabilitado temporalmente (restricciones para Argentina)
  * Para reactivar: descomentar este bloque completo y el bloque de funciones de arriba.
 
 app.post('/api/paypal/create-order', authMiddleware, async (req, res) => {
@@ -1950,7 +1956,7 @@ app.post('/api/paypal/capture-order/:orderID', authMiddleware, async (req, res) 
         const result = await paypalRequest(`/v2/checkout/orders/${req.params.orderID}/capture`, 'POST');
         if (result.status !== 201 && result.status !== 200) return res.status(400).json({ error: result.body?.message || 'Error al capturar pago en PayPal' });
         await pool.query('UPDATE usuarios SET premium=$1 WHERE id=$2', [true, req.user.id]);
-        console.log(`[PayPal] Usuario ${req.user.id} → premium: true`);
+        console.log(`[PayPal] Usuario ${req.user.id} â†’ premium: true`);
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -1962,7 +1968,7 @@ app.post('/api/paypal/activate-subscription', authMiddleware, async (req, res) =
         const { subscriptionID } = req.body;
         if (!subscriptionID) return res.status(400).json({ error: 'subscriptionID requerido' });
         await pool.query('UPDATE usuarios SET premium=$1, paypal_subscription_id=$2 WHERE id=$3', [true, subscriptionID, req.user.id]);
-        console.log(`[PayPal Subscription] Usuario ${req.user.id} → premium: true (sub: ${subscriptionID})`);
+        console.log(`[PayPal Subscription] Usuario ${req.user.id} â†’ premium: true (sub: ${subscriptionID})`);
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -1973,7 +1979,7 @@ app.post('/api/paypal/webhook', async (req, res) => {
     try {
         const rawBody = req.body;
         const event = JSON.parse(Buffer.isBuffer(rawBody) ? rawBody.toString() : rawBody);
-        console.log('🔔 PayPal webhook recibido:', event.event_type, event.id);
+        console.log('ðŸ”” PayPal webhook recibido:', event.event_type, event.id);
         const CANCEL_EVENTS = ['BILLING.SUBSCRIPTION.CANCELLED', 'BILLING.SUBSCRIPTION.SUSPENDED', 'BILLING.SUBSCRIPTION.EXPIRED'];
         if (CANCEL_EVENTS.includes(event.event_type)) {
             const subscriptionId = event.resource?.id;
@@ -1983,7 +1989,7 @@ app.post('/api/paypal/webhook', async (req, res) => {
                     [subscriptionId]
                 );
                 if (result.rows.length > 0) {
-                    console.log(`🔻 Premium desactivado para usuario ${result.rows[0].id} — ${event.event_type}`);
+                    console.log(`ðŸ”» Premium desactivado para usuario ${result.rows[0].id} â€” ${event.event_type}`);
                 }
             }
         }
@@ -1997,9 +2003,9 @@ app.post('/api/paypal/webhook', async (req, res) => {
 
 // ========== INICIAR SERVIDOR ==========
 
-// Sincronización periódica de estados de suscripción con MercadoPago.
+// SincronizaciÃ³n periÃ³dica de estados de suscripciÃ³n con MercadoPago.
 // Garantiza que cancelaciones/pausas se reflejen aunque el webhook haya fallado.
-// Corre cada 4 horas. Si MP_ACCESS_TOKEN no está configurado, no hace nada.
+// Corre cada 4 horas. Si MP_ACCESS_TOKEN no estÃ¡ configurado, no hace nada.
 async function syncMPSubscriptions() {
     if (!MP_ACCESS_TOKEN) return;
     try {
@@ -2014,16 +2020,16 @@ async function syncMPSubscriptions() {
                 const hasAuthorized = (search.body?.results || []).some(p => p.status === 'authorized');
                 if (!hasAuthorized) {
                     await pool.query('UPDATE usuarios SET premium=FALSE WHERE id=$1', [user.id]);
-                    console.log(`[MP Sync] 🔻 Usuario ${user.id} → premium: FALSE (sin suscripción autorizada)`);
+                    console.log(`[MP Sync] ðŸ”» Usuario ${user.id} â†’ premium: FALSE (sin suscripciÃ³n autorizada)`);
                     deactivated++;
                 }
-                // Pequeña pausa entre requests para no saturar la API de MP
+                // PequeÃ±a pausa entre requests para no saturar la API de MP
                 await new Promise(r => setTimeout(r, 300));
             } catch (e) {
                 console.warn(`[MP Sync] Error verificando usuario ${user.id}:`, e.message);
             }
         }
-        console.log(`[MP Sync] ✅ Sync completado — ${deactivated} usuario(s) desactivado(s)`);
+        console.log(`[MP Sync] âœ… Sync completado â€” ${deactivated} usuario(s) desactivado(s)`);
     } catch (e) {
         console.error('[MP Sync] Error:', e.message);
     }
@@ -2031,16 +2037,16 @@ async function syncMPSubscriptions() {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-    console.log(`✅ Servidor escuchando en puerto ${PORT}`);
-    console.log(`📍 http://localhost:${PORT}`);
+    console.log(`âœ… Servidor escuchando en puerto ${PORT}`);
+    console.log(`ðŸ“ http://localhost:${PORT}`);
     await runMigrations();
-    startPushReminders(); // ← Arranca el chequeo periódico de push
+    startPushReminders(); // â† Arranca el chequeo periÃ³dico de push
 
-    // Sincronización periódica con MercadoPago: detecta cancelaciones aunque el webhook falle
+    // SincronizaciÃ³n periÃ³dica con MercadoPago: detecta cancelaciones aunque el webhook falle
     if (MP_ACCESS_TOKEN) {
-        setTimeout(syncMPSubscriptions, 30000); // primer sync 30s después del boot
+        setTimeout(syncMPSubscriptions, 30000); // primer sync 30s despuÃ©s del boot
         setInterval(syncMPSubscriptions, 4 * 60 * 60 * 1000); // luego cada 4 horas
-        console.log('✅ Sync periódico de suscripciones MP activado (cada 4 horas)');
+        console.log('âœ… Sync periÃ³dico de suscripciones MP activado (cada 4 horas)');
     }
 
     // Keep-alive: evita que Railway duerma el servidor en planes gratuitos.
@@ -2053,8 +2059,8 @@ app.listen(PORT, async () => {
             https.get(`${BACKEND_URL}/health`, (res) => {
                 // Solo para mantener vivo el proceso, no necesitamos la respuesta
                 res.resume();
-            }).on('error', () => { /* silencioso — el servidor sigue corriendo */ });
+            }).on('error', () => { /* silencioso â€” el servidor sigue corriendo */ });
         }, 4 * 60 * 1000); // cada 4 minutos
-        console.log(`🏓 Keep-alive activado → ${BACKEND_URL}/health`);
+        console.log(`ðŸ“ Keep-alive activado â†’ ${BACKEND_URL}/health`);
     }
 });
