@@ -2087,6 +2087,25 @@ app.post('/api/notas', authMiddleware, async (req, res) => {
     }
 });
 
+app.patch('/api/notas/:id', authMiddleware, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { titulo, contenido, color, recordatorio } = req.body;
+        const result = await pool.query(
+            `UPDATE notas
+             SET titulo = $1, contenido = $2, color = $3, recordatorio = $4
+             WHERE id = $5 AND usuario_id = $6
+             RETURNING *`,
+            [titulo || null, contenido || null, color || 'amarillo', recordatorio || null, id, req.user.id]
+        );
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Nota no encontrada' });
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error('PATCH /api/notas:', err.message);
+        res.status(500).json({ error: 'Error al actualizar nota' });
+    }
+});
+
 app.delete('/api/notas/:id', authMiddleware, async (req, res) => {
     try {
         const { id } = req.params;
