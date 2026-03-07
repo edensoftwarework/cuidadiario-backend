@@ -280,6 +280,23 @@ async function runMigrations() {
             ADD COLUMN IF NOT EXISTS premium_welcome_pending BOOLEAN DEFAULT FALSE
         `);
 
+        // NOTAS: tablero visual con recordatorios
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS notas (
+                id           SERIAL PRIMARY KEY,
+                usuario_id   INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+                paciente_id  INTEGER REFERENCES pacientes(id) ON DELETE SET NULL,
+                titulo       TEXT,
+                contenido    TEXT,
+                color        VARCHAR(20) DEFAULT 'amarillo',
+                recordatorio TIMESTAMP,
+                created_at   TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        `);
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS idx_notas_usuario ON notas (usuario_id, created_at DESC)
+        `).catch(() => {});
+
         console.log('✅ Migraciones completadas');
     } catch (err) {
         console.error('❌ Error en migraciones:', err.message);
@@ -2028,6 +2045,62 @@ async function syncMPSubscriptions() {
         console.error('[MP Sync] Error:', e.message);
     }
 }
+
+// ========== NOTAS ==========
+app.get('/api/notas', authMiddleware, async (req, res) => {
+    try {
+        const { paciente_id } = req.query;
+        let query = 'SELECT * FROM notas WHERE usuario_id = $1';
+        const params = [req.user.id];
+        if (paciente_id) {
+            query += ' AND paciente_id = $2';
+            params.push(paciente_id);
+        }
+        query += ' ORDER BY created_at DESC';
+        const result = await pool.query(query, params);
+        res.json(result.rows);
+    } catch (err) {
+        console.error('GET /api/notas:', err.message);
+        res.status(500).json({ error: 'Error al obtener notas' });
+    }
+});
+
+app.post('/api/notas', authMiddleware, async (req, res) => {
+    try {
+        const { paciente_id, titulo, contenido, color, recordatorio } = req.body;
+        const result = await pool.query(
+            `INSERT INTO notas (usuario_id, paciente_id, titulo, contenido, color, recordatorio)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+            [
+                req.user.id,
+                paciente_id || null,
+                titulo || null,
+                contenido || null,
+                color || 'amarillo',
+                recordatorio || null
+            ]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('POST /api/notas:', err.message);
+        res.status(500).json({ error: 'Error al guardar nota' });
+    }
+});
+
+app.delete('/api/notas/:id', authMiddleware, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query(
+            'DELETE FROM notas WHERE id = $1 AND usuario_id = $2 RETURNING id',
+            [id, req.user.id]
+        );
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Nota no encontrada' });
+        res.json({ success: true });
+    } catch (err) {
+        console.error('DELETE /api/notas:', err.message);
+        res.status(500).json({ error: 'Error al eliminar nota' });
+    }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
