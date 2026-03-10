@@ -3325,6 +3325,55 @@ app.get('/api/b2b/reportes', authB2BMiddleware, async (req, res) => {
     }
 });
 
+// GET /api/b2b/reporte/export — backup completo de la institución (solo admin)
+app.get('/api/b2b/reporte/export', authB2BMiddleware, async (req, res) => {
+    try {
+        if (req.b2bUser.rol !== 'admin_institucion') {
+            return res.status(403).json({ error: 'Solo el administrador puede exportar datos' });
+        }
+        const iid = req.b2bUser.institucion_id;
+        const [institucion, pacientes, staff, medicamentos, histMeds, citas, histTareas, sintomas, signos, contactos, notas] = await Promise.all([
+            pool.query('SELECT id, nombre, tipo, telefono, email, direccion, created_at FROM instituciones_b2b WHERE id=$1', [iid]),
+            pool.query('SELECT * FROM pacientes_b2b WHERE institucion_id=$1 ORDER BY apellido, nombre', [iid]),
+            pool.query('SELECT id, nombre, email, rol, turno, activo, created_at FROM usuarios_b2b WHERE institucion_id=$1 ORDER BY rol, nombre', [iid]),
+            pool.query('SELECT * FROM medicamentos_b2b WHERE institucion_id=$1 ORDER BY paciente_id', [iid]),
+            pool.query('SELECT * FROM historial_medicamentos_b2b WHERE institucion_id=$1 ORDER BY fecha DESC', [iid]),
+            pool.query('SELECT * FROM citas_b2b WHERE institucion_id=$1 ORDER BY fecha DESC', [iid]),
+            pool.query('SELECT * FROM historial_tareas_b2b WHERE institucion_id=$1 ORDER BY fecha DESC', [iid]),
+            pool.query('SELECT * FROM sintomas_b2b WHERE institucion_id=$1 ORDER BY fecha DESC', [iid]),
+            pool.query('SELECT * FROM signos_vitales_b2b WHERE institucion_id=$1 ORDER BY fecha DESC', [iid]),
+            pool.query('SELECT * FROM contactos_b2b WHERE institucion_id=$1', [iid]),
+            pool.query('SELECT * FROM notas_b2b WHERE institucion_id=$1 ORDER BY created_at DESC', [iid]),
+        ]);
+        res.json({
+            exportado_en: new Date().toISOString(),
+            version: '1.0',
+            institucion: institucion.rows[0],
+            resumen: {
+                total_pacientes: pacientes.rowCount,
+                total_staff: staff.rowCount,
+                total_medicamentos: medicamentos.rowCount,
+                total_tomas: histMeds.rowCount,
+                total_citas: citas.rowCount,
+                total_sintomas: sintomas.rowCount,
+            },
+            pacientes: pacientes.rows,
+            staff: staff.rows,
+            medicamentos: medicamentos.rows,
+            historial_medicamentos: histMeds.rows,
+            citas: citas.rows,
+            historial_tareas: histTareas.rows,
+            sintomas: sintomas.rows,
+            signos_vitales: signos.rows,
+            contactos: contactos.rows,
+            notas: notas.rows,
+        });
+    } catch (err) {
+        console.error('GET /api/b2b/reporte/export:', err.message);
+        res.status(500).json({ error: 'Error al exportar datos' });
+    }
+});
+
 // ============================================================
 // ========== FIN MÓDULO B2B ==========
 // ============================================================
