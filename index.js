@@ -3063,6 +3063,23 @@ app.post('/api/b2b/sintomas', authB2BMiddleware, requireB2BRole('admin_instituci
     }
 });
 
+// PATCH /api/b2b/sintomas/:id
+app.patch('/api/b2b/sintomas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        const { descripcion, intensidad } = req.body;
+        if (!descripcion) return res.status(400).json({ error: 'descripcion obligatoria' });
+        const result = await pool.query(
+            'UPDATE sintomas_b2b SET descripcion=$1, intensidad=$2 WHERE id=$3 AND institucion_id=$4 RETURNING *',
+            [descripcion, intensidad ?? null, req.params.id, req.b2bUser.institucion_id]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'Síntoma no encontrado' });
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error('PATCH /api/b2b/sintomas/:id:', err.message);
+        res.status(500).json({ error: 'Error al actualizar síntoma' });
+    }
+});
+
 // DELETE /api/b2b/sintomas/:id
 app.delete('/api/b2b/sintomas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
     try {
