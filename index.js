@@ -529,6 +529,26 @@ async function runMigrations() {
         await pool.query(`ALTER TABLE pacientes_b2b ADD COLUMN IF NOT EXISTS motivo_egreso TEXT`).catch(() => {});
         await pool.query(`ALTER TABLE usuarios_b2b ADD COLUMN IF NOT EXISTS turno VARCHAR(20) DEFAULT 'mañana'`).catch(() => {});
 
+        // MIGRACIONES B2B v3 — Catálogo de medicamentos y modelo de stock institucional
+        await pool.query(`ALTER TABLE instituciones_b2b ADD COLUMN IF NOT EXISTS stock_modelo VARCHAR(20) DEFAULT 'familiar'`).catch(() => {});
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS catalogo_medicamentos_b2b (
+                id              SERIAL PRIMARY KEY,
+                institucion_id  INTEGER NOT NULL REFERENCES instituciones_b2b(id) ON DELETE CASCADE,
+                nombre          VARCHAR(200) NOT NULL,
+                principio_activo VARCHAR(200),
+                presentacion    VARCHAR(100),
+                unidad          VARCHAR(50) NOT NULL DEFAULT 'comprimido',
+                stock_actual    INTEGER NOT NULL DEFAULT 0,
+                stock_minimo    INTEGER NOT NULL DEFAULT 5,
+                activo          BOOLEAN DEFAULT TRUE,
+                created_at      TIMESTAMPTZ DEFAULT NOW(),
+                updated_at      TIMESTAMPTZ DEFAULT NOW()
+            )
+        `).catch(() => {});
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_catalogo_meds_b2b ON catalogo_medicamentos_b2b (institucion_id, activo)`).catch(() => {});
+        await pool.query(`ALTER TABLE medicamentos_b2b ADD COLUMN IF NOT EXISTS catalogo_id INTEGER REFERENCES catalogo_medicamentos_b2b(id) ON DELETE SET NULL`).catch(() => {});
+
         console.log('✅ Migraciones B2B completadas');
         // ============================================================
         // FIN MIGRACIONES B2B
@@ -2567,11 +2587,12 @@ app.get('/api/b2b/institucion', authB2BMiddleware, async (req, res) => {
 // PATCH /api/b2b/institucion
 app.patch('/api/b2b/institucion', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
     try {
-        const { nombre, tipo, direccion, telefono, email } = req.body;
+        const { nombre, tipo, direccion, telefono, email, stock_modelo } = req.body;
         await pool.query(
             `UPDATE instituciones_b2b SET nombre=COALESCE($1,nombre), tipo=COALESCE($2,tipo),
-             direccion=COALESCE($3,direccion), telefono=COALESCE($4,telefono), email=COALESCE($5,email) WHERE id=$6`,
-            [nombre, tipo, direccion, telefono, email, req.b2bUser.institucion_id]
+             direccion=COALESCE($3,direccion), telefono=COALESCE($4,telefono), email=COALESCE($5,email),
+             stock_modelo=COALESCE($6,stock_modelo) WHERE id=$7`,
+            [nombre, tipo, direccion, telefono, email, stock_modelo, req.b2bUser.institucion_id]
         );
         res.json({ success: true });
     } catch (err) {
@@ -2792,10 +2813,15 @@ app.get('/api/b2b/medicamentos/historial', authB2BMiddleware, async (req, res) =
 app.get('/api/b2b/medicamentos', authB2BMiddleware, async (req, res) => {
     try {
         const { paciente_id } = req.query;
-        let query = 'SELECT * FROM medicamentos_b2b WHERE institucion_id=$1 AND activo=TRUE';
+        let query = `SELECT m.*,
+                     c.nombre AS catalogo_nombre, c.stock_actual AS catalogo_stock,
+                     c.stock_minimo AS catalogo_stock_minimo, c.unidad AS catalogo_unidad
+                     FROM medicamentos_b2b m
+                     LEFT JOIN catalogo_medicamentos_b2b c ON m.catalogo_id = c.id
+                     WHERE m.institucion_id=$1 AND m.activo=TRUE`;
         const params = [req.b2bUser.institucion_id];
-        if (paciente_id) { query += ` AND paciente_id=$2`; params.push(paciente_id); }
-        query += ' ORDER BY nombre';
+        if (paciente_id) { query += ` AND m.paciente_id=$2`; params.push(paciente_id); }
+        query += ' ORDER BY m.nombre';
         res.json((await pool.query(query, params)).rows);
     } catch (err) {
         console.error('GET /api/b2b/medicamentos:', err.message);
@@ -2806,13 +2832,13 @@ app.get('/api/b2b/medicamentos', authB2BMiddleware, async (req, res) => {
 // POST /api/b2b/medicamentos
 app.post('/api/b2b/medicamentos', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
     try {
-        const { paciente_id, nombre, dosis, frecuencia, hora_inicio, hora_fin, horarios_custom, instrucciones, stock } = req.body;
+        const { paciente_id, nombre, dosis, frecuencia, hora_inicio, hora_fin, horarios_custom, instrucciones, stock, catalogo_id } = req.body;
         if (!paciente_id || !nombre) return res.status(400).json({ error: 'paciente_id y nombre obligatorios' });
         if (!(await checkB2BPacienteAccess(req.b2bUser, paciente_id))) return res.status(403).json({ error: 'Sin acceso a este paciente' });
         const result = await pool.query(
-            `INSERT INTO medicamentos_b2b (institucion_id, paciente_id, nombre, dosis, frecuencia, hora_inicio, hora_fin, horarios_custom, instrucciones, stock)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-            [req.b2bUser.institucion_id, paciente_id, nombre, dosis, frecuencia, hora_inicio||null, hora_fin||null, horarios_custom, instrucciones, stock||null]
+            `INSERT INTO medicamentos_b2b (institucion_id, paciente_id, nombre, dosis, frecuencia, hora_inicio, hora_fin, horarios_custom, instrucciones, stock, catalogo_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+            [req.b2bUser.institucion_id, paciente_id, nombre, dosis, frecuencia, hora_inicio||null, hora_fin||null, horarios_custom, instrucciones, stock||null, catalogo_id||null]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -2827,11 +2853,28 @@ app.post('/api/b2b/medicamentos/:id/toma', authB2BMiddleware, requireB2BRole('ad
         const med = await pool.query('SELECT * FROM medicamentos_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         if (med.rowCount === 0) return res.status(404).json({ error: 'Medicamento no encontrado' });
         const m = med.rows[0];
+        // Register the toma in history
         const result = await pool.query(
             `INSERT INTO historial_medicamentos_b2b (institucion_id, paciente_id, medicamento_id, medicamento_nombre, dosis, administrado_por, administrador_nombre, notas)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
             [req.b2bUser.institucion_id, m.paciente_id, m.id, m.nombre, m.dosis, req.b2bUser.id, req.b2bUser.nombre, req.body.notas||null]
         );
+        // Auto-decrement stock based on institution model
+        const instRow = await pool.query('SELECT stock_modelo FROM instituciones_b2b WHERE id=$1', [req.b2bUser.institucion_id]);
+        const stockModelo = instRow.rows[0]?.stock_modelo || 'familiar';
+        if (stockModelo === 'institucion' && m.catalogo_id) {
+            // Decrement global catalog stock (never below 0)
+            await pool.query(
+                'UPDATE catalogo_medicamentos_b2b SET stock_actual = GREATEST(0, stock_actual - 1), updated_at = NOW() WHERE id=$1 AND institucion_id=$2',
+                [m.catalogo_id, req.b2bUser.institucion_id]
+            );
+        } else if (m.stock !== null && m.stock > 0) {
+            // Decrement per-patient stock (familiar model or non-cataloged)
+            await pool.query(
+                'UPDATE medicamentos_b2b SET stock = GREATEST(0, stock - 1) WHERE id=$1 AND institucion_id=$2',
+                [m.id, req.b2bUser.institucion_id]
+            );
+        }
         res.status(201).json(result.rows[0]);
     } catch (err) {
         console.error('POST /api/b2b/medicamentos/:id/toma:', err.message);
@@ -2842,13 +2885,17 @@ app.post('/api/b2b/medicamentos/:id/toma', authB2BMiddleware, requireB2BRole('ad
 // PATCH /api/b2b/medicamentos/:id
 app.patch('/api/b2b/medicamentos/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
     try {
-        const { nombre, dosis, frecuencia, hora_inicio, hora_fin, horarios_custom, instrucciones, stock, activo } = req.body;
+        const { nombre, dosis, frecuencia, hora_inicio, hora_fin, horarios_custom, instrucciones, stock, activo, catalogo_id } = req.body;
+        // catalogo_id can be explicitly set to null (unlink) or a number (link), hence no COALESCE
+        const hasCatalogoId = Object.prototype.hasOwnProperty.call(req.body, 'catalogo_id');
         await pool.query(
             `UPDATE medicamentos_b2b SET nombre=COALESCE($1,nombre), dosis=COALESCE($2,dosis), frecuencia=COALESCE($3,frecuencia),
              hora_inicio=COALESCE($4,hora_inicio), hora_fin=COALESCE($5,hora_fin), horarios_custom=COALESCE($6,horarios_custom),
-             instrucciones=COALESCE($7,instrucciones), stock=COALESCE($8,stock), activo=COALESCE($9,activo)
-             WHERE id=$10 AND institucion_id=$11`,
-            [nombre, dosis, frecuencia, hora_inicio, hora_fin, horarios_custom, instrucciones, stock, activo, req.params.id, req.b2bUser.institucion_id]
+             instrucciones=COALESCE($7,instrucciones), stock=COALESCE($8,stock), activo=COALESCE($9,activo),
+             catalogo_id = CASE WHEN $10 THEN $11::integer ELSE catalogo_id END
+             WHERE id=$12 AND institucion_id=$13`,
+            [nombre, dosis, frecuencia, hora_inicio, hora_fin, horarios_custom, instrucciones, stock, activo,
+             hasCatalogoId, hasCatalogoId ? catalogo_id : null, req.params.id, req.b2bUser.institucion_id]
         );
         res.json({ success: true });
     } catch (err) {
@@ -2865,6 +2912,85 @@ app.delete('/api/b2b/medicamentos/:id', authB2BMiddleware, requireB2BRole('admin
     } catch (err) {
         console.error('DELETE /api/b2b/medicamentos/:id:', err.message);
         res.status(500).json({ error: 'Error al eliminar medicamento' });
+    }
+});
+
+// ---------- B2B: CATÁLOGO DE MEDICAMENTOS ----------
+
+// GET /api/b2b/catalogo/stock-bajo  (must come BEFORE /:id)
+app.get('/api/b2b/catalogo/stock-bajo', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT * FROM catalogo_medicamentos_b2b WHERE institucion_id=$1 AND activo=TRUE AND stock_actual <= stock_minimo ORDER BY stock_actual ASC',
+            [req.b2bUser.institucion_id]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        console.error('GET /api/b2b/catalogo/stock-bajo:', err.message);
+        res.status(500).json({ error: 'Error' });
+    }
+});
+
+// GET /api/b2b/catalogo
+app.get('/api/b2b/catalogo', authB2BMiddleware, async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT * FROM catalogo_medicamentos_b2b WHERE institucion_id=$1 AND activo=TRUE ORDER BY nombre',
+            [req.b2bUser.institucion_id]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        console.error('GET /api/b2b/catalogo:', err.message);
+        res.status(500).json({ error: 'Error al obtener catálogo' });
+    }
+});
+
+// POST /api/b2b/catalogo
+app.post('/api/b2b/catalogo', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+    try {
+        const { nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo } = req.body;
+        if (!nombre) return res.status(400).json({ error: 'nombre obligatorio' });
+        const result = await pool.query(
+            `INSERT INTO catalogo_medicamentos_b2b (institucion_id, nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo)
+             VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+            [req.b2bUser.institucion_id, nombre, principio_activo||null, presentacion||null, unidad||'comprimido', stock_actual||0, stock_minimo||5]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('POST /api/b2b/catalogo:', err.message);
+        res.status(500).json({ error: 'Error al agregar al catálogo' });
+    }
+});
+
+// PATCH /api/b2b/catalogo/:id
+app.patch('/api/b2b/catalogo/:id', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+    try {
+        const { nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo } = req.body;
+        const result = await pool.query(
+            `UPDATE catalogo_medicamentos_b2b
+             SET nombre=COALESCE($1,nombre), principio_activo=COALESCE($2,principio_activo),
+                 presentacion=COALESCE($3,presentacion), unidad=COALESCE($4,unidad),
+                 stock_actual=COALESCE($5,stock_actual), stock_minimo=COALESCE($6,stock_minimo),
+                 updated_at=NOW()
+             WHERE id=$7 AND institucion_id=$8 RETURNING *`,
+            [nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo, req.params.id, req.b2bUser.institucion_id]
+        );
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Ítem no encontrado' });
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error('PATCH /api/b2b/catalogo/:id:', err.message);
+        res.status(500).json({ error: 'Error al actualizar ítem del catálogo' });
+    }
+});
+
+// DELETE /api/b2b/catalogo/:id
+app.delete('/api/b2b/catalogo/:id', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+    try {
+        await pool.query('UPDATE catalogo_medicamentos_b2b SET activo=FALSE WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('DELETE /api/b2b/catalogo/:id:', err.message);
+        res.status(500).json({ error: 'Error al eliminar ítem del catálogo' });
     }
 });
 
