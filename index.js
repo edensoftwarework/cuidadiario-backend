@@ -3,7 +3,15 @@
  * by EDEN SoftWork
  *
  * ============================================================
- * FUNCIONALIDADES INCLUIDAS:
+ * MÓDULOS:
+ *   [B2C] CuidaDiario — App para cuidadores y familiares individuales
+ *   [B2B] CuidaDiario PRO — App para instituciones (geriátricos, empresas de cuidado)
+ *
+ *   Todos los endpoints B2B están bajo /api/b2b/*
+ *   Todas las tablas B2B tienen sufijo _b2b
+ *   Auth B2B usa el mismo JWT_SECRET pero con campo b2b:true en el payload
+ * ============================================================
+ * FUNCIONALIDADES INCLUIDAS [B2C]:
  *
  * PUSH NOTIFICATIONS (web-push):
  * 1. require('web-push') — librería para enviar notificaciones push
@@ -154,6 +162,7 @@ if (RESEND_API_KEY) {
 // ========== CONFIGURACIÓN ==========
 const ALLOWED_ORIGINS = [
     'https://cuidadiario.edensoftwork.com',
+    'https://pro.cuidadiario.edensoftwork.com',
     'http://localhost:3000',
     'http://localhost:5500',
     'http://127.0.0.1:5500',
@@ -296,6 +305,234 @@ async function runMigrations() {
         await pool.query(`
             CREATE INDEX IF NOT EXISTS idx_notas_usuario ON notas (usuario_id, created_at DESC)
         `).catch(() => {});
+
+        // ============================================================
+        // MIGRACIONES B2B — Tablas completamente separadas del modelo B2C
+        // ============================================================
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS instituciones_b2b (
+                id          SERIAL PRIMARY KEY,
+                nombre      TEXT NOT NULL,
+                tipo        VARCHAR(50) DEFAULT 'geriatrico',
+                direccion   TEXT,
+                telefono    VARCHAR(30),
+                email       TEXT,
+                plan        VARCHAR(20) DEFAULT 'basico',
+                activa      BOOLEAN DEFAULT TRUE,
+                created_at  TIMESTAMP DEFAULT NOW()
+            )
+        `);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS usuarios_b2b (
+                id                  SERIAL PRIMARY KEY,
+                institucion_id      INTEGER REFERENCES instituciones_b2b(id) ON DELETE CASCADE,
+                nombre              TEXT NOT NULL,
+                email               TEXT UNIQUE NOT NULL,
+                password_hash       TEXT NOT NULL,
+                rol                 VARCHAR(30) DEFAULT 'cuidador_staff',
+                activo              BOOLEAN DEFAULT TRUE,
+                reset_token         TEXT,
+                reset_token_expiry  TIMESTAMP,
+                created_at          TIMESTAMP DEFAULT NOW()
+            )
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_usuarios_b2b_email ON usuarios_b2b (email)`).catch(() => {});
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_usuarios_b2b_inst ON usuarios_b2b (institucion_id)`).catch(() => {});
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS pacientes_b2b (
+                id                       SERIAL PRIMARY KEY,
+                institucion_id           INTEGER NOT NULL REFERENCES instituciones_b2b(id) ON DELETE CASCADE,
+                nombre                   TEXT NOT NULL,
+                apellido                 TEXT,
+                fecha_nacimiento         DATE,
+                dni                      VARCHAR(20),
+                habitacion               VARCHAR(20),
+                diagnostico              TEXT,
+                obra_social              TEXT,
+                num_afiliado             TEXT,
+                contacto_familiar_nombre TEXT,
+                contacto_familiar_tel    TEXT,
+                notas_ingreso            TEXT,
+                fecha_ingreso            DATE DEFAULT CURRENT_DATE,
+                foto_url                 TEXT,
+                activo                   BOOLEAN DEFAULT TRUE,
+                created_at               TIMESTAMP DEFAULT NOW()
+            )
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_pacientes_b2b_inst ON pacientes_b2b (institucion_id)`).catch(() => {});
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS asignaciones_b2b (
+                id              SERIAL PRIMARY KEY,
+                institucion_id  INTEGER NOT NULL REFERENCES instituciones_b2b(id) ON DELETE CASCADE,
+                cuidador_id     INTEGER NOT NULL REFERENCES usuarios_b2b(id) ON DELETE CASCADE,
+                paciente_id     INTEGER NOT NULL REFERENCES pacientes_b2b(id) ON DELETE CASCADE,
+                activa          BOOLEAN DEFAULT TRUE,
+                created_at      TIMESTAMP DEFAULT NOW(),
+                UNIQUE(cuidador_id, paciente_id)
+            )
+        `);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS medicamentos_b2b (
+                id              SERIAL PRIMARY KEY,
+                institucion_id  INTEGER NOT NULL REFERENCES instituciones_b2b(id) ON DELETE CASCADE,
+                paciente_id     INTEGER NOT NULL REFERENCES pacientes_b2b(id) ON DELETE CASCADE,
+                nombre          TEXT NOT NULL,
+                dosis           TEXT,
+                frecuencia      VARCHAR(30),
+                hora_inicio     TIME,
+                hora_fin        TIME,
+                horarios_custom TEXT,
+                instrucciones   TEXT,
+                stock           INTEGER,
+                activo          BOOLEAN DEFAULT TRUE,
+                created_at      TIMESTAMP DEFAULT NOW()
+            )
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_meds_b2b_paciente ON medicamentos_b2b (paciente_id)`).catch(() => {});
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS historial_medicamentos_b2b (
+                id                   SERIAL PRIMARY KEY,
+                institucion_id       INTEGER NOT NULL REFERENCES instituciones_b2b(id) ON DELETE CASCADE,
+                paciente_id          INTEGER NOT NULL REFERENCES pacientes_b2b(id) ON DELETE CASCADE,
+                medicamento_id       INTEGER REFERENCES medicamentos_b2b(id) ON DELETE SET NULL,
+                medicamento_nombre   TEXT,
+                dosis                TEXT,
+                administrado_por     INTEGER REFERENCES usuarios_b2b(id) ON DELETE SET NULL,
+                administrador_nombre TEXT,
+                notas                TEXT,
+                fecha                TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_histmed_b2b ON historial_medicamentos_b2b (paciente_id, fecha DESC)`).catch(() => {});
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS citas_b2b (
+                id              SERIAL PRIMARY KEY,
+                institucion_id  INTEGER NOT NULL REFERENCES instituciones_b2b(id) ON DELETE CASCADE,
+                paciente_id     INTEGER NOT NULL REFERENCES pacientes_b2b(id) ON DELETE CASCADE,
+                titulo          TEXT NOT NULL,
+                descripcion     TEXT,
+                fecha           TIMESTAMP NOT NULL,
+                medico          TEXT,
+                especialidad    TEXT,
+                lugar           TEXT,
+                estado          VARCHAR(20) DEFAULT 'pendiente',
+                created_by      INTEGER REFERENCES usuarios_b2b(id) ON DELETE SET NULL,
+                created_at      TIMESTAMP DEFAULT NOW()
+            )
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_citas_b2b_paciente ON citas_b2b (paciente_id, fecha)`).catch(() => {});
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tareas_b2b (
+                id              SERIAL PRIMARY KEY,
+                institucion_id  INTEGER NOT NULL REFERENCES instituciones_b2b(id) ON DELETE CASCADE,
+                paciente_id     INTEGER NOT NULL REFERENCES pacientes_b2b(id) ON DELETE CASCADE,
+                titulo          TEXT NOT NULL,
+                descripcion     TEXT,
+                categoria       VARCHAR(30),
+                frecuencia      VARCHAR(30),
+                hora            TIME,
+                activa          BOOLEAN DEFAULT TRUE,
+                created_by      INTEGER REFERENCES usuarios_b2b(id) ON DELETE SET NULL,
+                created_at      TIMESTAMP DEFAULT NOW()
+            )
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_tareas_b2b_paciente ON tareas_b2b (paciente_id)`).catch(() => {});
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS historial_tareas_b2b (
+                id                 SERIAL PRIMARY KEY,
+                institucion_id     INTEGER NOT NULL REFERENCES instituciones_b2b(id) ON DELETE CASCADE,
+                paciente_id        INTEGER NOT NULL REFERENCES pacientes_b2b(id) ON DELETE CASCADE,
+                tarea_id           INTEGER REFERENCES tareas_b2b(id) ON DELETE SET NULL,
+                tarea_titulo       TEXT,
+                completado_por     INTEGER REFERENCES usuarios_b2b(id) ON DELETE SET NULL,
+                completador_nombre TEXT,
+                notas              TEXT,
+                fecha              TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_histtar_b2b ON historial_tareas_b2b (paciente_id, fecha DESC)`).catch(() => {});
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS sintomas_b2b (
+                id                 SERIAL PRIMARY KEY,
+                institucion_id     INTEGER NOT NULL REFERENCES instituciones_b2b(id) ON DELETE CASCADE,
+                paciente_id        INTEGER NOT NULL REFERENCES pacientes_b2b(id) ON DELETE CASCADE,
+                descripcion        TEXT NOT NULL,
+                intensidad         INTEGER,
+                registrado_por     INTEGER REFERENCES usuarios_b2b(id) ON DELETE SET NULL,
+                registrador_nombre TEXT,
+                fecha              TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_sintomas_b2b_paciente ON sintomas_b2b (paciente_id, fecha DESC)`).catch(() => {});
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS signos_vitales_b2b (
+                id                 SERIAL PRIMARY KEY,
+                institucion_id     INTEGER NOT NULL REFERENCES instituciones_b2b(id) ON DELETE CASCADE,
+                paciente_id        INTEGER NOT NULL REFERENCES pacientes_b2b(id) ON DELETE CASCADE,
+                tipo               VARCHAR(30),
+                valor              TEXT,
+                unidad             TEXT,
+                notas              TEXT,
+                registrado_por     INTEGER REFERENCES usuarios_b2b(id) ON DELETE SET NULL,
+                registrador_nombre TEXT,
+                fecha              TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_signos_b2b_paciente ON signos_vitales_b2b (paciente_id, fecha DESC)`).catch(() => {});
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS contactos_b2b (
+                id              SERIAL PRIMARY KEY,
+                institucion_id  INTEGER NOT NULL REFERENCES instituciones_b2b(id) ON DELETE CASCADE,
+                paciente_id     INTEGER NOT NULL REFERENCES pacientes_b2b(id) ON DELETE CASCADE,
+                nombre          TEXT NOT NULL,
+                relacion        TEXT,
+                telefono        TEXT,
+                email           TEXT,
+                es_principal    BOOLEAN DEFAULT FALSE,
+                created_at      TIMESTAMP DEFAULT NOW()
+            )
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_contactos_b2b_paciente ON contactos_b2b (paciente_id)`).catch(() => {});
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS notas_b2b (
+                id              SERIAL PRIMARY KEY,
+                institucion_id  INTEGER NOT NULL REFERENCES instituciones_b2b(id) ON DELETE CASCADE,
+                paciente_id     INTEGER NOT NULL REFERENCES pacientes_b2b(id) ON DELETE CASCADE,
+                titulo          TEXT,
+                contenido       TEXT,
+                urgente         BOOLEAN DEFAULT FALSE,
+                autor_id        INTEGER REFERENCES usuarios_b2b(id) ON DELETE SET NULL,
+                autor_nombre    TEXT,
+                created_at      TIMESTAMP DEFAULT NOW()
+            )
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_notas_b2b_paciente ON notas_b2b (paciente_id, created_at DESC)`).catch(() => {});
+
+        // MIGRACIONES B2B v2 — Campos clínicos para geriátricos
+        await pool.query(`ALTER TABLE pacientes_b2b ADD COLUMN IF NOT EXISTS alergias TEXT`).catch(() => {});
+        await pool.query(`ALTER TABLE pacientes_b2b ADD COLUMN IF NOT EXISTS medico_cabecera TEXT`).catch(() => {});
+        await pool.query(`ALTER TABLE pacientes_b2b ADD COLUMN IF NOT EXISTS antecedentes TEXT`).catch(() => {});
+        await pool.query(`ALTER TABLE pacientes_b2b ADD COLUMN IF NOT EXISTS fecha_egreso DATE`).catch(() => {});
+        await pool.query(`ALTER TABLE pacientes_b2b ADD COLUMN IF NOT EXISTS motivo_egreso TEXT`).catch(() => {});
+        await pool.query(`ALTER TABLE usuarios_b2b ADD COLUMN IF NOT EXISTS turno VARCHAR(20) DEFAULT 'mañana'`).catch(() => {});
+
+        console.log('✅ Migraciones B2B completadas');
+        // ============================================================
+        // FIN MIGRACIONES B2B
+        // ============================================================
 
         console.log('✅ Migraciones completadas');
     } catch (err) {
@@ -2120,6 +2357,975 @@ app.delete('/api/notas/:id', authMiddleware, async (req, res) => {
         res.status(500).json({ error: 'Error al eliminar nota' });
     }
 });
+
+// ============================================================
+// ========== B2B — MÓDULO INSTITUCIONAL ==========
+// ============================================================
+
+// ---------- B2B: Middleware de autenticación ----------
+function authB2BMiddleware(req, res, next) {
+    const auth = req.headers.authorization;
+    if (!auth) return res.status(401).json({ error: 'Token B2B requerido' });
+    const token = auth.split(' ')[1];
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        if (!decoded.b2b) return res.status(401).json({ error: 'Token no es B2B' });
+        req.b2bUser = decoded;
+        next();
+    } catch (e) {
+        return res.status(401).json({ error: 'Token B2B inválido o expirado' });
+    }
+}
+
+function requireB2BRole(...roles) {
+    return (req, res, next) => {
+        if (!roles.includes(req.b2bUser.rol)) {
+            return res.status(403).json({ error: 'No tenés permisos para esta acción' });
+        }
+        next();
+    };
+}
+
+// Helper: verifica si el usuario B2B puede acceder a un paciente
+async function checkB2BPacienteAccess(b2bUser, paciente_id) {
+    if (b2bUser.rol === 'admin_institucion' || b2bUser.rol === 'medico') {
+        const r = await pool.query('SELECT id FROM pacientes_b2b WHERE id=$1 AND institucion_id=$2 AND activo=TRUE', [paciente_id, b2bUser.institucion_id]);
+        return r.rowCount > 0;
+    }
+    const r = await pool.query('SELECT id FROM asignaciones_b2b WHERE cuidador_id=$1 AND paciente_id=$2 AND activa=TRUE', [b2bUser.id, paciente_id]);
+    return r.rowCount > 0;
+}
+
+// ---------- B2B: AUTH ----------
+
+// POST /api/b2b/auth/register — registrar institución + primer admin
+app.post('/api/b2b/auth/register', async (req, res) => {
+    try {
+        const { nombre_institucion, tipo_institucion, nombre_admin, email, password } = req.body;
+        if (!nombre_institucion || !email || !password || !nombre_admin)
+            return res.status(400).json({ error: 'Faltan datos obligatorios' });
+
+        const exists = await pool.query('SELECT id FROM usuarios_b2b WHERE email=$1', [email.toLowerCase()]);
+        if (exists.rowCount > 0) return res.status(409).json({ error: 'El email ya está registrado' });
+
+        const inst = await pool.query(
+            'INSERT INTO instituciones_b2b (nombre, tipo) VALUES ($1,$2) RETURNING id',
+            [nombre_institucion, tipo_institucion || 'geriatrico']
+        );
+        const institucion_id = inst.rows[0].id;
+
+        const hash = await bcrypt.hash(password, SALT_ROUNDS);
+        const user = await pool.query(
+            `INSERT INTO usuarios_b2b (institucion_id, nombre, email, password_hash, rol)
+             VALUES ($1,$2,$3,$4,'admin_institucion') RETURNING id, nombre, email, rol`,
+            [institucion_id, nombre_admin, email.toLowerCase(), hash]
+        );
+
+        const token = jwt.sign(
+            { id: user.rows[0].id, institucion_id, rol: 'admin_institucion', email: user.rows[0].email, nombre: user.rows[0].nombre, b2b: true },
+            JWT_SECRET, { expiresIn: '30d' }
+        );
+        res.status(201).json({ token, user: user.rows[0], institucion_id });
+    } catch (err) {
+        console.error('POST /api/b2b/auth/register:', err.message);
+        res.status(500).json({ error: 'Error al registrar institución' });
+    }
+});
+
+// POST /api/b2b/auth/login
+app.post('/api/b2b/auth/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        if (!email || !password) return res.status(400).json({ error: 'Email y contraseña requeridos' });
+
+        const result = await pool.query(
+            `SELECT u.*, i.nombre as institucion_nombre, i.plan, i.activa as institucion_activa
+             FROM usuarios_b2b u JOIN instituciones_b2b i ON u.institucion_id = i.id
+             WHERE u.email = $1`,
+            [email.toLowerCase()]
+        );
+        if (result.rowCount === 0) return res.status(401).json({ error: 'Credenciales inválidas' });
+
+        const user = result.rows[0];
+        if (!user.activo) return res.status(401).json({ error: 'Usuario desactivado' });
+        if (!user.institucion_activa) return res.status(401).json({ error: 'Institución desactivada' });
+
+        const valid = await bcrypt.compare(password, user.password_hash);
+        if (!valid) return res.status(401).json({ error: 'Credenciales inválidas' });
+
+        const token = jwt.sign(
+            { id: user.id, institucion_id: user.institucion_id, rol: user.rol, email: user.email, nombre: user.nombre, b2b: true },
+            JWT_SECRET, { expiresIn: '30d' }
+        );
+        res.json({ token, user: { id: user.id, nombre: user.nombre, email: user.email, rol: user.rol, institucion_id: user.institucion_id, institucion_nombre: user.institucion_nombre, plan: user.plan } });
+    } catch (err) {
+        console.error('POST /api/b2b/auth/login:', err.message);
+        res.status(500).json({ error: 'Error al iniciar sesión' });
+    }
+});
+
+// GET /api/b2b/auth/me
+app.get('/api/b2b/auth/me', authB2BMiddleware, async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT u.id, u.nombre, u.email, u.rol, u.created_at,
+                    i.id as institucion_id, i.nombre as institucion_nombre, i.tipo, i.plan, i.direccion, i.telefono
+             FROM usuarios_b2b u JOIN instituciones_b2b i ON u.institucion_id = i.id
+             WHERE u.id = $1`,
+            [req.b2bUser.id]
+        );
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error('GET /api/b2b/auth/me:', err.message);
+        res.status(500).json({ error: 'Error al obtener perfil' });
+    }
+});
+
+// PATCH /api/b2b/auth/me
+app.patch('/api/b2b/auth/me', authB2BMiddleware, async (req, res) => {
+    try {
+        const { nombre, email, password, password_actual, password_nueva } = req.body;
+        if (nombre) await pool.query('UPDATE usuarios_b2b SET nombre=$1 WHERE id=$2', [nombre, req.b2bUser.id]);
+        if (email) {
+            const exists = await pool.query('SELECT id FROM usuarios_b2b WHERE email=$1 AND id!=$2', [email.toLowerCase(), req.b2bUser.id]);
+            if (exists.rowCount > 0) return res.status(409).json({ error: 'El email ya está en uso' });
+            await pool.query('UPDATE usuarios_b2b SET email=$1 WHERE id=$2', [email.toLowerCase(), req.b2bUser.id]);
+        }
+        // Support both: direct password (legacy) and password_actual + password_nueva (secure)
+        if (password_nueva && password_actual) {
+            const userRow = await pool.query('SELECT password_hash FROM usuarios_b2b WHERE id=$1', [req.b2bUser.id]);
+            const valid = await bcrypt.compare(password_actual, userRow.rows[0].password_hash);
+            if (!valid) return res.status(400).json({ error: 'La contraseña actual es incorrecta' });
+            const hash = await bcrypt.hash(password_nueva, SALT_ROUNDS);
+            await pool.query('UPDATE usuarios_b2b SET password_hash=$1 WHERE id=$2', [hash, req.b2bUser.id]);
+        } else if (password) {
+            const hash = await bcrypt.hash(password, SALT_ROUNDS);
+            await pool.query('UPDATE usuarios_b2b SET password_hash=$1 WHERE id=$2', [hash, req.b2bUser.id]);
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error('PATCH /api/b2b/auth/me:', err.message);
+        res.status(500).json({ error: 'Error al actualizar perfil' });
+    }
+});
+
+// POST /api/b2b/auth/forgot-password
+app.post('/api/b2b/auth/forgot-password', async (req, res) => {
+    try {
+        const { email } = req.body;
+        const user = await pool.query('SELECT * FROM usuarios_b2b WHERE email=$1', [email.toLowerCase()]);
+        if (user.rowCount === 0) return res.json({ success: true }); // no revelar si existe
+        const token = require('crypto').randomBytes(32).toString('hex');
+        const expiry = new Date(Date.now() + 60 * 60 * 1000); // 1 hora
+        await pool.query('UPDATE usuarios_b2b SET reset_token=$1, reset_token_expiry=$2 WHERE id=$3', [token, expiry, user.rows[0].id]);
+        const resetUrl = `${process.env.B2B_FRONTEND_URL || process.env.FRONTEND_URL || 'https://pro.cuidadiario.edensoftwork.com'}/reset-password.html?token=${token}&b2b=1`;
+        // Envío de email via Resend (mismo sistema que B2C)
+        if (process.env.RESEND_API_KEY) {
+            await fetch('https://api.resend.com/emails', {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ from: process.env.EMAIL_FROM || 'CuidaDiario PRO <noreply@cuidadiario.com>', to: email, subject: 'Recuperar contraseña — CuidaDiario PRO', html: `<p>Hacé clic para restablecer tu contraseña:</p><a href="${resetUrl}">${resetUrl}</a><p>El link vence en 1 hora.</p>` })
+            });
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error('POST /api/b2b/auth/forgot-password:', err.message);
+        res.status(500).json({ error: 'Error al enviar email' });
+    }
+});
+
+// POST /api/b2b/auth/reset-password
+app.post('/api/b2b/auth/reset-password', async (req, res) => {
+    try {
+        const { token, password } = req.body;
+        const user = await pool.query('SELECT * FROM usuarios_b2b WHERE reset_token=$1 AND reset_token_expiry > NOW()', [token]);
+        if (user.rowCount === 0) return res.status(400).json({ error: 'Token inválido o expirado' });
+        const hash = await bcrypt.hash(password, SALT_ROUNDS);
+        await pool.query('UPDATE usuarios_b2b SET password_hash=$1, reset_token=NULL, reset_token_expiry=NULL WHERE id=$2', [hash, user.rows[0].id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('POST /api/b2b/auth/reset-password:', err.message);
+        res.status(500).json({ error: 'Error al restablecer contraseña' });
+    }
+});
+
+// ---------- B2B: INSTITUCIÓN ----------
+
+// GET /api/b2b/institucion
+app.get('/api/b2b/institucion', authB2BMiddleware, async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM instituciones_b2b WHERE id=$1', [req.b2bUser.institucion_id]);
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Institución no encontrada' });
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error('GET /api/b2b/institucion:', err.message);
+        res.status(500).json({ error: 'Error al obtener institución' });
+    }
+});
+
+// PATCH /api/b2b/institucion
+app.patch('/api/b2b/institucion', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+    try {
+        const { nombre, tipo, direccion, telefono, email } = req.body;
+        await pool.query(
+            `UPDATE instituciones_b2b SET nombre=COALESCE($1,nombre), tipo=COALESCE($2,tipo),
+             direccion=COALESCE($3,direccion), telefono=COALESCE($4,telefono), email=COALESCE($5,email) WHERE id=$6`,
+            [nombre, tipo, direccion, telefono, email, req.b2bUser.institucion_id]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('PATCH /api/b2b/institucion:', err.message);
+        res.status(500).json({ error: 'Error al actualizar institución' });
+    }
+});
+
+// ---------- B2B: STAFF ----------
+
+// GET /api/b2b/staff
+app.get('/api/b2b/staff', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT id, nombre, email, rol, activo, created_at FROM usuarios_b2b WHERE institucion_id=$1 ORDER BY nombre',
+            [req.b2bUser.institucion_id]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        console.error('GET /api/b2b/staff:', err.message);
+        res.status(500).json({ error: 'Error al obtener staff' });
+    }
+});
+
+// POST /api/b2b/staff — crear miembro del staff
+app.post('/api/b2b/staff', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+    try {
+        const { nombre, email, password, rol } = req.body;
+        if (!nombre || !email || !password) return res.status(400).json({ error: 'Faltan datos obligatorios' });
+        const exists = await pool.query('SELECT id FROM usuarios_b2b WHERE email=$1', [email.toLowerCase()]);
+        if (exists.rowCount > 0) return res.status(409).json({ error: 'El email ya está registrado' });
+        const hash = await bcrypt.hash(password, SALT_ROUNDS);
+        const validRoles = ['cuidador_staff', 'familiar', 'medico', 'admin_institucion'];
+        const userRol = validRoles.includes(rol) ? rol : 'cuidador_staff';
+        const result = await pool.query(
+            `INSERT INTO usuarios_b2b (institucion_id, nombre, email, password_hash, rol) VALUES ($1,$2,$3,$4,$5) RETURNING id, nombre, email, rol`,
+            [req.b2bUser.institucion_id, nombre, email.toLowerCase(), hash, userRol]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('POST /api/b2b/staff:', err.message);
+        res.status(500).json({ error: 'Error al crear miembro del staff' });
+    }
+});
+
+// PATCH /api/b2b/staff/:id
+app.patch('/api/b2b/staff/:id', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { nombre, rol, activo, password } = req.body;
+        const check = await pool.query('SELECT id FROM usuarios_b2b WHERE id=$1 AND institucion_id=$2', [id, req.b2bUser.institucion_id]);
+        if (check.rowCount === 0) return res.status(404).json({ error: 'Staff no encontrado' });
+        if (nombre) await pool.query('UPDATE usuarios_b2b SET nombre=$1 WHERE id=$2', [nombre, id]);
+        if (rol) await pool.query('UPDATE usuarios_b2b SET rol=$1 WHERE id=$2', [rol, id]);
+        if (activo !== undefined) await pool.query('UPDATE usuarios_b2b SET activo=$1 WHERE id=$2', [activo, id]);
+        if (password) { const h = await bcrypt.hash(password, SALT_ROUNDS); await pool.query('UPDATE usuarios_b2b SET password_hash=$1 WHERE id=$2', [h, id]); }
+        res.json({ success: true });
+    } catch (err) {
+        console.error('PATCH /api/b2b/staff/:id:', err.message);
+        res.status(500).json({ error: 'Error al actualizar staff' });
+    }
+});
+
+// DELETE /api/b2b/staff/:id — desactivar (no borrar)
+app.delete('/api/b2b/staff/:id', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (parseInt(id) === req.b2bUser.id) return res.status(400).json({ error: 'No podés desactivar tu propio usuario' });
+        const result = await pool.query('UPDATE usuarios_b2b SET activo=FALSE WHERE id=$1 AND institucion_id=$2 RETURNING id', [id, req.b2bUser.institucion_id]);
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Staff no encontrado' });
+        res.json({ success: true });
+    } catch (err) {
+        console.error('DELETE /api/b2b/staff/:id:', err.message);
+        res.status(500).json({ error: 'Error al desactivar staff' });
+    }
+});
+
+// ---------- B2B: PACIENTES ----------
+
+// GET /api/b2b/pacientes
+app.get('/api/b2b/pacientes', authB2BMiddleware, async (req, res) => {
+    try {
+        let query, params;
+        if (req.b2bUser.rol === 'admin_institucion' || req.b2bUser.rol === 'medico') {
+            query = 'SELECT * FROM pacientes_b2b WHERE institucion_id=$1 AND activo=TRUE ORDER BY apellido, nombre';
+            params = [req.b2bUser.institucion_id];
+        } else {
+            query = `SELECT p.* FROM pacientes_b2b p JOIN asignaciones_b2b a ON a.paciente_id = p.id
+                     WHERE a.cuidador_id=$1 AND a.activa=TRUE AND p.activo=TRUE ORDER BY p.apellido, p.nombre`;
+            params = [req.b2bUser.id];
+        }
+        const result = await pool.query(query, params);
+        res.json(result.rows);
+    } catch (err) {
+        console.error('GET /api/b2b/pacientes:', err.message);
+        res.status(500).json({ error: 'Error al obtener pacientes' });
+    }
+});
+
+// POST /api/b2b/pacientes
+app.post('/api/b2b/pacientes', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+    try {
+        const { nombre, apellido, fecha_nacimiento, dni, habitacion, diagnostico, obra_social, num_afiliado, contacto_familiar_nombre, contacto_familiar_tel, notas_ingreso, fecha_ingreso, alergias, medico_cabecera, antecedentes } = req.body;
+        if (!nombre) return res.status(400).json({ error: 'El nombre es obligatorio' });
+        const result = await pool.query(
+            `INSERT INTO pacientes_b2b (institucion_id, nombre, apellido, fecha_nacimiento, dni, habitacion, diagnostico, obra_social, num_afiliado, contacto_familiar_nombre, contacto_familiar_tel, notas_ingreso, fecha_ingreso, alergias, medico_cabecera, antecedentes)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+            [req.b2bUser.institucion_id, nombre, apellido, fecha_nacimiento||null, dni, habitacion, diagnostico, obra_social, num_afiliado, contacto_familiar_nombre, contacto_familiar_tel, notas_ingreso, fecha_ingreso||null, alergias||null, medico_cabecera||null, antecedentes||null]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('POST /api/b2b/pacientes:', err.message);
+        res.status(500).json({ error: 'Error al crear paciente' });
+    }
+});
+
+// PATCH /api/b2b/pacientes/:id
+app.patch('/api/b2b/pacientes/:id', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        const fields = ['nombre','apellido','fecha_nacimiento','dni','habitacion','diagnostico','obra_social','num_afiliado','contacto_familiar_nombre','contacto_familiar_tel','notas_ingreso','fecha_ingreso','foto_url','alergias','medico_cabecera','antecedentes','fecha_egreso','motivo_egreso'];
+        const updates = []; const values = []; let i = 1;
+        for (const f of fields) { if (req.body[f] !== undefined) { updates.push(`${f}=$${i++}`); values.push(req.body[f]); } }
+        if (updates.length === 0) return res.status(400).json({ error: 'Nada que actualizar' });
+        values.push(id, req.b2bUser.institucion_id);
+        await pool.query(`UPDATE pacientes_b2b SET ${updates.join(',')} WHERE id=$${i++} AND institucion_id=$${i}`, values);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('PATCH /api/b2b/pacientes/:id:', err.message);
+        res.status(500).json({ error: 'Error al actualizar paciente' });
+    }
+});
+
+// DELETE /api/b2b/pacientes/:id — soft delete
+app.delete('/api/b2b/pacientes/:id', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query('UPDATE pacientes_b2b SET activo=FALSE WHERE id=$1 AND institucion_id=$2 RETURNING id', [id, req.b2bUser.institucion_id]);
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Paciente no encontrado' });
+        res.json({ success: true });
+    } catch (err) {
+        console.error('DELETE /api/b2b/pacientes/:id:', err.message);
+        res.status(500).json({ error: 'Error al eliminar paciente' });
+    }
+});
+
+// ---------- B2B: ASIGNACIONES ----------
+
+// GET /api/b2b/asignaciones
+app.get('/api/b2b/asignaciones', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT a.*, u.nombre as cuidador_nombre, u.rol as cuidador_rol,
+                    p.nombre as paciente_nombre, p.apellido as paciente_apellido, p.habitacion
+             FROM asignaciones_b2b a JOIN usuarios_b2b u ON a.cuidador_id=u.id JOIN pacientes_b2b p ON a.paciente_id=p.id
+             WHERE a.institucion_id=$1 AND a.activa=TRUE ORDER BY p.apellido, p.nombre`,
+            [req.b2bUser.institucion_id]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        console.error('GET /api/b2b/asignaciones:', err.message);
+        res.status(500).json({ error: 'Error al obtener asignaciones' });
+    }
+});
+
+// POST /api/b2b/asignaciones
+app.post('/api/b2b/asignaciones', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+    try {
+        const { cuidador_id, paciente_id } = req.body;
+        if (!cuidador_id || !paciente_id) return res.status(400).json({ error: 'cuidador_id y paciente_id requeridos' });
+        const [uc, up] = await Promise.all([
+            pool.query('SELECT id FROM usuarios_b2b WHERE id=$1 AND institucion_id=$2', [cuidador_id, req.b2bUser.institucion_id]),
+            pool.query('SELECT id FROM pacientes_b2b WHERE id=$1 AND institucion_id=$2', [paciente_id, req.b2bUser.institucion_id])
+        ]);
+        if (uc.rowCount === 0) return res.status(400).json({ error: 'Cuidador no pertenece a la institución' });
+        if (up.rowCount === 0) return res.status(400).json({ error: 'Paciente no pertenece a la institución' });
+        const result = await pool.query(
+            `INSERT INTO asignaciones_b2b (institucion_id, cuidador_id, paciente_id)
+             VALUES ($1,$2,$3) ON CONFLICT (cuidador_id, paciente_id) DO UPDATE SET activa=TRUE RETURNING *`,
+            [req.b2bUser.institucion_id, cuidador_id, paciente_id]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('POST /api/b2b/asignaciones:', err.message);
+        res.status(500).json({ error: 'Error al crear asignación' });
+    }
+});
+
+// DELETE /api/b2b/asignaciones/:id
+app.delete('/api/b2b/asignaciones/:id', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+    try {
+        await pool.query('UPDATE asignaciones_b2b SET activa=FALSE WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('DELETE /api/b2b/asignaciones/:id:', err.message);
+        res.status(500).json({ error: 'Error al eliminar asignación' });
+    }
+});
+
+// ---------- B2B: MEDICAMENTOS ----------
+
+// GET /api/b2b/medicamentos/historial  (debe ir ANTES de /:id)
+app.get('/api/b2b/medicamentos/historial', authB2BMiddleware, async (req, res) => {
+    try {
+        const { paciente_id } = req.query;
+        let query = 'SELECT * FROM historial_medicamentos_b2b WHERE institucion_id=$1';
+        const params = [req.b2bUser.institucion_id];
+        if (paciente_id) { query += ` AND paciente_id=$2`; params.push(paciente_id); }
+        query += ' ORDER BY fecha DESC LIMIT 100';
+        res.json((await pool.query(query, params)).rows);
+    } catch (err) {
+        console.error('GET /api/b2b/medicamentos/historial:', err.message);
+        res.status(500).json({ error: 'Error al obtener historial' });
+    }
+});
+
+// GET /api/b2b/medicamentos
+app.get('/api/b2b/medicamentos', authB2BMiddleware, async (req, res) => {
+    try {
+        const { paciente_id } = req.query;
+        let query = 'SELECT * FROM medicamentos_b2b WHERE institucion_id=$1 AND activo=TRUE';
+        const params = [req.b2bUser.institucion_id];
+        if (paciente_id) { query += ` AND paciente_id=$2`; params.push(paciente_id); }
+        query += ' ORDER BY nombre';
+        res.json((await pool.query(query, params)).rows);
+    } catch (err) {
+        console.error('GET /api/b2b/medicamentos:', err.message);
+        res.status(500).json({ error: 'Error al obtener medicamentos' });
+    }
+});
+
+// POST /api/b2b/medicamentos
+app.post('/api/b2b/medicamentos', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        const { paciente_id, nombre, dosis, frecuencia, hora_inicio, hora_fin, horarios_custom, instrucciones, stock } = req.body;
+        if (!paciente_id || !nombre) return res.status(400).json({ error: 'paciente_id y nombre obligatorios' });
+        if (!(await checkB2BPacienteAccess(req.b2bUser, paciente_id))) return res.status(403).json({ error: 'Sin acceso a este paciente' });
+        const result = await pool.query(
+            `INSERT INTO medicamentos_b2b (institucion_id, paciente_id, nombre, dosis, frecuencia, hora_inicio, hora_fin, horarios_custom, instrucciones, stock)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+            [req.b2bUser.institucion_id, paciente_id, nombre, dosis, frecuencia, hora_inicio||null, hora_fin||null, horarios_custom, instrucciones, stock||null]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('POST /api/b2b/medicamentos:', err.message);
+        res.status(500).json({ error: 'Error al crear medicamento' });
+    }
+});
+
+// POST /api/b2b/medicamentos/:id/toma
+app.post('/api/b2b/medicamentos/:id/toma', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        const med = await pool.query('SELECT * FROM medicamentos_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
+        if (med.rowCount === 0) return res.status(404).json({ error: 'Medicamento no encontrado' });
+        const m = med.rows[0];
+        const result = await pool.query(
+            `INSERT INTO historial_medicamentos_b2b (institucion_id, paciente_id, medicamento_id, medicamento_nombre, dosis, administrado_por, administrador_nombre, notas)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+            [req.b2bUser.institucion_id, m.paciente_id, m.id, m.nombre, m.dosis, req.b2bUser.id, req.b2bUser.nombre, req.body.notas||null]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('POST /api/b2b/medicamentos/:id/toma:', err.message);
+        res.status(500).json({ error: 'Error al registrar toma' });
+    }
+});
+
+// PATCH /api/b2b/medicamentos/:id
+app.patch('/api/b2b/medicamentos/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        const { nombre, dosis, frecuencia, hora_inicio, hora_fin, horarios_custom, instrucciones, stock, activo } = req.body;
+        await pool.query(
+            `UPDATE medicamentos_b2b SET nombre=COALESCE($1,nombre), dosis=COALESCE($2,dosis), frecuencia=COALESCE($3,frecuencia),
+             hora_inicio=COALESCE($4,hora_inicio), hora_fin=COALESCE($5,hora_fin), horarios_custom=COALESCE($6,horarios_custom),
+             instrucciones=COALESCE($7,instrucciones), stock=COALESCE($8,stock), activo=COALESCE($9,activo)
+             WHERE id=$10 AND institucion_id=$11`,
+            [nombre, dosis, frecuencia, hora_inicio, hora_fin, horarios_custom, instrucciones, stock, activo, req.params.id, req.b2bUser.institucion_id]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('PATCH /api/b2b/medicamentos/:id:', err.message);
+        res.status(500).json({ error: 'Error al actualizar medicamento' });
+    }
+});
+
+// DELETE /api/b2b/medicamentos/:id
+app.delete('/api/b2b/medicamentos/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        await pool.query('UPDATE medicamentos_b2b SET activo=FALSE WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('DELETE /api/b2b/medicamentos/:id:', err.message);
+        res.status(500).json({ error: 'Error al eliminar medicamento' });
+    }
+});
+
+// ---------- B2B: CITAS ----------
+
+// GET /api/b2b/citas
+app.get('/api/b2b/citas', authB2BMiddleware, async (req, res) => {
+    try {
+        const { paciente_id } = req.query;
+        let query = `SELECT c.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
+                     FROM citas_b2b c JOIN pacientes_b2b p ON c.paciente_id=p.id WHERE c.institucion_id=$1`;
+        const params = [req.b2bUser.institucion_id];
+        if (paciente_id) { query += ` AND c.paciente_id=$2`; params.push(paciente_id); }
+        query += ' ORDER BY c.fecha';
+        res.json((await pool.query(query, params)).rows);
+    } catch (err) {
+        console.error('GET /api/b2b/citas:', err.message);
+        res.status(500).json({ error: 'Error al obtener citas' });
+    }
+});
+
+// POST /api/b2b/citas
+app.post('/api/b2b/citas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        const { paciente_id, titulo, descripcion, fecha, medico, especialidad, lugar } = req.body;
+        if (!paciente_id || !titulo || !fecha) return res.status(400).json({ error: 'paciente_id, titulo y fecha obligatorios' });
+        const result = await pool.query(
+            `INSERT INTO citas_b2b (institucion_id, paciente_id, titulo, descripcion, fecha, medico, especialidad, lugar, created_by)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+            [req.b2bUser.institucion_id, paciente_id, titulo, descripcion, fecha, medico, especialidad, lugar, req.b2bUser.id]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('POST /api/b2b/citas:', err.message);
+        res.status(500).json({ error: 'Error al crear cita' });
+    }
+});
+
+// PATCH /api/b2b/citas/:id
+app.patch('/api/b2b/citas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        const { titulo, descripcion, fecha, medico, especialidad, lugar, estado } = req.body;
+        await pool.query(
+            `UPDATE citas_b2b SET titulo=COALESCE($1,titulo), descripcion=COALESCE($2,descripcion), fecha=COALESCE($3,fecha),
+             medico=COALESCE($4,medico), especialidad=COALESCE($5,especialidad), lugar=COALESCE($6,lugar), estado=COALESCE($7,estado)
+             WHERE id=$8 AND institucion_id=$9`,
+            [titulo, descripcion, fecha, medico, especialidad, lugar, estado, req.params.id, req.b2bUser.institucion_id]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('PATCH /api/b2b/citas/:id:', err.message);
+        res.status(500).json({ error: 'Error al actualizar cita' });
+    }
+});
+
+// DELETE /api/b2b/citas/:id
+app.delete('/api/b2b/citas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        await pool.query('DELETE FROM citas_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('DELETE /api/b2b/citas/:id:', err.message);
+        res.status(500).json({ error: 'Error al eliminar cita' });
+    }
+});
+
+// ---------- B2B: TAREAS ----------
+
+// GET /api/b2b/tareas/historial (debe ir ANTES de /:id)
+app.get('/api/b2b/tareas/historial', authB2BMiddleware, async (req, res) => {
+    try {
+        const { paciente_id } = req.query;
+        let query = 'SELECT * FROM historial_tareas_b2b WHERE institucion_id=$1';
+        const params = [req.b2bUser.institucion_id];
+        if (paciente_id) { query += ` AND paciente_id=$2`; params.push(paciente_id); }
+        query += ' ORDER BY fecha DESC LIMIT 100';
+        res.json((await pool.query(query, params)).rows);
+    } catch (err) {
+        console.error('GET /api/b2b/tareas/historial:', err.message);
+        res.status(500).json({ error: 'Error al obtener historial de tareas' });
+    }
+});
+
+// GET /api/b2b/tareas
+app.get('/api/b2b/tareas', authB2BMiddleware, async (req, res) => {
+    try {
+        const { paciente_id } = req.query;
+        let query = `SELECT t.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
+                     FROM tareas_b2b t JOIN pacientes_b2b p ON t.paciente_id=p.id
+                     WHERE t.institucion_id=$1 AND t.activa=TRUE`;
+        const params = [req.b2bUser.institucion_id];
+        if (paciente_id) { query += ` AND t.paciente_id=$2`; params.push(paciente_id); }
+        query += ' ORDER BY t.hora NULLS LAST, t.titulo';
+        res.json((await pool.query(query, params)).rows);
+    } catch (err) {
+        console.error('GET /api/b2b/tareas:', err.message);
+        res.status(500).json({ error: 'Error al obtener tareas' });
+    }
+});
+
+// POST /api/b2b/tareas
+app.post('/api/b2b/tareas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        const { paciente_id, titulo, descripcion, categoria, frecuencia, hora } = req.body;
+        if (!paciente_id || !titulo) return res.status(400).json({ error: 'paciente_id y titulo obligatorios' });
+        const result = await pool.query(
+            `INSERT INTO tareas_b2b (institucion_id, paciente_id, titulo, descripcion, categoria, frecuencia, hora, created_by)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+            [req.b2bUser.institucion_id, paciente_id, titulo, descripcion, categoria, frecuencia, hora||null, req.b2bUser.id]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('POST /api/b2b/tareas:', err.message);
+        res.status(500).json({ error: 'Error al crear tarea' });
+    }
+});
+
+// POST /api/b2b/tareas/:id/completar
+app.post('/api/b2b/tareas/:id/completar', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        const tarea = await pool.query('SELECT * FROM tareas_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
+        if (tarea.rowCount === 0) return res.status(404).json({ error: 'Tarea no encontrada' });
+        const t = tarea.rows[0];
+        const result = await pool.query(
+            `INSERT INTO historial_tareas_b2b (institucion_id, paciente_id, tarea_id, tarea_titulo, completado_por, completador_nombre, notas)
+             VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+            [req.b2bUser.institucion_id, t.paciente_id, t.id, t.titulo, req.b2bUser.id, req.b2bUser.nombre, req.body.notas||null]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('POST /api/b2b/tareas/:id/completar:', err.message);
+        res.status(500).json({ error: 'Error al completar tarea' });
+    }
+});
+
+// PATCH /api/b2b/tareas/:id
+app.patch('/api/b2b/tareas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        const { titulo, descripcion, categoria, frecuencia, hora, activa } = req.body;
+        await pool.query(
+            `UPDATE tareas_b2b SET titulo=COALESCE($1,titulo), descripcion=COALESCE($2,descripcion),
+             categoria=COALESCE($3,categoria), frecuencia=COALESCE($4,frecuencia), hora=COALESCE($5,hora), activa=COALESCE($6,activa)
+             WHERE id=$7 AND institucion_id=$8`,
+            [titulo, descripcion, categoria, frecuencia, hora, activa, req.params.id, req.b2bUser.institucion_id]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('PATCH /api/b2b/tareas/:id:', err.message);
+        res.status(500).json({ error: 'Error al actualizar tarea' });
+    }
+});
+
+// DELETE /api/b2b/tareas/:id
+app.delete('/api/b2b/tareas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        await pool.query('UPDATE tareas_b2b SET activa=FALSE WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('DELETE /api/b2b/tareas/:id:', err.message);
+        res.status(500).json({ error: 'Error al eliminar tarea' });
+    }
+});
+
+// ---------- B2B: SÍNTOMAS ----------
+
+// GET /api/b2b/sintomas
+app.get('/api/b2b/sintomas', authB2BMiddleware, async (req, res) => {
+    try {
+        const { paciente_id } = req.query;
+        let query = `SELECT s.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
+                     FROM sintomas_b2b s JOIN pacientes_b2b p ON s.paciente_id=p.id WHERE s.institucion_id=$1`;
+        const params = [req.b2bUser.institucion_id];
+        if (paciente_id) { query += ` AND s.paciente_id=$2`; params.push(paciente_id); }
+        query += ' ORDER BY s.fecha DESC LIMIT 100';
+        res.json((await pool.query(query, params)).rows);
+    } catch (err) {
+        console.error('GET /api/b2b/sintomas:', err.message);
+        res.status(500).json({ error: 'Error al obtener síntomas' });
+    }
+});
+
+// POST /api/b2b/sintomas
+app.post('/api/b2b/sintomas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        const { paciente_id, descripcion, intensidad } = req.body;
+        if (!paciente_id || !descripcion) return res.status(400).json({ error: 'paciente_id y descripcion obligatorios' });
+        const result = await pool.query(
+            `INSERT INTO sintomas_b2b (institucion_id, paciente_id, descripcion, intensidad, registrado_por, registrador_nombre)
+             VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+            [req.b2bUser.institucion_id, paciente_id, descripcion, intensidad||null, req.b2bUser.id, req.b2bUser.nombre]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('POST /api/b2b/sintomas:', err.message);
+        res.status(500).json({ error: 'Error al crear síntoma' });
+    }
+});
+
+// DELETE /api/b2b/sintomas/:id
+app.delete('/api/b2b/sintomas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        await pool.query('DELETE FROM sintomas_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('DELETE /api/b2b/sintomas/:id:', err.message);
+        res.status(500).json({ error: 'Error al eliminar síntoma' });
+    }
+});
+
+// ---------- B2B: SIGNOS VITALES ----------
+
+// GET /api/b2b/signos-vitales
+app.get('/api/b2b/signos-vitales', authB2BMiddleware, async (req, res) => {
+    try {
+        const { paciente_id, tipo } = req.query;
+        let query = `SELECT sv.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
+                     FROM signos_vitales_b2b sv JOIN pacientes_b2b p ON sv.paciente_id=p.id WHERE sv.institucion_id=$1`;
+        const params = [req.b2bUser.institucion_id];
+        if (paciente_id) { query += ` AND sv.paciente_id=$${params.length+1}`; params.push(paciente_id); }
+        if (tipo) { query += ` AND sv.tipo=$${params.length+1}`; params.push(tipo); }
+        query += ' ORDER BY sv.fecha DESC LIMIT 100';
+        res.json((await pool.query(query, params)).rows);
+    } catch (err) {
+        console.error('GET /api/b2b/signos-vitales:', err.message);
+        res.status(500).json({ error: 'Error al obtener signos vitales' });
+    }
+});
+
+// POST /api/b2b/signos-vitales
+app.post('/api/b2b/signos-vitales', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        const { paciente_id, tipo, valor, unidad, notas } = req.body;
+        if (!paciente_id || !tipo || !valor) return res.status(400).json({ error: 'paciente_id, tipo y valor obligatorios' });
+        const result = await pool.query(
+            `INSERT INTO signos_vitales_b2b (institucion_id, paciente_id, tipo, valor, unidad, notas, registrado_por, registrador_nombre)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+            [req.b2bUser.institucion_id, paciente_id, tipo, valor, unidad, notas, req.b2bUser.id, req.b2bUser.nombre]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('POST /api/b2b/signos-vitales:', err.message);
+        res.status(500).json({ error: 'Error al crear signo vital' });
+    }
+});
+
+// DELETE /api/b2b/signos-vitales/:id
+app.delete('/api/b2b/signos-vitales/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        await pool.query('DELETE FROM signos_vitales_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('DELETE /api/b2b/signos-vitales/:id:', err.message);
+        res.status(500).json({ error: 'Error al eliminar signo vital' });
+    }
+});
+
+// ---------- B2B: CONTACTOS DE EMERGENCIA ----------
+
+// GET /api/b2b/contactos
+app.get('/api/b2b/contactos', authB2BMiddleware, async (req, res) => {
+    try {
+        const { paciente_id } = req.query;
+        let query = 'SELECT * FROM contactos_b2b WHERE institucion_id=$1';
+        const params = [req.b2bUser.institucion_id];
+        if (paciente_id) { query += ` AND paciente_id=$2`; params.push(paciente_id); }
+        query += ' ORDER BY es_principal DESC, nombre';
+        res.json((await pool.query(query, params)).rows);
+    } catch (err) {
+        console.error('GET /api/b2b/contactos:', err.message);
+        res.status(500).json({ error: 'Error al obtener contactos' });
+    }
+});
+
+// POST /api/b2b/contactos
+app.post('/api/b2b/contactos', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        const { paciente_id, nombre, relacion, telefono, email, es_principal } = req.body;
+        if (!paciente_id || !nombre) return res.status(400).json({ error: 'paciente_id y nombre obligatorios' });
+        const result = await pool.query(
+            `INSERT INTO contactos_b2b (institucion_id, paciente_id, nombre, relacion, telefono, email, es_principal)
+             VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+            [req.b2bUser.institucion_id, paciente_id, nombre, relacion, telefono, email, es_principal||false]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('POST /api/b2b/contactos:', err.message);
+        res.status(500).json({ error: 'Error al crear contacto' });
+    }
+});
+
+// PATCH /api/b2b/contactos/:id
+app.patch('/api/b2b/contactos/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        const { nombre, relacion, telefono, email, es_principal } = req.body;
+        await pool.query(
+            `UPDATE contactos_b2b SET nombre=COALESCE($1,nombre), relacion=COALESCE($2,relacion),
+             telefono=COALESCE($3,telefono), email=COALESCE($4,email), es_principal=COALESCE($5,es_principal)
+             WHERE id=$6 AND institucion_id=$7`,
+            [nombre, relacion, telefono, email, es_principal, req.params.id, req.b2bUser.institucion_id]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('PATCH /api/b2b/contactos/:id:', err.message);
+        res.status(500).json({ error: 'Error al actualizar contacto' });
+    }
+});
+
+// DELETE /api/b2b/contactos/:id
+app.delete('/api/b2b/contactos/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        await pool.query('DELETE FROM contactos_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('DELETE /api/b2b/contactos/:id:', err.message);
+        res.status(500).json({ error: 'Error al eliminar contacto' });
+    }
+});
+
+// ---------- B2B: NOTAS INTERNAS ----------
+
+// GET /api/b2b/notas
+app.get('/api/b2b/notas', authB2BMiddleware, async (req, res) => {
+    try {
+        const { paciente_id } = req.query;
+        let query = `SELECT n.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
+                     FROM notas_b2b n JOIN pacientes_b2b p ON n.paciente_id=p.id WHERE n.institucion_id=$1`;
+        const params = [req.b2bUser.institucion_id];
+        if (paciente_id) { query += ` AND n.paciente_id=$2`; params.push(paciente_id); }
+        query += ' ORDER BY n.urgente DESC, n.created_at DESC';
+        res.json((await pool.query(query, params)).rows);
+    } catch (err) {
+        console.error('GET /api/b2b/notas:', err.message);
+        res.status(500).json({ error: 'Error al obtener notas' });
+    }
+});
+
+// POST /api/b2b/notas
+app.post('/api/b2b/notas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        const { paciente_id, titulo, contenido, urgente } = req.body;
+        if (!paciente_id) return res.status(400).json({ error: 'paciente_id obligatorio' });
+        const result = await pool.query(
+            `INSERT INTO notas_b2b (institucion_id, paciente_id, titulo, contenido, urgente, autor_id, autor_nombre)
+             VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+            [req.b2bUser.institucion_id, paciente_id, titulo, contenido, urgente||false, req.b2bUser.id, req.b2bUser.nombre]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('POST /api/b2b/notas:', err.message);
+        res.status(500).json({ error: 'Error al crear nota' });
+    }
+});
+
+// PATCH /api/b2b/notas/:id
+app.patch('/api/b2b/notas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        const { titulo, contenido, urgente } = req.body;
+        await pool.query(
+            `UPDATE notas_b2b SET titulo=COALESCE($1,titulo), contenido=COALESCE($2,contenido), urgente=COALESCE($3,urgente)
+             WHERE id=$4 AND institucion_id=$5`,
+            [titulo, contenido, urgente, req.params.id, req.b2bUser.institucion_id]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        console.error('PATCH /api/b2b/notas/:id:', err.message);
+        res.status(500).json({ error: 'Error al actualizar nota' });
+    }
+});
+
+// DELETE /api/b2b/notas/:id
+app.delete('/api/b2b/notas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+    try {
+        await pool.query('DELETE FROM notas_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('DELETE /api/b2b/notas/:id:', err.message);
+        res.status(500).json({ error: 'Error al eliminar nota' });
+    }
+});
+
+// ---------- B2B: DASHBOARD ----------
+
+// GET /api/b2b/dashboard
+app.get('/api/b2b/dashboard', authB2BMiddleware, async (req, res) => {
+    try {
+        const iid = req.b2bUser.institucion_id;
+        const [pacientes, staff, citasProximas, sintomasRecientes, notasUrgentes, tomasHoy, tareasHoy, cumpleanosHoy, stockBajo] = await Promise.all([
+            pool.query('SELECT COUNT(*) as total FROM pacientes_b2b WHERE institucion_id=$1 AND activo=TRUE', [iid]),
+            pool.query('SELECT COUNT(*) as total, rol FROM usuarios_b2b WHERE institucion_id=$1 AND activo=TRUE GROUP BY rol', [iid]),
+            pool.query(`SELECT c.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
+                        FROM citas_b2b c JOIN pacientes_b2b p ON c.paciente_id=p.id
+                        WHERE c.institucion_id=$1 AND c.fecha BETWEEN NOW() AND NOW()+INTERVAL '7 days' AND c.estado='pendiente'
+                        ORDER BY c.fecha LIMIT 10`, [iid]),
+            pool.query(`SELECT s.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
+                        FROM sintomas_b2b s JOIN pacientes_b2b p ON s.paciente_id=p.id
+                        WHERE s.institucion_id=$1 AND s.fecha > NOW()-INTERVAL '24 hours' ORDER BY s.fecha DESC LIMIT 10`, [iid]),
+            pool.query(`SELECT n.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
+                        FROM notas_b2b n JOIN pacientes_b2b p ON n.paciente_id=p.id
+                        WHERE n.institucion_id=$1 AND n.urgente=TRUE ORDER BY n.created_at DESC LIMIT 10`, [iid]),
+            pool.query('SELECT COUNT(*) as total FROM historial_medicamentos_b2b WHERE institucion_id=$1 AND fecha>CURRENT_DATE', [iid]),
+            pool.query('SELECT COUNT(*) as total FROM historial_tareas_b2b WHERE institucion_id=$1 AND fecha>CURRENT_DATE', [iid]),
+            pool.query(`SELECT id, nombre, apellido, fecha_nacimiento,
+                        EXTRACT(YEAR FROM AGE(fecha_nacimiento)) AS edad
+                        FROM pacientes_b2b
+                        WHERE institucion_id=$1 AND activo=TRUE
+                        AND TO_CHAR(fecha_nacimiento,'MM-DD') = TO_CHAR(NOW(),'MM-DD')`, [iid]),
+            pool.query(`SELECT id, nombre, dosis_horario, stock
+                        FROM medicamentos_b2b
+                        WHERE institucion_id=$1 AND activo=TRUE AND stock IS NOT NULL AND stock < 5
+                        ORDER BY stock ASC LIMIT 10`, [iid])
+        ]);
+        res.json({
+            resumen: { pacientes_activos: parseInt(pacientes.rows[0].total), tomas_hoy: parseInt(tomasHoy.rows[0].total), tareas_completadas_hoy: parseInt(tareasHoy.rows[0].total), staff: staff.rows },
+            citas_proximas: citasProximas.rows,
+            sintomas_recientes: sintomasRecientes.rows,
+            notas_urgentes: notasUrgentes.rows,
+            cumpleanos_hoy: cumpleanosHoy.rows,
+            stock_bajo: stockBajo.rows
+        });
+    } catch (err) {
+        console.error('GET /api/b2b/dashboard:', err.message);
+        res.status(500).json({ error: 'Error al obtener dashboard' });
+    }
+});
+
+// GET /api/b2b/reportes?paciente_id=&desde=&hasta=
+app.get('/api/b2b/reportes', authB2BMiddleware, async (req, res) => {
+    try {
+        const { paciente_id, desde, hasta } = req.query;
+        if (!paciente_id) return res.status(400).json({ error: 'paciente_id requerido' });
+        const iid = req.b2bUser.institucion_id;
+        const d = desde || new Date(Date.now() - 30*24*60*60*1000).toISOString();
+        const h = hasta || new Date().toISOString();
+        const [paciente, medicamentos, histMeds, citas, histTareas, sintomas, signos, contactos, notas] = await Promise.all([
+            pool.query('SELECT * FROM pacientes_b2b WHERE id=$1 AND institucion_id=$2', [paciente_id, iid]),
+            pool.query('SELECT * FROM medicamentos_b2b WHERE paciente_id=$1 AND activo=TRUE', [paciente_id]),
+            pool.query('SELECT * FROM historial_medicamentos_b2b WHERE paciente_id=$1 AND fecha BETWEEN $2 AND $3 ORDER BY fecha DESC', [paciente_id, d, h]),
+            pool.query('SELECT * FROM citas_b2b WHERE paciente_id=$1 AND fecha BETWEEN $2 AND $3 ORDER BY fecha', [paciente_id, d, h]),
+            pool.query('SELECT * FROM historial_tareas_b2b WHERE paciente_id=$1 AND fecha BETWEEN $2 AND $3 ORDER BY fecha DESC', [paciente_id, d, h]),
+            pool.query('SELECT * FROM sintomas_b2b WHERE paciente_id=$1 AND fecha BETWEEN $2 AND $3 ORDER BY fecha DESC', [paciente_id, d, h]),
+            pool.query('SELECT * FROM signos_vitales_b2b WHERE paciente_id=$1 AND fecha BETWEEN $2 AND $3 ORDER BY fecha DESC', [paciente_id, d, h]),
+            pool.query('SELECT * FROM contactos_b2b WHERE paciente_id=$1 ORDER BY es_principal DESC', [paciente_id]),
+            pool.query('SELECT * FROM notas_b2b WHERE paciente_id=$1 AND created_at BETWEEN $2 AND $3 ORDER BY created_at DESC', [paciente_id, d, h])
+        ]);
+        if (paciente.rowCount === 0) return res.status(404).json({ error: 'Paciente no encontrado' });
+        res.json({
+            paciente: paciente.rows[0], periodo: { desde: d, hasta: h },
+            medicamentos: medicamentos.rows, historial_medicamentos: histMeds.rows,
+            citas: citas.rows, historial_tareas: histTareas.rows,
+            sintomas: sintomas.rows, signos_vitales: signos.rows,
+            contactos: contactos.rows, notas: notas.rows
+        });
+    } catch (err) {
+        console.error('GET /api/b2b/reportes:', err.message);
+        res.status(500).json({ error: 'Error al generar reporte' });
+    }
+});
+
+// ============================================================
+// ========== FIN MÓDULO B2B ==========
+// ============================================================
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
