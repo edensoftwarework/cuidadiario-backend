@@ -3271,7 +3271,9 @@ app.get('/api/b2b/dashboard', authB2BMiddleware, async (req, res) => {
                         FROM pacientes_b2b
                         WHERE institucion_id=$1 AND activo=TRUE
                         AND TO_CHAR(fecha_nacimiento,'MM-DD') = TO_CHAR(NOW(),'MM-DD')`, [iid]),
-            pool.query(`SELECT id, nombre, dosis_horario, stock
+            pool.query(`SELECT id, nombre,
+                        TRIM(COALESCE(dosis,'') || CASE WHEN frecuencia IS NOT NULL AND frecuencia <> '' THEN ' · ' || frecuencia ELSE '' END) AS dosis_horario,
+                        stock
                         FROM medicamentos_b2b
                         WHERE institucion_id=$1 AND activo=TRUE AND stock IS NOT NULL AND stock < 5
                         ORDER BY stock ASC LIMIT 10`, [iid])
