@@ -2519,7 +2519,7 @@ app.post('/api/b2b/auth/forgot-password', async (req, res) => {
         const token = require('crypto').randomBytes(32).toString('hex');
         const expiry = new Date(Date.now() + 60 * 60 * 1000); // 1 hora
         await pool.query('UPDATE usuarios_b2b SET reset_token=$1, reset_token_expiry=$2 WHERE id=$3', [token, expiry, user.rows[0].id]);
-        const resetUrl = `${process.env.B2B_FRONTEND_URL || process.env.FRONTEND_URL || 'https://cuidadiario-pro.edensoftwork.com'}/reset-password.html?token=${token}&b2b=1`;
+        const resetUrl = `https://cuidadiario-pro.edensoftwork.com/reset-password.html?token=${token}&b2b=1`;
         // Envío de email via Resend (mismo sistema que B2C)
         if (process.env.RESEND_API_KEY) {
             await fetch('https://api.resend.com/emails', {
