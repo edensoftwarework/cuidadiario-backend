@@ -569,6 +569,10 @@ async function runMigrations() {
         `).catch(() => {});
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_documentos_b2b_paciente ON documentos_b2b (paciente_id, institucion_id)`).catch(() => {});
         console.log('✅ Migraciones B2B v4 completadas');
+
+        // MIGRACIONES B2B v5 — Onboarding de institución
+        await pool.query(`ALTER TABLE instituciones_b2b ADD COLUMN IF NOT EXISTS onboarding_done BOOLEAN DEFAULT FALSE`).catch(() => {});
+        console.log('✅ Migraciones B2B v5 completadas');
         // ============================================================
         // FIN MIGRACIONES B2B
         // ============================================================
@@ -2497,7 +2501,7 @@ app.post('/api/b2b/auth/login', async (req, res) => {
         if (!email || !password) return res.status(400).json({ error: 'Email y contraseña requeridos' });
 
         const result = await pool.query(
-            `SELECT u.*, i.nombre as institucion_nombre, i.plan, i.activa as institucion_activa, i.permisos_equipo
+            `SELECT u.*, i.nombre as institucion_nombre, i.plan, i.activa as institucion_activa, i.permisos_equipo, i.onboarding_done
              FROM usuarios_b2b u JOIN instituciones_b2b i ON u.institucion_id = i.id
              WHERE u.email = $1`,
             [email.toLowerCase()]
@@ -2515,7 +2519,7 @@ app.post('/api/b2b/auth/login', async (req, res) => {
             { id: user.id, institucion_id: user.institucion_id, rol: user.rol, email: user.email, nombre: user.nombre, b2b: true },
             JWT_SECRET, { expiresIn: '30d' }
         );
-        res.json({ token, user: { id: user.id, nombre: user.nombre, email: user.email, rol: user.rol, institucion_id: user.institucion_id, institucion_nombre: user.institucion_nombre, plan: user.plan, institucion_permisos: user.permisos_equipo || {} } });
+        res.json({ token, user: { id: user.id, nombre: user.nombre, email: user.email, rol: user.rol, institucion_id: user.institucion_id, institucion_nombre: user.institucion_nombre, plan: user.plan, institucion_permisos: user.permisos_equipo || {}, onboarding_done: !!user.onboarding_done } });
     } catch (err) {
         console.error('POST /api/b2b/auth/login:', err.message);
         res.status(500).json({ error: 'Error al iniciar sesión' });
@@ -2625,14 +2629,17 @@ app.get('/api/b2b/institucion', authB2BMiddleware, async (req, res) => {
 // PATCH /api/b2b/institucion
 app.patch('/api/b2b/institucion', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
     try {
-        const { nombre, tipo, direccion, telefono, email, stock_modelo, permisos_equipo } = req.body;
+        const { nombre, tipo, direccion, telefono, email, stock_modelo, permisos_equipo, onboarding_done } = req.body;
         await pool.query(
             `UPDATE instituciones_b2b SET nombre=COALESCE($1,nombre), tipo=COALESCE($2,tipo),
              direccion=COALESCE($3,direccion), telefono=COALESCE($4,telefono), email=COALESCE($5,email),
              stock_modelo=COALESCE($6,stock_modelo),
-             permisos_equipo=COALESCE($7::jsonb,permisos_equipo) WHERE id=$8`,
+             permisos_equipo=COALESCE($7::jsonb,permisos_equipo),
+             onboarding_done=COALESCE($9,onboarding_done) WHERE id=$8`,
             [nombre, tipo, direccion, telefono, email, stock_modelo,
-             permisos_equipo ? JSON.stringify(permisos_equipo) : null, req.b2bUser.institucion_id]
+             permisos_equipo ? JSON.stringify(permisos_equipo) : null,
+             req.b2bUser.institucion_id,
+             onboarding_done !== undefined ? onboarding_done : null]
         );
         res.json({ success: true });
     } catch (err) {
