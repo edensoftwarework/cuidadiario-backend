@@ -2928,10 +2928,11 @@ app.post('/api/b2b/medicamentos/:id/toma', authB2BMiddleware, requireB2BRole('ad
         if (med.rowCount === 0) return res.status(404).json({ error: 'Medicamento no encontrado' });
         const m = med.rows[0];
         // Register the toma in history
+        const _adminNombre = (req.body._quien && typeof req.body._quien === 'string' && req.body._quien.trim()) ? req.body._quien.trim() : req.b2bUser.nombre;
         const result = await pool.query(
             `INSERT INTO historial_medicamentos_b2b (institucion_id, paciente_id, medicamento_id, medicamento_nombre, dosis, administrado_por, administrador_nombre, notas)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-            [req.b2bUser.institucion_id, m.paciente_id, m.id, m.nombre, m.dosis, req.b2bUser.id, req.b2bUser.nombre, req.body.notas||null]
+            [req.b2bUser.institucion_id, m.paciente_id, m.id, m.nombre, m.dosis, req.b2bUser.id, _adminNombre, req.body.notas||null]
         );
         // Auto-decrement stock based on institution model
         const instRow = await pool.query('SELECT stock_modelo FROM instituciones_b2b WHERE id=$1', [req.b2bUser.institucion_id]);
@@ -3188,10 +3189,11 @@ app.post('/api/b2b/tareas/:id/completar', authB2BMiddleware, requireB2BRole('adm
         const tarea = await pool.query('SELECT * FROM tareas_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         if (tarea.rowCount === 0) return res.status(404).json({ error: 'Tarea no encontrada' });
         const t = tarea.rows[0];
+        const _compNombre = (req.body._quien && typeof req.body._quien === 'string' && req.body._quien.trim()) ? req.body._quien.trim() : req.b2bUser.nombre;
         const result = await pool.query(
             `INSERT INTO historial_tareas_b2b (institucion_id, paciente_id, tarea_id, tarea_titulo, completado_por, completador_nombre, notas)
              VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-            [req.b2bUser.institucion_id, t.paciente_id, t.id, t.titulo, req.b2bUser.id, req.b2bUser.nombre, req.body.notas||null]
+            [req.b2bUser.institucion_id, t.paciente_id, t.id, t.titulo, req.b2bUser.id, _compNombre, req.body.notas||null]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -3251,10 +3253,11 @@ app.post('/api/b2b/sintomas', authB2BMiddleware, requireB2BRole('admin_instituci
     try {
         const { paciente_id, descripcion, intensidad } = req.body;
         if (!paciente_id || !descripcion) return res.status(400).json({ error: 'paciente_id y descripcion obligatorios' });
+        const _regNombreSint = (req.body._quien && typeof req.body._quien === 'string' && req.body._quien.trim()) ? req.body._quien.trim() : req.b2bUser.nombre;
         const result = await pool.query(
             `INSERT INTO sintomas_b2b (institucion_id, paciente_id, descripcion, intensidad, registrado_por, registrador_nombre)
              VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-            [req.b2bUser.institucion_id, paciente_id, descripcion, intensidad||null, req.b2bUser.id, req.b2bUser.nombre]
+            [req.b2bUser.institucion_id, paciente_id, descripcion, intensidad||null, req.b2bUser.id, _regNombreSint]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -3315,10 +3318,11 @@ app.post('/api/b2b/signos-vitales', authB2BMiddleware, requireB2BRole('admin_ins
     try {
         const { paciente_id, tipo, valor, unidad, notas } = req.body;
         if (!paciente_id || !tipo || !valor) return res.status(400).json({ error: 'paciente_id, tipo y valor obligatorios' });
+        const _regNombreSigno = (req.body._quien && typeof req.body._quien === 'string' && req.body._quien.trim()) ? req.body._quien.trim() : req.b2bUser.nombre;
         const result = await pool.query(
             `INSERT INTO signos_vitales_b2b (institucion_id, paciente_id, tipo, valor, unidad, notas, registrado_por, registrador_nombre)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-            [req.b2bUser.institucion_id, paciente_id, tipo, valor, unidad, notas, req.b2bUser.id, req.b2bUser.nombre]
+            [req.b2bUser.institucion_id, paciente_id, tipo, valor, unidad, notas, req.b2bUser.id, _regNombreSigno]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -3423,10 +3427,11 @@ app.post('/api/b2b/notas', authB2BMiddleware, requireB2BRole('admin_institucion'
     try {
         const { paciente_id, titulo, contenido, urgente } = req.body;
         if (!paciente_id) return res.status(400).json({ error: 'paciente_id obligatorio' });
+        const _autorNombre = (req.body._quien && typeof req.body._quien === 'string' && req.body._quien.trim()) ? req.body._quien.trim() : req.b2bUser.nombre;
         const result = await pool.query(
             `INSERT INTO notas_b2b (institucion_id, paciente_id, titulo, contenido, urgente, autor_id, autor_nombre)
              VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-            [req.b2bUser.institucion_id, paciente_id, titulo, contenido, urgente||false, req.b2bUser.id, req.b2bUser.nombre]
+            [req.b2bUser.institucion_id, paciente_id, titulo, contenido, urgente||false, req.b2bUser.id, _autorNombre]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
