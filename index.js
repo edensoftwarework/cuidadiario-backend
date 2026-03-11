@@ -3682,6 +3682,7 @@ app.delete('/api/b2b/documentos/:id', authB2BMiddleware, async (req, res) => {
 // ============================================================
 // ========== FIN MÓDULO B2B ==========
 // ============================================================
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
     console.log(`✅ Servidor escuchando en puerto ${PORT}`);
     console.log(`📍 http://localhost:${PORT}`);
