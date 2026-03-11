@@ -2732,6 +2732,31 @@ app.get('/api/b2b/pacientes', authB2BMiddleware, async (req, res) => {
     }
 });
 
+// GET /api/b2b/pacientes/:id — single patient (used by paciente.html)
+app.get('/api/b2b/pacientes/:id', authB2BMiddleware, async (req, res) => {
+    try {
+        const { id } = req.params;
+        let result;
+        if (req.b2bUser.rol === 'admin_institucion' || req.b2bUser.rol === 'medico') {
+            result = await pool.query(
+                'SELECT * FROM pacientes_b2b WHERE id=$1 AND institucion_id=$2 AND activo=TRUE',
+                [id, req.b2bUser.institucion_id]
+            );
+        } else {
+            result = await pool.query(
+                `SELECT p.* FROM pacientes_b2b p JOIN asignaciones_b2b a ON a.paciente_id = p.id
+                 WHERE p.id=$1 AND a.cuidador_id=$2 AND a.activa=TRUE AND p.activo=TRUE`,
+                [id, req.b2bUser.id]
+            );
+        }
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Paciente no encontrado' });
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error('GET /api/b2b/pacientes/:id:', err.message);
+        res.status(500).json({ error: 'Error al obtener paciente' });
+    }
+});
+
 // POST /api/b2b/pacientes
 app.post('/api/b2b/pacientes', authB2BMiddleware, async (req, res) => {
     try {
