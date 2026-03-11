@@ -550,6 +550,25 @@ async function runMigrations() {
         await pool.query(`ALTER TABLE medicamentos_b2b ADD COLUMN IF NOT EXISTS catalogo_id INTEGER REFERENCES catalogo_medicamentos_b2b(id) ON DELETE SET NULL`).catch(() => {});
 
         console.log('✅ Migraciones B2B completadas');
+
+        // MIGRACIONES B2B v4 — Permisos configurables del equipo + documentos adjuntos
+        await pool.query(`ALTER TABLE instituciones_b2b ADD COLUMN IF NOT EXISTS permisos_equipo JSONB DEFAULT '{}'`).catch(() => {});
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS documentos_b2b (
+                id              SERIAL PRIMARY KEY,
+                institucion_id  INTEGER NOT NULL REFERENCES instituciones_b2b(id) ON DELETE CASCADE,
+                paciente_id     INTEGER NOT NULL REFERENCES pacientes_b2b(id) ON DELETE CASCADE,
+                nombre_archivo  TEXT NOT NULL,
+                tipo_mime       VARCHAR(100),
+                tamanio_bytes   INTEGER,
+                datos           TEXT NOT NULL,
+                subido_por      INTEGER REFERENCES usuarios_b2b(id) ON DELETE SET NULL,
+                subido_nombre   TEXT,
+                created_at      TIMESTAMP DEFAULT NOW()
+            )
+        `).catch(() => {});
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_documentos_b2b_paciente ON documentos_b2b (paciente_id, institucion_id)`).catch(() => {});
+        console.log('✅ Migraciones B2B v4 completadas');
         // ============================================================
         // FIN MIGRACIONES B2B
         // ============================================================
@@ -2416,6 +2435,25 @@ async function checkB2BPacienteAccess(b2bUser, paciente_id) {
     return r.rowCount > 0;
 }
 
+// Helper: verifica si el usuario B2B tiene permiso para una acción según configuración de la institución en DB
+async function checkB2BCanDo(b2bUser, action) {
+    if (b2bUser.rol === 'admin_institucion') return true;
+    if (b2bUser.rol === 'familiar') return false;
+    const defaults = {
+        crear_paciente:    { medico: true,  cuidador_staff: true  },
+        editar_paciente:   { medico: true,  cuidador_staff: true  },
+        dar_alta:          { medico: true,  cuidador_staff: false },
+        eliminar_paciente: { medico: false, cuidador_staff: false },
+    };
+    try {
+        const r = await pool.query('SELECT permisos_equipo FROM instituciones_b2b WHERE id=$1', [b2bUser.institucion_id]);
+        const perms = r.rows[0]?.permisos_equipo || {};
+        const key = `${b2bUser.rol}_${action}`;
+        if (key in perms) return !!perms[key];
+    } catch {}
+    return defaults[action]?.[b2bUser.rol] ?? false;
+}
+
 // ---------- B2B: AUTH ----------
 
 // POST /api/b2b/auth/register — registrar institución + primer admin
@@ -2459,7 +2497,7 @@ app.post('/api/b2b/auth/login', async (req, res) => {
         if (!email || !password) return res.status(400).json({ error: 'Email y contraseña requeridos' });
 
         const result = await pool.query(
-            `SELECT u.*, i.nombre as institucion_nombre, i.plan, i.activa as institucion_activa
+            `SELECT u.*, i.nombre as institucion_nombre, i.plan, i.activa as institucion_activa, i.permisos_equipo
              FROM usuarios_b2b u JOIN instituciones_b2b i ON u.institucion_id = i.id
              WHERE u.email = $1`,
             [email.toLowerCase()]
@@ -2477,7 +2515,7 @@ app.post('/api/b2b/auth/login', async (req, res) => {
             { id: user.id, institucion_id: user.institucion_id, rol: user.rol, email: user.email, nombre: user.nombre, b2b: true },
             JWT_SECRET, { expiresIn: '30d' }
         );
-        res.json({ token, user: { id: user.id, nombre: user.nombre, email: user.email, rol: user.rol, institucion_id: user.institucion_id, institucion_nombre: user.institucion_nombre, plan: user.plan } });
+        res.json({ token, user: { id: user.id, nombre: user.nombre, email: user.email, rol: user.rol, institucion_id: user.institucion_id, institucion_nombre: user.institucion_nombre, plan: user.plan, institucion_permisos: user.permisos_equipo || {} } });
     } catch (err) {
         console.error('POST /api/b2b/auth/login:', err.message);
         res.status(500).json({ error: 'Error al iniciar sesión' });
@@ -2587,12 +2625,14 @@ app.get('/api/b2b/institucion', authB2BMiddleware, async (req, res) => {
 // PATCH /api/b2b/institucion
 app.patch('/api/b2b/institucion', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
     try {
-        const { nombre, tipo, direccion, telefono, email, stock_modelo } = req.body;
+        const { nombre, tipo, direccion, telefono, email, stock_modelo, permisos_equipo } = req.body;
         await pool.query(
             `UPDATE instituciones_b2b SET nombre=COALESCE($1,nombre), tipo=COALESCE($2,tipo),
              direccion=COALESCE($3,direccion), telefono=COALESCE($4,telefono), email=COALESCE($5,email),
-             stock_modelo=COALESCE($6,stock_modelo) WHERE id=$7`,
-            [nombre, tipo, direccion, telefono, email, stock_modelo, req.b2bUser.institucion_id]
+             stock_modelo=COALESCE($6,stock_modelo),
+             permisos_equipo=COALESCE($7::jsonb,permisos_equipo) WHERE id=$8`,
+            [nombre, tipo, direccion, telefono, email, stock_modelo,
+             permisos_equipo ? JSON.stringify(permisos_equipo) : null, req.b2bUser.institucion_id]
         );
         res.json({ success: true });
     } catch (err) {
@@ -2693,8 +2733,10 @@ app.get('/api/b2b/pacientes', authB2BMiddleware, async (req, res) => {
 });
 
 // POST /api/b2b/pacientes
-app.post('/api/b2b/pacientes', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+app.post('/api/b2b/pacientes', authB2BMiddleware, async (req, res) => {
     try {
+        if (!await checkB2BCanDo(req.b2bUser, 'crear_paciente'))
+            return res.status(403).json({ error: 'No tenés permisos para crear pacientes' });
         const { nombre, apellido, fecha_nacimiento, dni, habitacion, diagnostico, obra_social, num_afiliado, contacto_familiar_nombre, contacto_familiar_tel, notas_ingreso, fecha_ingreso, alergias, medico_cabecera, antecedentes } = req.body;
         if (!nombre) return res.status(400).json({ error: 'El nombre es obligatorio' });
         const result = await pool.query(
@@ -2710,9 +2752,14 @@ app.post('/api/b2b/pacientes', authB2BMiddleware, requireB2BRole('admin_instituc
 });
 
 // PATCH /api/b2b/pacientes/:id
-app.patch('/api/b2b/pacientes/:id', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+app.patch('/api/b2b/pacientes/:id', authB2BMiddleware, async (req, res) => {
     try {
         const { id } = req.params;
+        // dar_alta requires specific permission; general edits use editar_paciente
+        const isEgreso = req.body.fecha_egreso !== undefined || req.body.motivo_egreso !== undefined;
+        const action = isEgreso ? 'dar_alta' : 'editar_paciente';
+        if (!await checkB2BCanDo(req.b2bUser, action))
+            return res.status(403).json({ error: 'No tenés permisos para esta acción' });
         const fields = ['nombre','apellido','fecha_nacimiento','dni','habitacion','diagnostico','obra_social','num_afiliado','contacto_familiar_nombre','contacto_familiar_tel','notas_ingreso','fecha_ingreso','foto_url','alergias','medico_cabecera','antecedentes','fecha_egreso','motivo_egreso'];
         const updates = []; const values = []; let i = 1;
         for (const f of fields) { if (req.body[f] !== undefined) { updates.push(`${f}=$${i++}`); values.push(req.body[f]); } }
@@ -2727,8 +2774,10 @@ app.patch('/api/b2b/pacientes/:id', authB2BMiddleware, requireB2BRole('admin_ins
 });
 
 // DELETE /api/b2b/pacientes/:id — soft delete
-app.delete('/api/b2b/pacientes/:id', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+app.delete('/api/b2b/pacientes/:id', authB2BMiddleware, async (req, res) => {
     try {
+        if (!await checkB2BCanDo(req.b2bUser, 'eliminar_paciente'))
+            return res.status(403).json({ error: 'No tenés permisos para eliminar pacientes' });
         const { id } = req.params;
         const result = await pool.query('UPDATE pacientes_b2b SET activo=FALSE WHERE id=$1 AND institucion_id=$2 RETURNING id', [id, req.b2bUser.institucion_id]);
         if (result.rowCount === 0) return res.status(404).json({ error: 'Paciente no encontrado' });
@@ -3395,24 +3444,29 @@ app.get('/api/b2b/dashboard', authB2BMiddleware, async (req, res) => {
     try {
         const iid = req.b2bUser.institucion_id;
         const [pacientes, staff, citasProximas, sintomasRecientes, notasUrgentes, tomasHoy, tareasHoy, cumpleanosHoy, stockBajo] = await Promise.all([
-            pool.query('SELECT COUNT(*) as total FROM pacientes_b2b WHERE institucion_id=$1 AND activo=TRUE', [iid]),
+            pool.query('SELECT COUNT(*) as total FROM pacientes_b2b WHERE institucion_id=$1 AND activo=TRUE AND fecha_egreso IS NULL', [iid]),
             pool.query('SELECT COUNT(*) as total, rol FROM usuarios_b2b WHERE institucion_id=$1 AND activo=TRUE GROUP BY rol', [iid]),
             pool.query(`SELECT c.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
                         FROM citas_b2b c JOIN pacientes_b2b p ON c.paciente_id=p.id
                         WHERE c.institucion_id=$1 AND c.fecha BETWEEN NOW() AND NOW()+INTERVAL '7 days' AND c.estado='pendiente'
+                        AND p.fecha_egreso IS NULL
                         ORDER BY c.fecha LIMIT 10`, [iid]),
             pool.query(`SELECT s.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
                         FROM sintomas_b2b s JOIN pacientes_b2b p ON s.paciente_id=p.id
-                        WHERE s.institucion_id=$1 AND s.fecha > NOW()-INTERVAL '24 hours' ORDER BY s.fecha DESC LIMIT 10`, [iid]),
+                        WHERE s.institucion_id=$1 AND s.fecha > NOW()-INTERVAL '24 hours'
+                        AND p.fecha_egreso IS NULL
+                        ORDER BY s.fecha DESC LIMIT 10`, [iid]),
             pool.query(`SELECT n.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
                         FROM notas_b2b n JOIN pacientes_b2b p ON n.paciente_id=p.id
-                        WHERE n.institucion_id=$1 AND n.urgente=TRUE ORDER BY n.created_at DESC LIMIT 10`, [iid]),
+                        WHERE n.institucion_id=$1 AND n.urgente=TRUE
+                        AND p.fecha_egreso IS NULL
+                        ORDER BY n.created_at DESC LIMIT 10`, [iid]),
             pool.query('SELECT COUNT(*) as total FROM historial_medicamentos_b2b WHERE institucion_id=$1 AND fecha>CURRENT_DATE', [iid]),
             pool.query('SELECT COUNT(*) as total FROM historial_tareas_b2b WHERE institucion_id=$1 AND fecha>CURRENT_DATE', [iid]),
             pool.query(`SELECT id, nombre, apellido, fecha_nacimiento,
                         EXTRACT(YEAR FROM AGE(fecha_nacimiento)) AS edad
                         FROM pacientes_b2b
-                        WHERE institucion_id=$1 AND activo=TRUE
+                        WHERE institucion_id=$1 AND activo=TRUE AND fecha_egreso IS NULL
                         AND TO_CHAR(fecha_nacimiento,'MM-DD') = TO_CHAR(NOW(),'MM-DD')`, [iid]),
             pool.query(`SELECT id, nombre,
                         TRIM(COALESCE(dosis,'') || CASE WHEN frecuencia IS NOT NULL AND frecuencia <> '' THEN ' · ' || frecuencia ELSE '' END) AS dosis_horario,
@@ -3517,11 +3571,92 @@ app.get('/api/b2b/reporte/export', authB2BMiddleware, async (req, res) => {
     }
 });
 
+// ---------- B2B: DOCUMENTOS ADJUNTOS ----------
+
+// POST /api/b2b/documentos — subir documento (base64) para un paciente (máx 5 MB)
+app.post('/api/b2b/documentos', authB2BMiddleware, async (req, res) => {
+    try {
+        const { paciente_id, nombre_archivo, tipo_mime, datos } = req.body;
+        if (!paciente_id || !nombre_archivo || !datos)
+            return res.status(400).json({ error: 'paciente_id, nombre_archivo y datos son requeridos' });
+        const hasAccess = await checkB2BPacienteAccess(req.b2bUser, parseInt(paciente_id));
+        if (!hasAccess) return res.status(403).json({ error: 'Sin acceso a este paciente' });
+        // Base64 de 5 MB ≈ 6.8 MB de texto; con margen: 7 MB de chars
+        if (datos.length > 7 * 1024 * 1024)
+            return res.status(413).json({ error: 'El archivo supera el límite de 5 MB' });
+        const tamanio_bytes = Math.round(datos.length * 0.75);
+        const result = await pool.query(
+            `INSERT INTO documentos_b2b (institucion_id, paciente_id, nombre_archivo, tipo_mime, tamanio_bytes, datos, subido_por, subido_nombre)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+             RETURNING id, nombre_archivo, tipo_mime, tamanio_bytes, subido_nombre, created_at`,
+            [req.b2bUser.institucion_id, paciente_id, nombre_archivo, tipo_mime || null,
+             tamanio_bytes, datos, req.b2bUser.id, req.b2bUser.nombre]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('POST /api/b2b/documentos:', err.message);
+        res.status(500).json({ error: 'Error al guardar documento' });
+    }
+});
+
+// GET /api/b2b/documentos?paciente_id=X — listar documentos (sin datos binarios para listado rápido)
+app.get('/api/b2b/documentos', authB2BMiddleware, async (req, res) => {
+    try {
+        const { paciente_id } = req.query;
+        if (!paciente_id) return res.status(400).json({ error: 'paciente_id requerido' });
+        const hasAccess = await checkB2BPacienteAccess(req.b2bUser, parseInt(paciente_id));
+        if (!hasAccess) return res.status(403).json({ error: 'Sin acceso a este paciente' });
+        const result = await pool.query(
+            `SELECT id, nombre_archivo, tipo_mime, tamanio_bytes, subido_nombre, created_at
+             FROM documentos_b2b WHERE paciente_id=$1 AND institucion_id=$2 ORDER BY created_at DESC`,
+            [paciente_id, req.b2bUser.institucion_id]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        console.error('GET /api/b2b/documentos:', err.message);
+        res.status(500).json({ error: 'Error al obtener documentos' });
+    }
+});
+
+// GET /api/b2b/documentos/:id/download — descargar documento completo con headers
+app.get('/api/b2b/documentos/:id/download', authB2BMiddleware, async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT * FROM documentos_b2b WHERE id=$1 AND institucion_id=$2',
+            [req.params.id, req.b2bUser.institucion_id]
+        );
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Documento no encontrado' });
+        const doc = result.rows[0];
+        const buf = Buffer.from(doc.datos, 'base64');
+        res.setHeader('Content-Type', doc.tipo_mime || 'application/octet-stream');
+        res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(doc.nombre_archivo)}`);
+        res.setHeader('Content-Length', buf.length);
+        res.send(buf);
+    } catch (err) {
+        console.error('GET /api/b2b/documentos/:id/download:', err.message);
+        res.status(500).json({ error: 'Error al descargar documento' });
+    }
+});
+
+// DELETE /api/b2b/documentos/:id — solo quien lo subió o el admin puede eliminarlo
+app.delete('/api/b2b/documentos/:id', authB2BMiddleware, async (req, res) => {
+    try {
+        const result = await pool.query(
+            `DELETE FROM documentos_b2b WHERE id=$1 AND institucion_id=$2
+             AND (subido_por=$3 OR $4='admin_institucion') RETURNING id`,
+            [req.params.id, req.b2bUser.institucion_id, req.b2bUser.id, req.b2bUser.rol]
+        );
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Documento no encontrado o sin permisos' });
+        res.json({ success: true });
+    } catch (err) {
+        console.error('DELETE /api/b2b/documentos/:id:', err.message);
+        res.status(500).json({ error: 'Error al eliminar documento' });
+    }
+});
+
 // ============================================================
 // ========== FIN MÓDULO B2B ==========
 // ============================================================
-
-const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
     console.log(`✅ Servidor escuchando en puerto ${PORT}`);
     console.log(`📍 http://localhost:${PORT}`);
