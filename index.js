@@ -2489,13 +2489,34 @@ app.post('/api/b2b/auth/register', async (req, res) => {
 
         const hash = await bcrypt.hash(password, SALT_ROUNDS);
         const user = await pool.query(
-            `INSERT INTO usuarios_b2b (institucion_id, nombre, email, password_hash, rol, email_verified, email_verification_token, email_verification_expiry)
-             VALUES ($1,$2,$3,$4,'admin_institucion',$5,$6,$7) RETURNING id, nombre, email, rol`,
-            [institucion_id, nombre_admin, email.toLowerCase(), hash, emailVerified, verificationToken, verificationExpiry]
+            `INSERT INTO usuarios_b2b (institucion_id, nombre, email, password_hash, rol)
+             VALUES ($1,$2,$3,$4,'admin_institucion') RETURNING id, nombre, email, rol`,
+            [institucion_id, nombre_admin, email.toLowerCase(), hash]
         );
 
-        // Enviar email de verificación (solo para emails reales)
-        if (!isTestEmail && process.env.RESEND_API_KEY) {
+        // Intentar guardar los campos de verificación de email (requieren migración v6).
+        // Wrapped en try/catch para que el registro funcione aunque la migración aún no haya corrido.
+        let emailVerifiedFinal = isTestEmail;
+        if (!isTestEmail) {
+            try {
+                await pool.query(
+                    `UPDATE usuarios_b2b
+                     SET email_verified=FALSE, email_verification_token=$1, email_verification_expiry=$2
+                     WHERE id=$3`,
+                    [verificationToken, verificationExpiry, user.rows[0].id]
+                );
+            } catch (verErr) {
+                // Las columnas aún no existen — el usuario puede verificar más tarde
+                console.warn('[B2B] Columnas de verificación no disponibles (migración pendiente):', verErr.message);
+                emailVerifiedFinal = true; // tratarlo como verificado para no bloquear el flujo
+            }
+        } else {
+            // Email de prueba: marcar verificado directamente
+            await pool.query('UPDATE usuarios_b2b SET email_verified=TRUE WHERE id=$1', [user.rows[0].id]).catch(() => {});
+        }
+
+        // Enviar email de verificación (solo para emails reales y si la actualización de token fue exitosa)
+        if (!isTestEmail && emailVerifiedFinal === false && process.env.RESEND_API_KEY) {
             const verifyUrl = `${process.env.FRONTEND_URL || 'https://cuidadiario-pro.edensoftwork.com'}/verify-email.html?token=${verificationToken}&b2b=1`;
             try {
                 await fetch('https://api.resend.com/emails', {
@@ -2548,7 +2569,7 @@ app.post('/api/b2b/auth/register', async (req, res) => {
                 plan: 'free',
                 institucion_permisos: {},
                 onboarding_done: false,
-                email_verified: emailVerified
+                email_verified: emailVerifiedFinal
             }
         });
     } catch (err) {
@@ -3869,4 +3890,3 @@ app.listen(PORT, async () => {
         console.log(`🏓 Keep-alive activado → ${BACKEND_URL}/health`);
     }
 });
-//
