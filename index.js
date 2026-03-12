@@ -2476,12 +2476,61 @@ app.post('/api/b2b/auth/register', async (req, res) => {
         );
         const institucion_id = inst.rows[0].id;
 
+        // Emails de prueba (test@test, test1@test1 ... test9@test9): se verifican automáticamente
+        const isTestEmail = /^test\d*@test\d*$/i.test(email.trim());
+        let verificationToken = null;
+        let verificationExpiry = null;
+        let emailVerified = isTestEmail;
+
+        if (!isTestEmail) {
+            verificationToken = require('crypto').randomBytes(32).toString('hex');
+            verificationExpiry = new Date(Date.now() + 72 * 60 * 60 * 1000); // 72 horas
+        }
+
         const hash = await bcrypt.hash(password, SALT_ROUNDS);
         const user = await pool.query(
-            `INSERT INTO usuarios_b2b (institucion_id, nombre, email, password_hash, rol)
-             VALUES ($1,$2,$3,$4,'admin_institucion') RETURNING id, nombre, email, rol`,
-            [institucion_id, nombre_admin, email.toLowerCase(), hash]
+            `INSERT INTO usuarios_b2b (institucion_id, nombre, email, password_hash, rol, email_verified, email_verification_token, email_verification_expiry)
+             VALUES ($1,$2,$3,$4,'admin_institucion',$5,$6,$7) RETURNING id, nombre, email, rol`,
+            [institucion_id, nombre_admin, email.toLowerCase(), hash, emailVerified, verificationToken, verificationExpiry]
         );
+
+        // Enviar email de verificación (solo para emails reales)
+        if (!isTestEmail && process.env.RESEND_API_KEY) {
+            const verifyUrl = `${process.env.FRONTEND_URL || 'https://cuidadiario-pro.edensoftwork.com'}/verify-email.html?token=${verificationToken}&b2b=1`;
+            try {
+                await fetch('https://api.resend.com/emails', {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        from: process.env.EMAIL_FROM || 'CuidaDiario PRO <noreply@cuidadiario.com>',
+                        to: email,
+                        subject: 'Confirmá tu cuenta — CuidaDiario PRO',
+                        html: `
+                            <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:28px;border:1px solid #e0e0e0;border-radius:10px">
+                                <h2 style="color:#4F46E5;margin-bottom:4px">CuidaDiario <strong>PRO</strong></h2>
+                                <p style="color:#6B7280;font-size:.88rem;margin-top:0">Plataforma de gestión institucional</p>
+                                <hr style="border:none;border-top:1px solid #eee;margin:16px 0">
+                                <p>Hola <strong>${nombre_admin}</strong>,</p>
+                                <p>Tu cuenta para la institución <strong>${nombre_institucion}</strong> fue creada correctamente.</p>
+                                <p>Para activarla y poder usar todas las funciones, confirmá tu email haciendo clic en el botón de abajo:</p>
+                                <div style="text-align:center;margin:28px 0">
+                                    <a href="${verifyUrl}"
+                                       style="background:#4F46E5;color:#fff;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:700;font-size:1rem;display:inline-block">
+                                        Confirmar mi cuenta
+                                    </a>
+                                </div>
+                                <p style="color:#9CA3AF;font-size:.82rem">Este enlace vence en <strong>72 horas</strong>. Si no creaste esta cuenta, podés ignorar este email.</p>
+                                <hr style="border:none;border-top:1px solid #eee;margin:20px 0">
+                                <p style="color:#D1D5DB;font-size:.75rem">CuidaDiario PRO — EDEN SoftWork</p>
+                            </div>
+                        `
+                    })
+                });
+                console.log(`[B2B] Email de verificación enviado a ${email}`);
+            } catch (emailErr) {
+                console.warn(`[B2B] Email de verificación no enviado a ${email}:`, emailErr.message);
+            }
+        }
 
         const token = jwt.sign(
             { id: user.rows[0].id, institucion_id, rol: 'admin_institucion', email: user.rows[0].email, nombre: user.rows[0].nombre, b2b: true },
@@ -2498,7 +2547,8 @@ app.post('/api/b2b/auth/register', async (req, res) => {
                 institucion_nombre: nombre_institucion,
                 plan: 'free',
                 institucion_permisos: {},
-                onboarding_done: false
+                onboarding_done: false,
+                email_verified: emailVerified
             }
         });
     } catch (err) {
@@ -2532,7 +2582,7 @@ app.post('/api/b2b/auth/login', async (req, res) => {
             { id: user.id, institucion_id: user.institucion_id, rol: user.rol, email: user.email, nombre: user.nombre, b2b: true },
             JWT_SECRET, { expiresIn: '30d' }
         );
-        res.json({ token, user: { id: user.id, nombre: user.nombre, email: user.email, rol: user.rol, institucion_id: user.institucion_id, institucion_nombre: user.institucion_nombre, plan: user.plan, institucion_permisos: user.permisos_equipo || {}, onboarding_done: !!user.onboarding_done } });
+        res.json({ token, user: { id: user.id, nombre: user.nombre, email: user.email, rol: user.rol, institucion_id: user.institucion_id, institucion_nombre: user.institucion_nombre, plan: user.plan, institucion_permisos: user.permisos_equipo || {}, onboarding_done: !!user.onboarding_done, email_verified: !!user.email_verified } });
     } catch (err) {
         console.error('POST /api/b2b/auth/login:', err.message);
         res.status(500).json({ error: 'Error al iniciar sesión' });
@@ -2622,6 +2672,89 @@ app.post('/api/b2b/auth/reset-password', async (req, res) => {
     } catch (err) {
         console.error('POST /api/b2b/auth/reset-password:', err.message);
         res.status(500).json({ error: 'Error al restablecer contraseña' });
+    }
+});
+
+// GET /api/b2b/auth/verify-email?token=XXX — activa la cuenta tras hacer clic en el link del email
+app.get('/api/b2b/auth/verify-email', async (req, res) => {
+    try {
+        const { token } = req.query;
+        if (!token) return res.status(400).json({ error: 'Token de verificación requerido' });
+
+        const result = await pool.query(
+            'SELECT id, email, nombre FROM usuarios_b2b WHERE email_verification_token=$1 AND email_verification_expiry > NOW()',
+            [token]
+        );
+        if (result.rowCount === 0)
+            return res.status(400).json({ error: 'El link de verificación es inválido o ya expiró. Solícita uno nuevo desde la aplicación.' });
+
+        await pool.query(
+            'UPDATE usuarios_b2b SET email_verified=TRUE, email_verification_token=NULL, email_verification_expiry=NULL WHERE id=$1',
+            [result.rows[0].id]
+        );
+        console.log(`[B2B] Email verificado: ${result.rows[0].email} (id=${result.rows[0].id})`);
+        res.json({ success: true, message: 'Email confirmado correctamente. Ya podés usar todas las funciones de CuidaDiario PRO.' });
+    } catch (err) {
+        console.error('GET /api/b2b/auth/verify-email:', err.message);
+        res.status(500).json({ error: 'Error al verificar email' });
+    }
+});
+
+// POST /api/b2b/auth/resend-verification — reenvía el email de verificación
+app.post('/api/b2b/auth/resend-verification', authB2BMiddleware, async (req, res) => {
+    try {
+        const userRow = await pool.query(
+            'SELECT id, nombre, email, email_verified FROM usuarios_b2b WHERE id=$1',
+            [req.b2bUser.id]
+        );
+        if (userRow.rowCount === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
+        const user = userRow.rows[0];
+
+        if (user.email_verified)
+            return res.json({ success: true, already_verified: true, message: 'Tu email ya está verificado.' });
+
+        const isTestEmail = /^test\d*@test\d*$/i.test(user.email);
+        if (isTestEmail) {
+            await pool.query('UPDATE usuarios_b2b SET email_verified=TRUE WHERE id=$1', [user.id]);
+            return res.json({ success: true, message: 'Email de prueba verificado automáticamente.' });
+        }
+
+        const newToken = require('crypto').randomBytes(32).toString('hex');
+        const newExpiry = new Date(Date.now() + 72 * 60 * 60 * 1000);
+        await pool.query(
+            'UPDATE usuarios_b2b SET email_verification_token=$1, email_verification_expiry=$2 WHERE id=$3',
+            [newToken, newExpiry, user.id]
+        );
+
+        if (process.env.RESEND_API_KEY) {
+            const verifyUrl = `${process.env.FRONTEND_URL || 'https://cuidadiario-pro.edensoftwork.com'}/verify-email.html?token=${newToken}&b2b=1`;
+            await fetch('https://api.resend.com/emails', {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    from: process.env.EMAIL_FROM || 'CuidaDiario PRO <noreply@cuidadiario.com>',
+                    to: user.email,
+                    subject: 'Confirmá tu cuenta — CuidaDiario PRO',
+                    html: `
+                        <div style="font-family:Arial,sans-serif;max-width:520px;margin:auto;padding:28px;border:1px solid #e0e0e0;border-radius:10px">
+                            <h2 style="color:#4F46E5">CuidaDiario <strong>PRO</strong></h2>
+                            <p>Hola <strong>${user.nombre}</strong>, re-envíamos tu link de confirmación de cuenta:</p>
+                            <div style="text-align:center;margin:28px 0">
+                                <a href="${verifyUrl}" style="background:#4F46E5;color:#fff;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:700;font-size:1rem;display:inline-block">
+                                    Confirmar mi cuenta
+                                </a>
+                            </div>
+                            <p style="color:#9CA3AF;font-size:.82rem">Este enlace vence en <strong>72 horas</strong>.</p>
+                            <p style="color:#D1D5DB;font-size:.75rem">CuidaDiario PRO — EDEN SoftWork</p>
+                        </div>
+                    `
+                })
+            }).catch(e => console.warn('[B2B] Resend error:', e.message));
+        }
+        res.json({ success: true, message: `Email de verificación reenviado a ${user.email}.` });
+    } catch (err) {
+        console.error('POST /api/b2b/auth/resend-verification:', err.message);
+        res.status(500).json({ error: 'Error al reenviar verificación' });
     }
 });
 
