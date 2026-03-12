@@ -110,7 +110,8 @@ const webPush = require('web-push');       // ← push notifications
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const EMAIL_FROM     = process.env.EMAIL_FROM || process.env.SMTP_FROM || 'CuidaDiario <onboarding@resend.dev>';
-const FRONTEND_URL   = (process.env.FRONTEND_URL || '').replace(/\/$/, '');
+const FRONTEND_URL     = (process.env.FRONTEND_URL     || '').replace(/\/$/, '');
+const FRONTEND_URL_PRO = (process.env.FRONTEND_URL_PRO || process.env.FRONTEND_URL || 'https://cuidadiario-pro.edensoftwork.com').replace(/\/$/, '');
 
 // Enviar email via Resend HTTP API (sin nodemailer, sin SMTP)
 async function sendEmail({ to, subject, html }) {
@@ -2516,10 +2517,13 @@ app.post('/api/b2b/auth/register', async (req, res) => {
         }
 
         // Enviar email de verificación (solo para emails reales y si la actualización de token fue exitosa)
-        if (!isTestEmail && emailVerifiedFinal === false && process.env.RESEND_API_KEY) {
-            const verifyUrl = `${process.env.FRONTEND_URL || 'https://cuidadiario-pro.edensoftwork.com'}/verify-email.html?token=${verificationToken}&b2b=1`;
-            try {
-                await fetch('https://api.resend.com/emails', {
+        if (!isTestEmail && emailVerifiedFinal === false) {
+            if (!process.env.RESEND_API_KEY) {
+                console.error('[B2B] ⚠️  RESEND_API_KEY no está configurada en Railway. El email de verificación NO fue enviado a', email, '\u2014 Configurá la variable de entorno RESEND_API_KEY para habilitar el envío de emails.');
+            } else {
+                const verifyUrl = `${FRONTEND_URL_PRO}/verify-email.html?token=${verificationToken}&b2b=1`;
+                try {
+                    await fetch('https://api.resend.com/emails', {
                     method: 'POST',
                     headers: { 'Authorization': `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -2548,10 +2552,11 @@ app.post('/api/b2b/auth/register', async (req, res) => {
                     })
                 });
                 console.log(`[B2B] Email de verificación enviado a ${email}`);
-            } catch (emailErr) {
-                console.warn(`[B2B] Email de verificación no enviado a ${email}:`, emailErr.message);
-            }
-        }
+                } catch (emailErr) {
+                    console.warn(`[B2B] Email de verificación no enviado a ${email}:`, emailErr.message);
+                }
+            } // end if RESEND_API_KEY
+        } // end if !isTestEmail && emailVerifiedFinal === false
 
         const token = jwt.sign(
             { id: user.rows[0].id, institucion_id, rol: 'admin_institucion', email: user.rows[0].email, nombre: user.rows[0].nombre, b2b: true },
@@ -2748,7 +2753,7 @@ app.post('/api/b2b/auth/resend-verification', authB2BMiddleware, async (req, res
         );
 
         if (process.env.RESEND_API_KEY) {
-            const verifyUrl = `${process.env.FRONTEND_URL || 'https://cuidadiario-pro.edensoftwork.com'}/verify-email.html?token=${newToken}&b2b=1`;
+            const verifyUrl = `${FRONTEND_URL_PRO}/verify-email.html?token=${newToken}&b2b=1`;
             await fetch('https://api.resend.com/emails', {
                 method: 'POST',
                 headers: { 'Authorization': `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
