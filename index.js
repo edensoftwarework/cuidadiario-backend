@@ -574,6 +574,12 @@ async function runMigrations() {
         // MIGRACIONES B2B v5 — Onboarding de institución
         await pool.query(`ALTER TABLE instituciones_b2b ADD COLUMN IF NOT EXISTS onboarding_done BOOLEAN DEFAULT FALSE`).catch(() => {});
         console.log('✅ Migraciones B2B v5 completadas');
+
+        // MIGRACIONES B2B v6 — Verificación de email al registrarse
+        await pool.query(`ALTER TABLE usuarios_b2b ADD COLUMN IF NOT EXISTS email_verified           BOOLEAN   DEFAULT FALSE`).catch(() => {});
+        await pool.query(`ALTER TABLE usuarios_b2b ADD COLUMN IF NOT EXISTS email_verification_token  TEXT`).catch(() => {});
+        await pool.query(`ALTER TABLE usuarios_b2b ADD COLUMN IF NOT EXISTS email_verification_expiry TIMESTAMPTZ`).catch(() => {});
+        console.log('✅ Migraciones B2B v6 completadas');
         // ============================================================
         // FIN MIGRACIONES B2B
         // ============================================================
@@ -3895,4 +3901,3 @@ app.listen(PORT, async () => {
         console.log(`🏓 Keep-alive activado → ${BACKEND_URL}/health`);
     }
 });
-//
