@@ -2463,7 +2463,7 @@ async function checkB2BCanDo(b2bUser, action) {
 // POST /api/b2b/auth/register — registrar institución + primer admin
 app.post('/api/b2b/auth/register', async (req, res) => {
     try {
-        const { nombre_institucion, tipo_institucion, nombre_admin, email, password } = req.body;
+        const { nombre_institucion, tipo_institucion, nombre_admin, email, password, telefono } = req.body;
         if (!nombre_institucion || !email || !password || !nombre_admin)
             return res.status(400).json({ error: 'Faltan datos obligatorios' });
 
@@ -2471,8 +2471,8 @@ app.post('/api/b2b/auth/register', async (req, res) => {
         if (exists.rowCount > 0) return res.status(409).json({ error: 'El email ya está registrado' });
 
         const inst = await pool.query(
-            'INSERT INTO instituciones_b2b (nombre, tipo) VALUES ($1,$2) RETURNING id',
-            [nombre_institucion, tipo_institucion || 'geriatrico']
+            'INSERT INTO instituciones_b2b (nombre, tipo, telefono) VALUES ($1,$2,$3) RETURNING id',
+            [nombre_institucion, tipo_institucion || 'geriatrico', telefono || null]
         );
         const institucion_id = inst.rows[0].id;
 
@@ -2487,7 +2487,20 @@ app.post('/api/b2b/auth/register', async (req, res) => {
             { id: user.rows[0].id, institucion_id, rol: 'admin_institucion', email: user.rows[0].email, nombre: user.rows[0].nombre, b2b: true },
             JWT_SECRET, { expiresIn: '30d' }
         );
-        res.status(201).json({ token, user: user.rows[0], institucion_id });
+        res.status(201).json({
+            token,
+            user: {
+                id: user.rows[0].id,
+                nombre: user.rows[0].nombre,
+                email: user.rows[0].email,
+                rol: user.rows[0].rol,
+                institucion_id,
+                institucion_nombre: nombre_institucion,
+                plan: 'free',
+                institucion_permisos: {},
+                onboarding_done: false
+            }
+        });
     } catch (err) {
         console.error('POST /api/b2b/auth/register:', err.message);
         res.status(500).json({ error: 'Error al registrar institución' });
