@@ -587,6 +587,10 @@ async function runMigrations() {
         // Instituciones ya existentes sin trial_started_at: asignar created_at como inicio de prueba
         await pool.query(`UPDATE instituciones_b2b SET trial_started_at = created_at WHERE trial_started_at IS NULL`).catch(() => {});
         console.log('✅ Migraciones B2B v7 completadas');
+
+        // MIGRACIONES B2B v8 — Modo estación compartida persistente (cross-device)
+        await pool.query(`ALTER TABLE instituciones_b2b ADD COLUMN IF NOT EXISTS shared_mode BOOLEAN DEFAULT FALSE`).catch(() => {});
+        console.log('✅ Migraciones B2B v8 completadas');
         // ============================================================
         // FIN MIGRACIONES B2B
         // ============================================================
@@ -1997,13 +2001,16 @@ app.post('/api/b2b/webhook/mercadopago', async (req, res) => {
                 const preapproval = mp.body;
                 const instId = parseInt(preapproval.external_reference);
                 if (instId && !isNaN(instId)) {
-                    const isPro = preapproval.status === 'authorized';
-                    if (isPro) {
-                        await pool.query('UPDATE instituciones_b2b SET plan=$1 WHERE id=$2', ['pro', instId]);
+                    if (preapproval.status === 'authorized') {
+                        const plan = _mpPlanFromPreapproval(preapproval);
+                        await pool.query('UPDATE instituciones_b2b SET plan=$1 WHERE id=$2', [plan, instId]);
+                        console.log(`[MP Webhook B2B] ✅ Institución ${instId} → plan: ${plan.toUpperCase()} (estado MP: "${preapproval.status}")`);
+                    } else if (['cancelled', 'paused', 'expired'].includes(preapproval.status)) {
+                        await pool.query('UPDATE instituciones_b2b SET plan=$1 WHERE id=$2', ['free', instId]);
+                        console.log(`[MP Webhook B2B] 🔻 Institución ${instId} → plan: free (estado MP: "${preapproval.status}")`);
                     } else {
-                        await pool.query('UPDATE instituciones_b2b SET plan=$1 WHERE id=$2', ['basico', instId]);
+                        console.log(`[MP Webhook B2B] ℹ️ Institución ${instId} — estado MP: "${preapproval.status}" (sin cambio de plan)`);
                     }
-                    console.log(`[MP Webhook B2B] ✅ Institución ${instId} → plan: ${isPro ? 'pro' : 'basico'} (estado MP: "${preapproval.status}")`);
                 } else {
                     console.warn(`[MP Webhook B2B] external_reference inválido: "${preapproval.external_reference}"`);
                 }
@@ -2020,61 +2027,62 @@ app.post('/api/b2b/webhook/mercadopago', async (req, res) => {
     }
 });
 
+// Helper: determina el plan (pro/basico) a partir de un objeto preapproval de MP
+function _mpPlanFromPreapproval(preapproval) {
+    const amount = preapproval?.auto_recurring?.transaction_amount;
+    const reason = (preapproval?.reason || '').toLowerCase();
+    if (amount >= 14000 || reason.includes('pro')) return 'pro';
+    if (amount >= 6000  || reason.includes('básico') || reason.includes('basico')) return 'basico';
+    return 'basico'; // fallback conservador
+}
+
 // GET /api/b2b/verify-subscription — Verifica el estado de la suscripción MP y actualiza el plan
+// Requiere preapproval_id en el query para actualizar; sin él solo devuelve el plan actual de la DB.
 app.get('/api/b2b/verify-subscription', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
-    if (!MP_ACCESS_TOKEN) {
-        return res.status(400).json({ error: 'MercadoPago no configurado en el servidor' });
-    }
+    const instId = req.b2bUser.institucion_id;
     try {
-        let authorized = null;
-        const instId = req.b2bUser.institucion_id;
-        // Intento 1: preapproval_id específico enviado por el frontend
         const preapprovalId = req.query.preapproval_id;
-        if (preapprovalId) {
-            const mp = await mpRequest(`/preapproval/${preapprovalId}`);
-            if (mp.status === 200 && mp.body.status === 'authorized') {
-                const ref = parseInt(mp.body.external_reference);
-                if (ref === instId) {
-                    authorized = mp.body;
-                } else {
-                    console.warn(`[MP Verify B2B] preapproval ${preapprovalId}: external_reference="${mp.body.external_reference}" no coincide con institucion ${instId}`);
-                }
-            }
+
+        // Sin preapproval_id → solo reportar el plan actual, sin consultar ni modificar MP
+        if (!preapprovalId) {
+            const instRes = await pool.query('SELECT plan FROM instituciones_b2b WHERE id=$1', [instId]);
+            const currentPlan = instRes.rows[0]?.plan || 'free';
+            return res.json({ plan: currentPlan, status: 'current' });
         }
-        // Intento 2: buscar por external_reference (cubre cualquier suscripción de la institución)
-        if (!authorized) {
-            const search = await mpRequest(`/preapproval/search?external_reference=${instId}&status=authorized`);
-            if (search.status === 200) {
-                const results = search.body?.results || [];
-                authorized = results.find(p =>
-                    p.status === 'authorized' &&
-                    parseInt(p.external_reference) === instId
-                ) || null;
-            }
+
+        if (!MP_ACCESS_TOKEN) {
+            return res.status(400).json({ error: 'MercadoPago no configurado en el servidor' });
         }
-        if (authorized) {
-            await pool.query('UPDATE instituciones_b2b SET plan=$1 WHERE id=$2', ['pro', instId]);
-            console.log(`[MP Verify B2B] ✅ Institución ${instId} → plan: PRO (preapproval: ${authorized.id})`);
-            return res.json({ plan: 'pro', status: 'authorized' });
+
+        // Con preapproval_id: verificar el pago real en MP
+        const mp = await mpRequest(`/preapproval/${preapprovalId}`);
+        if (mp.status !== 200) {
+            console.warn(`[MP Verify B2B] No se pudo obtener preapproval ${preapprovalId} — HTTP ${mp.status}`);
+            return res.json({ plan: 'free', status: 'not_found', message: 'No se pudo verificar el pago. Intentá nuevamente en unos minutos.' });
         }
-        // Sin suscripción autorizada — buscar todas para saber el estado real
-        const searchAll = await mpRequest(`/preapproval/search?external_reference=${instId}`);
-        const allResults = searchAll.body?.results || [];
-        const pending    = allResults.find(p => p.status === 'pending');
-        const cancelled  = allResults.find(p => ['cancelled', 'paused', 'expired'].includes(p.status));
-        if (cancelled && !pending) {
-            await pool.query('UPDATE instituciones_b2b SET plan=$1 WHERE id=$2', ['basico', instId]);
-            console.log(`[MP Verify B2B] 🔻 Institución ${instId} → plan: BASICO (estado MP: "${cancelled.status}")`);
-            return res.json({ plan: 'basico', status: cancelled.status, message: 'La suscripción fue cancelada o expiró.' });
+
+        const preapproval = mp.body;
+        const ref = parseInt(preapproval.external_reference);
+        if (ref !== instId) {
+            console.warn(`[MP Verify B2B] preapproval ${preapprovalId}: external_reference="${preapproval.external_reference}" no coincide con institucion ${instId}`);
+            return res.status(403).json({ error: 'Este pago no corresponde a tu institución' });
         }
-        console.log(`[MP Verify B2B] Institución ${instId} — estados: ${allResults.map(p => p.status).join(', ') || 'ninguna'}`);
-        return res.json({
-            plan: 'basico',
-            status: pending ? 'pending' : 'not_found',
-            message: pending
-                ? 'El pago está siendo procesado. Puede demorar unos minutos.'
-                : 'No se encontró suscripción activa en MercadoPago.'
-        });
+
+        if (preapproval.status === 'authorized') {
+            const plan = _mpPlanFromPreapproval(preapproval);
+            await pool.query('UPDATE instituciones_b2b SET plan=$1 WHERE id=$2', [plan, instId]);
+            console.log(`[MP Verify B2B] ✅ Institución ${instId} → plan: ${plan.toUpperCase()} (preapproval: ${preapproval.id})`);
+            return res.json({ plan, status: 'authorized' });
+        }
+
+        if (preapproval.status === 'pending') {
+            return res.json({ plan: 'free', status: 'pending', message: 'El pago está siendo procesado. Puede demorar unos minutos.' });
+        }
+
+        // Cancelado / expirado / pausado
+        console.log(`[MP Verify B2B] Institución ${instId} — estado MP: "${preapproval.status}"`);
+        return res.json({ plan: 'free', status: preapproval.status, message: 'La suscripción no está activa.' });
+
     } catch (err) {
         console.error('[MP Verify B2B] Error:', err.message);
         res.status(500).json({ error: err.message });
@@ -2483,6 +2491,93 @@ async function syncMPSubscriptions() {
     } catch (e) {
         console.error('[MP Sync] Error:', e.message);
     }
+
+    // B2B — sincronizar instituciones con planes pagos
+    try {
+        const b2bInsts = await pool.query("SELECT id FROM instituciones_b2b WHERE plan IN ('basico','pro')");
+        if (b2bInsts.rows.length > 0) {
+            console.log(`[MP Sync B2B] Verificando ${b2bInsts.rows.length} institución(es) con plan activo...`);
+            let b2bDeactivated = 0;
+            for (const inst of b2bInsts.rows) {
+                try {
+                    const search = await mpRequest(`/preapproval/search?external_reference=b2b_${inst.id}&status=authorized`);
+                    if (search.status !== 200) continue;
+                    const hasAuthorized = (search.body?.results || []).some(p => p.status === 'authorized');
+                    if (!hasAuthorized) {
+                        await pool.query("UPDATE instituciones_b2b SET plan='free' WHERE id=$1", [inst.id]);
+                        console.log(`[MP Sync B2B] 🔻 Institución ${inst.id} → plan: free (sin suscripción autorizada)`);
+                        b2bDeactivated++;
+                    }
+                    await new Promise(r => setTimeout(r, 300));
+                } catch (e) {
+                    console.warn(`[MP Sync B2B] Error verificando institución ${inst.id}:`, e.message);
+                }
+            }
+            console.log(`[MP Sync B2B] ✅ Sync B2B completado — ${b2bDeactivated} institución(es) desactivada(s)`);
+        }
+    } catch (e) {
+        console.warn('[MP Sync B2B] Error en sync B2B:', e.message);
+    }
+}
+
+// ========== RECORDATORIOS DE VENCIMIENTO DE TRIAL ==========
+// Envía emails de aviso a instituciones en período de prueba que están por vencer.
+// Se llama diariamente desde el servidor.
+async function checkTrialReminders() {
+    if (!RESEND_API_KEY) return; // sin email configurado, saltar silenciosamente
+    try {
+        // Aviso a los 45 días (15 días restantes) — ventana de ±12h para no duplicar
+        const warn15 = await pool.query(`
+            SELECT id, nombre, email FROM instituciones_b2b
+            WHERE plan = 'free' AND trial_started_at IS NOT NULL
+              AND email IS NOT NULL AND email <> ''
+              AND NOW() - trial_started_at BETWEEN INTERVAL '44 days 12 hours' AND INTERVAL '45 days 12 hours'
+        `);
+        for (const inst of warn15.rows) {
+            try {
+                await sendEmail({
+                    to: inst.email,
+                    subject: 'Tu prueba gratuita de CuidaDiario PRO vence en 15 días',
+                    html: `<div style="font-family:'Segoe UI',Arial,sans-serif;max-width:520px;margin:auto;padding:28px;border:1px solid #e5e7eb;border-radius:12px">
+                        <h2 style="color:#1565C0;margin-top:0">⏳ Te quedan 15 días de prueba</h2>
+                        <p>Hola <strong>${inst.nombre}</strong>,</p>
+                        <p>Tu período de prueba gratuito de <strong>CuidaDiario PRO</strong> vence en <strong>15 días</strong>.</p>
+                        <p>Para seguir usando todas las funciones sin interrupciones, activá un plan desde la sección <em>Configuración → Mi Plan</em>.</p>
+                        <a href="${FRONTEND_URL_PRO}/pages/configuracion.html" style="display:inline-block;background:#1565C0;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:700;margin-top:12px">Ver planes →</a>
+                        <p style="color:#9CA3AF;font-size:.8rem;margin-top:24px">CuidaDiario PRO · EDEN SoftWork · <a href="mailto:edensoftwarework@gmail.com" style="color:#9CA3AF">soporte</a></p>
+                    </div>`
+                });
+                console.log(`[Trial Reminder] ⏳ Aviso 15 días enviado a ${inst.email} (institución ${inst.id})`);
+            } catch (e) { console.warn(`[Trial Reminder] No se pudo enviar a ${inst.email}:`, e.message); }
+        }
+
+        // Aviso final a los 55 días (5 días restantes) — ventana de ±12h
+        const warn5 = await pool.query(`
+            SELECT id, nombre, email FROM instituciones_b2b
+            WHERE plan = 'free' AND trial_started_at IS NOT NULL
+              AND email IS NOT NULL AND email <> ''
+              AND NOW() - trial_started_at BETWEEN INTERVAL '54 days 12 hours' AND INTERVAL '55 days 12 hours'
+        `);
+        for (const inst of warn5.rows) {
+            try {
+                await sendEmail({
+                    to: inst.email,
+                    subject: '⚠️ Tu prueba de CuidaDiario PRO vence en 5 días',
+                    html: `<div style="font-family:'Segoe UI',Arial,sans-serif;max-width:520px;margin:auto;padding:28px;border:1px solid #e5e7eb;border-radius:12px">
+                        <h2 style="color:#DC2626;margin-top:0">⚠️ ¡Solo quedan 5 días!</h2>
+                        <p>Hola <strong>${inst.nombre}</strong>,</p>
+                        <p>Tu período de prueba gratuito de <strong>CuidaDiario PRO</strong> vence en <strong>5 días</strong>.</p>
+                        <p>Después de esa fecha, no podrás agregar nuevos registros. Tus datos existentes estarán seguros.</p>
+                        <a href="${FRONTEND_URL_PRO}/pages/configuracion.html" style="display:inline-block;background:#DC2626;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:700;margin-top:12px">Activar plan ahora →</a>
+                        <p style="color:#9CA3AF;font-size:.8rem;margin-top:24px">CuidaDiario PRO · EDEN SoftWork · <a href="mailto:edensoftwarework@gmail.com" style="color:#9CA3AF">soporte</a></p>
+                    </div>`
+                });
+                console.log(`[Trial Reminder] ⚠️ Aviso final 5 días enviado a ${inst.email} (institución ${inst.id})`);
+            } catch (e) { console.warn(`[Trial Reminder] No se pudo enviar a ${inst.email}:`, e.message); }
+        }
+    } catch (e) {
+        console.error('[Trial Reminders] Error:', e.message);
+    }
 }
 
 // ========== NOTAS ==========
@@ -2564,6 +2659,54 @@ app.delete('/api/notas/:id', authMiddleware, async (req, res) => {
 // ========== B2B — MÓDULO INSTITUCIONAL ==========
 // ============================================================
 
+// ---------- B2B: Helper de límites de plan y expiración del trial ----------
+/**
+ * Verifica si una institución puede realizar una acción según su plan y trial.
+ * Retorna { allowed: true } o { allowed: false, error, code? }
+ */
+async function checkInstPlanForAction(instId, action) {
+    const r = await pool.query('SELECT plan, trial_started_at FROM instituciones_b2b WHERE id=$1', [instId]);
+    const inst = r.rows[0];
+    if (!inst) return { allowed: false, error: 'Institución no encontrada' };
+
+    // Verificar expiración del trial (plan 'free' = período de prueba)
+    if (inst.plan === 'free') {
+        const started = inst.trial_started_at ? new Date(inst.trial_started_at) : new Date();
+        const daysDiff = (Date.now() - started.getTime()) / (1000 * 60 * 60 * 24);
+        if (daysDiff > 60) {
+            return {
+                allowed: false,
+                code: 'TRIAL_EXPIRED',
+                error: 'Tu período de prueba de 60 días ha vencido. Activá un plan desde Configuración para continuar.'
+            };
+        }
+    }
+
+    // Verificar límites del plan Básico
+    if (inst.plan === 'basico') {
+        if (action === 'crear_paciente') {
+            const cnt = await pool.query(
+                'SELECT COUNT(*) as c FROM pacientes_b2b WHERE institucion_id=$1 AND activo=TRUE AND fecha_egreso IS NULL',
+                [instId]
+            );
+            if (parseInt(cnt.rows[0].c) >= 20) {
+                return { allowed: false, error: 'Tu plan Básico permite hasta 20 pacientes activos. Actualizá a PRO para agregar más.' };
+            }
+        }
+        if (action === 'crear_staff') {
+            const cnt = await pool.query(
+                'SELECT COUNT(*) as c FROM usuarios_b2b WHERE institucion_id=$1 AND activo=TRUE',
+                [instId]
+            );
+            if (parseInt(cnt.rows[0].c) >= 5) {
+                return { allowed: false, error: 'Tu plan Básico permite hasta 5 miembros del equipo. Actualizá a PRO para agregar más.' };
+            }
+        }
+    }
+
+    return { allowed: true };
+}
+
 // ---------- B2B: Middleware de autenticación ----------
 function authB2BMiddleware(req, res, next) {
     const auth = req.headers.authorization;
@@ -2572,6 +2715,11 @@ function authB2BMiddleware(req, res, next) {
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
         if (!decoded.b2b) return res.status(401).json({ error: 'Token no es B2B' });
+        // Bloquear usuarios cuyo email_verified sea explícitamente false (en el JWT).
+        // === false es intencional: undefined (tokens viejos sin el campo) pasa sin problemas.
+        if (decoded.email_verified === false) {
+            return res.status(401).json({ error: 'Email no verificado. Revisá tu bandeja de entrada o solicitá un nuevo enlace desde el login.', code: 'EMAIL_NOT_VERIFIED' });
+        }
         req.b2bUser = decoded;
         next();
     } catch (e) {
@@ -2620,7 +2768,7 @@ async function checkB2BCanDo(b2bUser, action) {
 // ---------- B2B: AUTH ----------
 
 // POST /api/b2b/auth/register — registrar institución + primer admin
-app.post('/api/b2b/auth/register', async (req, res) => {
+app.post('/api/b2b/auth/register', authRateLimit, async (req, res) => {
     try {
         const { nombre_institucion, tipo_institucion, nombre_admin, email, password, telefono } = req.body;
         if (!nombre_institucion || !email || !password || !nombre_admin)
@@ -2718,7 +2866,7 @@ app.post('/api/b2b/auth/register', async (req, res) => {
         } // end if !isTestEmail && emailVerifiedFinal === false
 
         const token = jwt.sign(
-            { id: user.rows[0].id, institucion_id, rol: 'admin_institucion', email: user.rows[0].email, nombre: user.rows[0].nombre, b2b: true },
+            { id: user.rows[0].id, institucion_id, rol: 'admin_institucion', email: user.rows[0].email, nombre: user.rows[0].nombre, b2b: true, email_verified: emailVerifiedFinal },
             JWT_SECRET, { expiresIn: '30d' }
         );
         res.status(201).json({
@@ -2743,13 +2891,13 @@ app.post('/api/b2b/auth/register', async (req, res) => {
 });
 
 // POST /api/b2b/auth/login
-app.post('/api/b2b/auth/login', async (req, res) => {
+app.post('/api/b2b/auth/login', authRateLimit, async (req, res) => {
     try {
         const { email, password } = req.body;
         if (!email || !password) return res.status(400).json({ error: 'Email y contraseña requeridos' });
 
         const result = await pool.query(
-            `SELECT u.*, i.nombre as institucion_nombre, i.plan, i.activa as institucion_activa, i.permisos_equipo, i.onboarding_done
+            `SELECT u.*, i.nombre as institucion_nombre, i.plan, i.activa as institucion_activa, i.permisos_equipo, i.onboarding_done, i.stock_modelo, i.shared_mode, i.trial_started_at
              FROM usuarios_b2b u JOIN instituciones_b2b i ON u.institucion_id = i.id
              WHERE u.email = $1`,
             [email.toLowerCase()]
@@ -2764,10 +2912,10 @@ app.post('/api/b2b/auth/login', async (req, res) => {
         if (!valid) return res.status(401).json({ error: 'Credenciales inválidas' });
 
         const token = jwt.sign(
-            { id: user.id, institucion_id: user.institucion_id, rol: user.rol, email: user.email, nombre: user.nombre, b2b: true },
+            { id: user.id, institucion_id: user.institucion_id, rol: user.rol, email: user.email, nombre: user.nombre, b2b: true, email_verified: !!user.email_verified },
             JWT_SECRET, { expiresIn: '30d' }
         );
-        res.json({ token, user: { id: user.id, nombre: user.nombre, email: user.email, rol: user.rol, institucion_id: user.institucion_id, institucion_nombre: user.institucion_nombre, plan: user.plan, institucion_permisos: user.permisos_equipo || {}, onboarding_done: !!user.onboarding_done, email_verified: !!user.email_verified } });
+        res.json({ token, user: { id: user.id, nombre: user.nombre, email: user.email, rol: user.rol, institucion_id: user.institucion_id, institucion_nombre: user.institucion_nombre, plan: user.plan, institucion_permisos: user.permisos_equipo || {}, onboarding_done: !!user.onboarding_done, email_verified: !!user.email_verified, stock_modelo: user.stock_modelo || 'familiar', shared_mode: !!user.shared_mode, trial_started_at: user.trial_started_at || null } });
     } catch (err) {
         console.error('POST /api/b2b/auth/login:', err.message);
         res.status(500).json({ error: 'Error al iniciar sesión' });
@@ -2778,8 +2926,9 @@ app.post('/api/b2b/auth/login', async (req, res) => {
 app.get('/api/b2b/auth/me', authB2BMiddleware, async (req, res) => {
     try {
         const result = await pool.query(
-            `SELECT u.id, u.nombre, u.email, u.rol, u.created_at,
-                    i.id as institucion_id, i.nombre as institucion_nombre, i.tipo, i.plan, i.direccion, i.telefono
+            `SELECT u.id, u.nombre, u.email, u.rol, u.created_at, u.email_verified,
+                    i.id as institucion_id, i.nombre as institucion_nombre, i.tipo, i.plan, i.direccion, i.telefono,
+                    i.stock_modelo, i.shared_mode, i.trial_started_at
              FROM usuarios_b2b u JOIN instituciones_b2b i ON u.institucion_id = i.id
              WHERE u.id = $1`,
             [req.b2bUser.id]
@@ -2821,7 +2970,7 @@ app.patch('/api/b2b/auth/me', authB2BMiddleware, async (req, res) => {
 });
 
 // POST /api/b2b/auth/forgot-password
-app.post('/api/b2b/auth/forgot-password', async (req, res) => {
+app.post('/api/b2b/auth/forgot-password', authRateLimit, async (req, res) => {
     try {
         const { email } = req.body;
         const user = await pool.query('SELECT * FROM usuarios_b2b WHERE email=$1', [email.toLowerCase()]);
@@ -2960,17 +3109,19 @@ app.get('/api/b2b/institucion', authB2BMiddleware, async (req, res) => {
 // PATCH /api/b2b/institucion
 app.patch('/api/b2b/institucion', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
     try {
-        const { nombre, tipo, direccion, telefono, email, stock_modelo, permisos_equipo, onboarding_done } = req.body;
+        const { nombre, tipo, direccion, telefono, email, stock_modelo, permisos_equipo, onboarding_done, shared_mode } = req.body;
         await pool.query(
             `UPDATE instituciones_b2b SET nombre=COALESCE($1,nombre), tipo=COALESCE($2,tipo),
              direccion=COALESCE($3,direccion), telefono=COALESCE($4,telefono), email=COALESCE($5,email),
              stock_modelo=COALESCE($6,stock_modelo),
              permisos_equipo=COALESCE($7::jsonb,permisos_equipo),
-             onboarding_done=COALESCE($9,onboarding_done) WHERE id=$8`,
+             onboarding_done=COALESCE($9,onboarding_done),
+             shared_mode=COALESCE($10,shared_mode) WHERE id=$8`,
             [nombre, tipo, direccion, telefono, email, stock_modelo,
              permisos_equipo ? JSON.stringify(permisos_equipo) : null,
              req.b2bUser.institucion_id,
-             onboarding_done !== undefined ? onboarding_done : null]
+             onboarding_done !== undefined ? onboarding_done : null,
+             shared_mode !== undefined ? shared_mode : null]
         );
         res.json({ success: true });
     } catch (err) {
@@ -3002,11 +3153,15 @@ app.post('/api/b2b/staff', authB2BMiddleware, requireB2BRole('admin_institucion'
         if (!nombre || !email || !password) return res.status(400).json({ error: 'Faltan datos obligatorios' });
         const exists = await pool.query('SELECT id FROM usuarios_b2b WHERE email=$1', [email.toLowerCase()]);
         if (exists.rowCount > 0) return res.status(409).json({ error: 'El email ya está registrado' });
+        // Verificar límite de plan y expiración del trial
+        const planCheck = await checkInstPlanForAction(req.b2bUser.institucion_id, 'crear_staff');
+        if (!planCheck.allowed) return res.status(planCheck.code === 'TRIAL_EXPIRED' ? 402 : 403).json({ error: planCheck.error, code: planCheck.code });
         const hash = await bcrypt.hash(password, SALT_ROUNDS);
         const validRoles = ['cuidador_staff', 'familiar', 'medico', 'admin_institucion'];
         const userRol = validRoles.includes(rol) ? rol : 'cuidador_staff';
+        // email_verified=TRUE: el admin confía en el email que ingresó, no se envía verificación
         const result = await pool.query(
-            `INSERT INTO usuarios_b2b (institucion_id, nombre, email, password_hash, rol) VALUES ($1,$2,$3,$4,$5) RETURNING id, nombre, email, rol`,
+            `INSERT INTO usuarios_b2b (institucion_id, nombre, email, password_hash, rol, email_verified) VALUES ($1,$2,$3,$4,$5,TRUE) RETURNING id, nombre, email, rol`,
             [req.b2bUser.institucion_id, nombre, email.toLowerCase(), hash, userRol]
         );
         // Enviar email de bienvenida al nuevo miembro del staff
@@ -3141,6 +3296,9 @@ app.post('/api/b2b/pacientes', authB2BMiddleware, async (req, res) => {
     try {
         if (!await checkB2BCanDo(req.b2bUser, 'crear_paciente'))
             return res.status(403).json({ error: 'No tenés permisos para crear pacientes' });
+        // Verificar límite de plan y expiración del trial
+        const planCheck = await checkInstPlanForAction(req.b2bUser.institucion_id, 'crear_paciente');
+        if (!planCheck.allowed) return res.status(planCheck.code === 'TRIAL_EXPIRED' ? 402 : 403).json({ error: planCheck.error, code: planCheck.code });
         const { nombre, apellido, fecha_nacimiento, dni, habitacion, diagnostico, obra_social, num_afiliado, contacto_familiar_nombre, contacto_familiar_tel, notas_ingreso, fecha_ingreso, alergias, medico_cabecera, antecedentes } = req.body;
         if (!nombre) return res.status(400).json({ error: 'El nombre es obligatorio' });
         const result = await pool.query(
@@ -4137,6 +4295,11 @@ app.listen(PORT, async () => {
         setInterval(syncMPSubscriptions, 4 * 60 * 60 * 1000); // luego cada 4 horas
         console.log('✅ Sync periódico de suscripciones MP activado (cada 4 horas)');
     }
+
+    // Recordatorios de vencimiento de trial: chequea diariamente
+    setTimeout(checkTrialReminders, 2 * 60 * 1000); // primer chequeo 2min después del boot
+    setInterval(checkTrialReminders, 24 * 60 * 60 * 1000); // luego cada 24 horas
+    console.log('✅ Recordatorios de vencimiento de trial activados (cada 24 horas)');
 
     // Keep-alive: evita que Railway duerma el servidor en planes gratuitos.
     // Se hace un GET a /health propio cada 4 minutos.
