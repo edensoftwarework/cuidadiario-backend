@@ -1929,6 +1929,143 @@ app.delete('/api/share/:id', authMiddleware, async (req, res) => {
 });
 
 // ========== MERCADOPAGO ==========
+// ========== MERCADOPAGO B2B (CuidaDiario PRO) ==========
+// Endpoints: /api/b2b/create-subscription, /api/b2b/webhook/mercadopago, /api/b2b/verify-subscription
+// El external_reference es el id de la institución (instituciones_b2b)
+
+// POST /api/b2b/create-subscription — Crea suscripción MercadoPago para la institución
+app.post('/api/b2b/create-subscription', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+    try {
+        // Obtener datos de la institución
+        const instRes = await pool.query('SELECT id, nombre, email FROM instituciones_b2b WHERE id=$1', [req.b2bUser.institucion_id]);
+        if (instRes.rows.length === 0) return res.status(404).json({ error: 'Institución no encontrada' });
+        const inst = instRes.rows[0];
+        // TODO: parametrizar monto y moneda si hay distintos planes
+        const payload = {
+            reason: 'CuidaDiario PRO',
+            auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: 15000, currency_id: 'ARS' },
+            back_url: `${FRONTEND_URL_PRO}/pages/configuracion.html?mp_success=1`,
+            payer_email: inst.email,
+            external_reference: String(inst.id)
+        };
+        const mp = await mpRequest('/preapproval', 'POST', payload);
+        if (mp.status !== 200 && mp.status !== 201) {
+            console.error('Error MP B2B create-subscription:', mp.body);
+            return res.status(400).json({ error: mp.body?.message || 'Error al crear suscripción en MercadoPago' });
+        }
+        res.json({ init_point: mp.body.init_point, preapproval_id: mp.body.id });
+    } catch (err) {
+        console.error('Error B2B create-subscription:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/b2b/webhook/mercadopago — Webhook MercadoPago para B2B
+app.post('/api/b2b/webhook/mercadopago', async (req, res) => {
+    try {
+        if (!verifyMPWebhookSignature(req)) {
+            console.warn('[MP Webhook B2B] Firma inválida — request rechazado');
+            return res.sendStatus(401);
+        }
+        const body = req.body || {};
+        const type  = body.type  || null;
+        const topic = req.query.topic || body.topic || null;
+        const dataId = body.data?.id || req.query['data.id'] || req.query.id || null;
+        const isPreapprovalEvent =
+            type  === 'subscription_preapproval' ||
+            type  === 'preapproval'              ||
+            topic === 'preapproval';
+        console.log(`[MP Webhook B2B] Recibido — type="${type}" topic="${topic}" dataId="${dataId}"`);
+        if (isPreapprovalEvent && dataId) {
+            const mp = await mpRequest(`/preapproval/${dataId}`);
+            if (mp.status === 200) {
+                const preapproval = mp.body;
+                const instId = parseInt(preapproval.external_reference);
+                if (instId && !isNaN(instId)) {
+                    const isPro = preapproval.status === 'authorized';
+                    if (isPro) {
+                        await pool.query('UPDATE instituciones_b2b SET plan=$1 WHERE id=$2', ['pro', instId]);
+                    } else {
+                        await pool.query('UPDATE instituciones_b2b SET plan=$1 WHERE id=$2', ['basico', instId]);
+                    }
+                    console.log(`[MP Webhook B2B] ✅ Institución ${instId} → plan: ${isPro ? 'pro' : 'basico'} (estado MP: "${preapproval.status}")`);
+                } else {
+                    console.warn(`[MP Webhook B2B] external_reference inválido: "${preapproval.external_reference}"`);
+                }
+            } else {
+                console.warn(`[MP Webhook B2B] No se pudo obtener preapproval "${dataId}" — HTTP ${mp.status}`);
+            }
+        } else {
+            console.log(`[MP Webhook B2B] Evento ignorado (no es preapproval)`);
+        }
+        res.sendStatus(200);
+    } catch (err) {
+        console.error('[MP Webhook B2B] Error:', err.message);
+        res.sendStatus(200);
+    }
+});
+
+// GET /api/b2b/verify-subscription — Verifica el estado de la suscripción MP y actualiza el plan
+app.get('/api/b2b/verify-subscription', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+    if (!MP_ACCESS_TOKEN) {
+        return res.status(400).json({ error: 'MercadoPago no configurado en el servidor' });
+    }
+    try {
+        let authorized = null;
+        const instId = req.b2bUser.institucion_id;
+        // Intento 1: preapproval_id específico enviado por el frontend
+        const preapprovalId = req.query.preapproval_id;
+        if (preapprovalId) {
+            const mp = await mpRequest(`/preapproval/${preapprovalId}`);
+            if (mp.status === 200 && mp.body.status === 'authorized') {
+                const ref = parseInt(mp.body.external_reference);
+                if (ref === instId) {
+                    authorized = mp.body;
+                } else {
+                    console.warn(`[MP Verify B2B] preapproval ${preapprovalId}: external_reference="${mp.body.external_reference}" no coincide con institucion ${instId}`);
+                }
+            }
+        }
+        // Intento 2: buscar por external_reference (cubre cualquier suscripción de la institución)
+        if (!authorized) {
+            const search = await mpRequest(`/preapproval/search?external_reference=${instId}&status=authorized`);
+            if (search.status === 200) {
+                const results = search.body?.results || [];
+                authorized = results.find(p =>
+                    p.status === 'authorized' &&
+                    parseInt(p.external_reference) === instId
+                ) || null;
+            }
+        }
+        if (authorized) {
+            await pool.query('UPDATE instituciones_b2b SET plan=$1 WHERE id=$2', ['pro', instId]);
+            console.log(`[MP Verify B2B] ✅ Institución ${instId} → plan: PRO (preapproval: ${authorized.id})`);
+            return res.json({ plan: 'pro', status: 'authorized' });
+        }
+        // Sin suscripción autorizada — buscar todas para saber el estado real
+        const searchAll = await mpRequest(`/preapproval/search?external_reference=${instId}`);
+        const allResults = searchAll.body?.results || [];
+        const pending    = allResults.find(p => p.status === 'pending');
+        const cancelled  = allResults.find(p => ['cancelled', 'paused', 'expired'].includes(p.status));
+        if (cancelled && !pending) {
+            await pool.query('UPDATE instituciones_b2b SET plan=$1 WHERE id=$2', ['basico', instId]);
+            console.log(`[MP Verify B2B] 🔻 Institución ${instId} → plan: BASICO (estado MP: "${cancelled.status}")`);
+            return res.json({ plan: 'basico', status: cancelled.status, message: 'La suscripción fue cancelada o expiró.' });
+        }
+        console.log(`[MP Verify B2B] Institución ${instId} — estados: ${allResults.map(p => p.status).join(', ') || 'ninguna'}`);
+        return res.json({
+            plan: 'basico',
+            status: pending ? 'pending' : 'not_found',
+            message: pending
+                ? 'El pago está siendo procesado. Puede demorar unos minutos.'
+                : 'No se encontró suscripción activa en MercadoPago.'
+        });
+    } catch (err) {
+        console.error('[MP Verify B2B] Error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 
 function mpRequest(path, method = 'GET', body = null) {
@@ -3901,4 +4038,3 @@ app.listen(PORT, async () => {
         console.log(`🏓 Keep-alive activado → ${BACKEND_URL}/health`);
     }
 });
-////
