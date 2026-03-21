@@ -3464,16 +3464,36 @@ app.post('/api/b2b/medicamentos/:id/toma', authB2BMiddleware, requireB2BRole('ad
         const med = await pool.query('SELECT * FROM medicamentos_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         if (med.rowCount === 0) return res.status(404).json({ error: 'Medicamento no encontrado' });
         const m = med.rows[0];
-        // Register the toma in history
+
+        // Determine stock model first (needed for the stock check below)
+        const instRow = await pool.query('SELECT stock_modelo FROM instituciones_b2b WHERE id=$1', [req.b2bUser.institucion_id]);
+        const stockModelo = instRow.rows[0]?.stock_modelo || 'familiar';
+
+        // STOCK GUARD: block toma if there is no stock remaining
+        if (stockModelo === 'institucion' && m.catalogo_id) {
+            const catRow = await pool.query(
+                'SELECT stock_actual FROM catalogo_medicamentos_b2b WHERE id=$1 AND institucion_id=$2',
+                [m.catalogo_id, req.b2bUser.institucion_id]
+            );
+            const catStock = catRow.rows[0]?.stock_actual ?? 0;
+            if (catStock <= 0) {
+                return res.status(400).json({ error: 'Sin stock disponible en el cat\u00e1logo. Repon\u00e9 el medicamento antes de registrar una toma.', code: 'STOCK_ZERO' });
+            }
+        } else if (m.stock !== null && m.stock <= 0) {
+            return res.status(400).json({ error: 'Sin stock disponible. Actualiz\u00e1 el stock antes de registrar una toma.', code: 'STOCK_ZERO' });
+        }
+
+        // Register the toma in history.
+        // Use NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires' so the stored naive
+        // TIMESTAMP reflects local Argentine time and displays correctly on the frontend.
         const _adminNombre = (req.body._quien && typeof req.body._quien === 'string' && req.body._quien.trim()) ? req.body._quien.trim() : req.b2bUser.nombre;
         const result = await pool.query(
-            `INSERT INTO historial_medicamentos_b2b (institucion_id, paciente_id, medicamento_id, medicamento_nombre, dosis, administrado_por, administrador_nombre, notas)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+            `INSERT INTO historial_medicamentos_b2b
+             (institucion_id, paciente_id, medicamento_id, medicamento_nombre, dosis, administrado_por, administrador_nombre, notas, fecha)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8, NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires') RETURNING *`,
             [req.b2bUser.institucion_id, m.paciente_id, m.id, m.nombre, m.dosis, req.b2bUser.id, _adminNombre, req.body.notas||null]
         );
         // Auto-decrement stock based on institution model
-        const instRow = await pool.query('SELECT stock_modelo FROM instituciones_b2b WHERE id=$1', [req.b2bUser.institucion_id]);
-        const stockModelo = instRow.rows[0]?.stock_modelo || 'familiar';
         if (stockModelo === 'institucion' && m.catalogo_id) {
             // Decrement global catalog stock (never below 0)
             await pool.query(
@@ -4035,12 +4055,23 @@ app.get('/api/b2b/dashboard', authB2BMiddleware, async (req, res) => {
                         FROM pacientes_b2b
                         WHERE institucion_id=$1 AND activo=TRUE AND fecha_egreso IS NULL
                         AND TO_CHAR(fecha_nacimiento,'MM-DD') = TO_CHAR(NOW(),'MM-DD')`, [iid]),
-            pool.query(`SELECT id, nombre,
+            pool.query(`
+                SELECT * FROM (
+                    -- Medicamentos individuales con stock bajo (modelo familiar o sin vínculo a catálogo)
+                    SELECT id::INTEGER, nombre,
                         TRIM(COALESCE(dosis,'') || CASE WHEN frecuencia IS NOT NULL AND frecuencia <> '' THEN ' · ' || frecuencia ELSE '' END) AS dosis_horario,
-                        stock
-                        FROM medicamentos_b2b
-                        WHERE institucion_id=$1 AND activo=TRUE AND stock IS NOT NULL AND stock < 5
-                        ORDER BY stock ASC LIMIT 10`, [iid])
+                        stock, NULL::TEXT AS unidad, 'individual'::TEXT AS tipo
+                    FROM medicamentos_b2b
+                    WHERE institucion_id=$1 AND activo=TRUE AND stock IS NOT NULL AND stock < 5
+                    UNION ALL
+                    -- Medicamentos del catálogo institucional con stock bajo
+                    SELECT id::INTEGER, nombre, presentacion AS dosis_horario,
+                        stock_actual AS stock, unidad, 'catalogo'::TEXT AS tipo
+                    FROM catalogo_medicamentos_b2b
+                    WHERE institucion_id=$1 AND stock_actual IS NOT NULL
+                      AND stock_actual <= COALESCE(stock_minimo, 5)
+                ) combinado
+                ORDER BY stock ASC LIMIT 15`, [iid])
         ]);
         res.json({
             resumen: { pacientes_activos: parseInt(pacientes.rows[0].total), tomas_hoy: parseInt(tomasHoy.rows[0].total), tareas_completadas_hoy: parseInt(tareasHoy.rows[0].total), staff: staff.rows },
