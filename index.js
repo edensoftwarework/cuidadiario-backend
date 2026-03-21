@@ -3748,8 +3748,8 @@ app.post('/api/b2b/tareas/:id/completar', authB2BMiddleware, requireB2BRole('adm
         const t = tarea.rows[0];
         const _compNombre = (req.body._quien && typeof req.body._quien === 'string' && req.body._quien.trim()) ? req.body._quien.trim() : req.b2bUser.nombre;
         const result = await pool.query(
-            `INSERT INTO historial_tareas_b2b (institucion_id, paciente_id, tarea_id, tarea_titulo, completado_por, completador_nombre, notas)
-             VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+            `INSERT INTO historial_tareas_b2b (institucion_id, paciente_id, tarea_id, tarea_titulo, completado_por, completador_nombre, notas, fecha)
+             VALUES ($1,$2,$3,$4,$5,$6,$7, NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires') RETURNING *`,
             [req.b2bUser.institucion_id, t.paciente_id, t.id, t.titulo, req.b2bUser.id, _compNombre, req.body.notas||null]
         );
         res.status(201).json(result.rows[0]);
