@@ -1958,7 +1958,7 @@ app.post('/api/b2b/create-subscription', authB2BMiddleware, requireB2BRole('admi
             reason: planInfo.reason,
             auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: planInfo.amount, currency_id: 'ARS' },
             back_url: `${FRONTEND_URL_PRO}/pages/configuracion.html?mp_success=1&plan=${planKey}`,
-            payer_email: inst.email,
+            payer_email: inst.email || req.b2bUser.email,
             external_reference: String(inst.id),
             ...(testMode ? { free_trial: { frequency: 1, frequency_type: 'days' } } : {})
         };
@@ -2630,9 +2630,9 @@ app.post('/api/b2b/auth/register', async (req, res) => {
         if (exists.rowCount > 0) return res.status(409).json({ error: 'El email ya está registrado' });
 
         const inst = await pool.query(
-            `INSERT INTO instituciones_b2b (nombre, tipo, telefono, plan, trial_started_at)
-             VALUES ($1,$2,$3,'free',NOW()) RETURNING id, plan`,
-            [nombre_institucion, tipo_institucion || 'geriatrico', telefono || null]
+            `INSERT INTO instituciones_b2b (nombre, tipo, telefono, email, plan, trial_started_at)
+             VALUES ($1,$2,$3,$4,'free',NOW()) RETURNING id, plan`,
+            [nombre_institucion, tipo_institucion || 'geriatrico', telefono || null, email.toLowerCase()]
         );
         const institucion_id = inst.rows[0].id;
 
@@ -4066,6 +4066,64 @@ app.delete('/api/b2b/documentos/:id', authB2BMiddleware, async (req, res) => {
 // ============================================================
 // ========== FIN MÓDULO B2B ==========
 // ============================================================
+
+// ============================================================
+// ========== SUPERADMIN — Activación manual de planes =========
+// ============================================================
+// GET /api/admin/institucion/:id — Consulta datos de una institución (para el panel admin)
+app.get('/api/admin/institucion/:id', async (req, res) => {
+    const adminKey    = req.headers['x-admin-key'];
+    const expectedKey = process.env.SUPERADMIN_KEY;
+    if (!expectedKey) return res.status(503).json({ error: 'SUPERADMIN_KEY no configurada en el servidor' });
+    if (!adminKey || adminKey !== expectedKey) return res.status(401).json({ error: 'Clave de administrador inválida' });
+    try {
+        const result = await pool.query(
+            'SELECT id, nombre, tipo, email, telefono, plan, activa, created_at FROM instituciones_b2b WHERE id=$1',
+            [parseInt(req.params.id)]
+        );
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Institución no encontrada' });
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error('[SuperAdmin] get-institucion error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/admin/set-plan
+// Permite a EDEN SoftWork activar un plan manualmente para clientes
+// que pagan por transferencia bancaria o cualquier acuerdo directo.
+// Requiere el header: X-Admin-Key: <SUPERADMIN_KEY (env var en Railway)>
+//
+// Uso (curl):
+//   curl -X POST https://<backend>/api/admin/set-plan \
+//        -H "X-Admin-Key: tu_clave_secreta" \
+//        -H "Content-Type: application/json" \
+//        -d '{"institucion_id": 5, "plan": "pro", "note": "Transferencia 15/03"}'
+// Planes válidos: free | basico | pro
+app.post('/api/admin/set-plan', async (req, res) => {
+    const adminKey   = req.headers['x-admin-key'];
+    const expectedKey = process.env.SUPERADMIN_KEY;
+    if (!expectedKey) return res.status(503).json({ error: 'SUPERADMIN_KEY no configurada en el servidor' });
+    if (!adminKey || adminKey !== expectedKey) return res.status(401).json({ error: 'Clave de administrador inválida' });
+    try {
+        const { institucion_id, plan, note } = req.body;
+        if (!institucion_id || !plan) return res.status(400).json({ error: 'institucion_id y plan son requeridos' });
+        const validPlans = ['free', 'basico', 'pro'];
+        if (!validPlans.includes(plan)) return res.status(400).json({ error: `Plan inválido. Debe ser uno de: ${validPlans.join(', ')}` });
+        const result = await pool.query(
+            'UPDATE instituciones_b2b SET plan=$1 WHERE id=$2 RETURNING id, nombre, plan',
+            [plan, parseInt(institucion_id)]
+        );
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Institución no encontrada' });
+        const inst = result.rows[0];
+        console.log(`[SuperAdmin] ✅ Plan actualizado manualmente — institución ${inst.id} (${inst.nombre}) → ${plan}${note ? ` | Nota: ${note}` : ''}`);
+        res.json({ success: true, institucion_id: inst.id, nombre: inst.nombre, plan: inst.plan });
+    } catch (err) {
+        console.error('[SuperAdmin] set-plan error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
     console.log(`✅ Servidor escuchando en puerto ${PORT}`);
