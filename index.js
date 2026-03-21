@@ -580,6 +580,13 @@ async function runMigrations() {
         await pool.query(`ALTER TABLE usuarios_b2b ADD COLUMN IF NOT EXISTS email_verification_token  TEXT`).catch(() => {});
         await pool.query(`ALTER TABLE usuarios_b2b ADD COLUMN IF NOT EXISTS email_verification_expiry TIMESTAMPTZ`).catch(() => {});
         console.log('✅ Migraciones B2B v6 completadas');
+
+        // MIGRACIONES B2B v7 — Plan 'free' por defecto + columna inicio período de prueba
+        await pool.query(`ALTER TABLE instituciones_b2b ALTER COLUMN plan SET DEFAULT 'free'`).catch(() => {});
+        await pool.query(`ALTER TABLE instituciones_b2b ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMPTZ DEFAULT NOW()`).catch(() => {});
+        // Instituciones ya existentes sin trial_started_at: asignar created_at como inicio de prueba
+        await pool.query(`UPDATE instituciones_b2b SET trial_started_at = created_at WHERE trial_started_at IS NULL`).catch(() => {});
+        console.log('✅ Migraciones B2B v7 completadas');
         // ============================================================
         // FIN MIGRACIONES B2B
         // ============================================================
@@ -1940,14 +1947,22 @@ app.post('/api/b2b/create-subscription', authB2BMiddleware, requireB2BRole('admi
         const instRes = await pool.query('SELECT id, nombre, email FROM instituciones_b2b WHERE id=$1', [req.b2bUser.institucion_id]);
         if (instRes.rows.length === 0) return res.status(404).json({ error: 'Institución no encontrada' });
         const inst = instRes.rows[0];
-        // TODO: parametrizar monto y moneda si hay distintos planes
-        const payload = {
-            reason: 'CuidaDiario PRO',
-            auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: 15000, currency_id: 'ARS' },
-            back_url: `${FRONTEND_URL_PRO}/pages/configuracion.html?mp_success=1`,
-            payer_email: inst.email,
-            external_reference: String(inst.id)
+        const PLANES_MP = {
+            pro:    { reason: 'CuidaDiario PRO — Plan PRO',    amount: 15000 },
+            basico: { reason: 'CuidaDiario PRO — Plan Básico', amount: 7500  }
         };
+        const planKey  = Object.keys(PLANES_MP).includes(req.body.plan) ? req.body.plan : 'pro';
+        const testMode = req.body.test_mode === true;
+        const planInfo = PLANES_MP[planKey];
+        const payload = {
+            reason: planInfo.reason,
+            auto_recurring: { frequency: 1, frequency_type: 'months', transaction_amount: planInfo.amount, currency_id: 'ARS' },
+            back_url: `${FRONTEND_URL_PRO}/pages/configuracion.html?mp_success=1&plan=${planKey}`,
+            payer_email: inst.email,
+            external_reference: String(inst.id),
+            ...(testMode ? { free_trial: { frequency: 1, frequency_type: 'days' } } : {})
+        };
+        console.log(`[MP B2B] create-subscription — institución ${inst.id}, plan: ${planKey}, testMode: ${testMode}`);
         const mp = await mpRequest('/preapproval', 'POST', payload);
         if (mp.status !== 200 && mp.status !== 201) {
             console.error('Error MP B2B create-subscription:', mp.body);
@@ -2615,7 +2630,8 @@ app.post('/api/b2b/auth/register', async (req, res) => {
         if (exists.rowCount > 0) return res.status(409).json({ error: 'El email ya está registrado' });
 
         const inst = await pool.query(
-            'INSERT INTO instituciones_b2b (nombre, tipo, telefono) VALUES ($1,$2,$3) RETURNING id',
+            `INSERT INTO instituciones_b2b (nombre, tipo, telefono, plan, trial_started_at)
+             VALUES ($1,$2,$3,'free',NOW()) RETURNING id, plan`,
             [nombre_institucion, tipo_institucion || 'geriatrico', telefono || null]
         );
         const institucion_id = inst.rows[0].id;
@@ -2714,7 +2730,7 @@ app.post('/api/b2b/auth/register', async (req, res) => {
                 rol: user.rows[0].rol,
                 institucion_id,
                 institucion_nombre: nombre_institucion,
-                plan: 'free',
+                plan: inst.rows[0].plan,
                 institucion_permisos: {},
                 onboarding_done: false,
                 email_verified: emailVerifiedFinal
@@ -2993,6 +3009,47 @@ app.post('/api/b2b/staff', authB2BMiddleware, requireB2BRole('admin_institucion'
             `INSERT INTO usuarios_b2b (institucion_id, nombre, email, password_hash, rol) VALUES ($1,$2,$3,$4,$5) RETURNING id, nombre, email, rol`,
             [req.b2bUser.institucion_id, nombre, email.toLowerCase(), hash, userRol]
         );
+        // Enviar email de bienvenida al nuevo miembro del staff
+        try {
+            const instRes2 = await pool.query('SELECT nombre FROM instituciones_b2b WHERE id=$1', [req.b2bUser.institucion_id]);
+            const instNombre = instRes2.rows[0]?.nombre || 'tu institución';
+            const rolLabels = { admin_institucion: 'Administrador', cuidador_staff: 'Personal / Operativo', familiar: 'Familiar (solo lectura)', medico: 'Médico / Profesional' };
+            const rolLabel = rolLabels[userRol] || userRol;
+            const loginUrl = `${FRONTEND_URL_PRO}/index.html`;
+            await sendEmail({
+                to: email.toLowerCase(),
+                subject: `¡Bienvenido/a a CuidaDiario PRO! Tu cuenta está lista`,
+                html: `
+                    <div style="font-family:'Segoe UI',Arial,sans-serif;max-width:560px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;border:1px solid #E5E7EB">
+                        <div style="background:linear-gradient(135deg,#0D2B6B,#1565C0);padding:28px 32px;text-align:center">
+                            <div style="font-size:2.5rem;margin-bottom:8px">🏥</div>
+                            <div style="color:#fff;font-size:1.3rem;font-weight:800">CuidaDiario PRO</div>
+                        </div>
+                        <div style="padding:28px 32px">
+                            <h2 style="font-size:1.2rem;color:#1F2937;margin-bottom:12px">¡Hola ${nombre}!</h2>
+                            <p style="color:#374151;line-height:1.6;margin-bottom:16px">
+                                El administrador de <strong>${instNombre}</strong> creó tu cuenta en <strong>CuidaDiario PRO</strong>.
+                                Ya podés iniciar sesión con tus credenciales.
+                            </p>
+                            <div style="background:#F0F4FF;border-radius:10px;padding:16px 20px;margin-bottom:20px">
+                                <div style="font-size:.85rem;color:#4B5563;margin-bottom:6px;font-weight:600">Tus datos de acceso:</div>
+                                <div style="color:#1E40AF;margin-bottom:4px">📧 <strong>Email:</strong> ${email.toLowerCase()}</div>
+                                <div style="color:#1E40AF;margin-bottom:4px">🔑 <strong>Contraseña:</strong> la que te compartió el administrador</div>
+                                <div style="color:#1E40AF">👤 <strong>Rol:</strong> ${rolLabel}</div>
+                            </div>
+                            <a href="${loginUrl}" style="display:block;background:#1565C0;color:#fff;text-decoration:none;text-align:center;padding:14px 24px;border-radius:8px;font-weight:700;font-size:1rem;margin-bottom:20px">
+                                Iniciar sesión →
+                            </a>
+                            <p style="font-size:.82rem;color:#9CA3AF">
+                                Si no esperabas este mensaje, ignoralo sin problema.<br>
+                                ¿Necesitás ayuda? <a href="mailto:edensoftwarework@gmail.com" style="color:#1565C0">edensoftwarework@gmail.com</a>
+                            </p>
+                        </div>
+                    </div>`
+            });
+        } catch (emailErr) {
+            console.warn('POST /api/b2b/staff — email de bienvenida no enviado:', emailErr.message);
+        }
         res.status(201).json(result.rows[0]);
     } catch (err) {
         console.error('POST /api/b2b/staff:', err.message);
