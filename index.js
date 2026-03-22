@@ -592,6 +592,12 @@ async function runMigrations() {
         // MIGRACIONES B2B v8 — Modo estación compartida persistente (cross-device)
         await pool.query(`ALTER TABLE instituciones_b2b ADD COLUMN IF NOT EXISTS shared_mode BOOLEAN DEFAULT FALSE`).catch(() => {});
         console.log('✅ Migraciones B2B v8 completadas');
+
+        // MIGRACIONES B2B v9 — Preferencias de alertas en DB + tracking descuento de precio introductorio
+        await pool.query(`ALTER TABLE usuarios_b2b ADD COLUMN IF NOT EXISTS notif_prefs JSONB DEFAULT '{}'`).catch(() => {});
+        await pool.query(`ALTER TABLE instituciones_b2b ADD COLUMN IF NOT EXISTS mp_preapproval_id TEXT`).catch(() => {});
+        await pool.query(`ALTER TABLE instituciones_b2b ADD COLUMN IF NOT EXISTS discount_expires_at TIMESTAMPTZ`).catch(() => {});
+        console.log('✅ Migraciones B2B v9 completadas');
         // ============================================================
         // FIN MIGRACIONES B2B
         // ============================================================
@@ -1953,8 +1959,8 @@ app.post('/api/b2b/create-subscription', authB2BMiddleware, requireB2BRole('admi
         if (instRes.rows.length === 0) return res.status(404).json({ error: 'Institución no encontrada' });
         const inst = instRes.rows[0];
         const PLANES_MP = {
-            pro:    { reason: 'CuidaDiario PRO — Plan PRO',    amount: 15000 },
-            basico: { reason: 'CuidaDiario PRO — Plan Básico', amount: 7500  }
+            pro:    { reason: 'CuidaDiario PRO — Plan PRO',    amount: 15000, amount_full: 30000 },
+            basico: { reason: 'CuidaDiario PRO — Plan Básico', amount: 10000, amount_full: 20000 }
         };
         const planKey  = Object.keys(PLANES_MP).includes(req.body.plan) ? req.body.plan : 'pro';
         const testMode = req.body.test_mode === true;
@@ -2004,8 +2010,26 @@ app.post('/api/b2b/webhook/mercadopago', async (req, res) => {
                 if (instId && !isNaN(instId)) {
                     if (preapproval.status === 'authorized') {
                         const plan = _mpPlanFromPreapproval(preapproval);
-                        await pool.query('UPDATE instituciones_b2b SET plan=$1 WHERE id=$2', [plan, instId]);
+                        await pool.query(
+                            `UPDATE instituciones_b2b
+                             SET plan=$1, mp_preapproval_id=$3,
+                                 discount_expires_at = CASE WHEN discount_expires_at IS NULL THEN NOW() + INTERVAL '6 months' ELSE discount_expires_at END
+                             WHERE id=$2`,
+                            [plan, instId, preapproval.id]
+                        );
                         console.log(`[MP Webhook B2B] ✅ Institución ${instId} → plan: ${plan.toUpperCase()} (estado MP: "${preapproval.status}")`);
+                        // Auto-escalate price if discount period has expired
+                        const discountCheck = await pool.query('SELECT discount_expires_at FROM instituciones_b2b WHERE id=$1', [instId]);
+                        const expiry = discountCheck.rows[0]?.discount_expires_at;
+                        if (expiry && new Date() > new Date(expiry)) {
+                            const fullAmounts = { pro: 30000, basico: 20000 };
+                            const fullAmount = fullAmounts[plan];
+                            const currentAmount = preapproval?.auto_recurring?.transaction_amount;
+                            if (fullAmount && currentAmount < fullAmount) {
+                                await mpRequest(`/preapproval/${preapproval.id}`, 'PATCH', { auto_recurring: { transaction_amount: fullAmount } });
+                                console.log(`[MP Webhook B2B] 💰 Período promocional expirado — institución ${instId} actualizada a $${fullAmount}/mes`);
+                            }
+                        }
                     } else if (['cancelled', 'paused', 'expired'].includes(preapproval.status)) {
                         await pool.query('UPDATE instituciones_b2b SET plan=$1 WHERE id=$2', ['free', instId]);
                         console.log(`[MP Webhook B2B] 🔻 Institución ${instId} → plan: free (estado MP: "${preapproval.status}")`);
@@ -2030,11 +2054,15 @@ app.post('/api/b2b/webhook/mercadopago', async (req, res) => {
 
 // Helper: determina el plan (pro/basico) a partir de un objeto preapproval de MP
 function _mpPlanFromPreapproval(preapproval) {
-    const amount = preapproval?.auto_recurring?.transaction_amount;
     const reason = (preapproval?.reason || '').toLowerCase();
-    if (amount >= 14000 || reason.includes('pro')) return 'pro';
-    if (amount >= 6000  || reason.includes('básico') || reason.includes('basico')) return 'basico';
-    return 'basico'; // fallback conservador
+    const amount = preapproval?.auto_recurring?.transaction_amount;
+    // Detectar por descripción (más fiable — los precios intro y completo se superponen)
+    if (reason.includes('plan pro')) return 'pro';
+    if (reason.includes('básico') || reason.includes('basico')) return 'basico';
+    // Fallback por monto: PRO intro=15000, full=30000; Básico intro=10000, full=20000
+    // Umbral conservador: ≥25000 → PRO full; resto → básico
+    if (amount >= 25000) return 'pro';
+    return 'basico';
 }
 
 // GET /api/b2b/verify-subscription — Verifica el estado de la suscripción MP y actualiza el plan
@@ -2071,7 +2099,13 @@ app.get('/api/b2b/verify-subscription', authB2BMiddleware, requireB2BRole('admin
 
         if (preapproval.status === 'authorized') {
             const plan = _mpPlanFromPreapproval(preapproval);
-            await pool.query('UPDATE instituciones_b2b SET plan=$1 WHERE id=$2', [plan, instId]);
+            await pool.query(
+                `UPDATE instituciones_b2b
+                 SET plan=$1, mp_preapproval_id=$3,
+                     discount_expires_at = CASE WHEN discount_expires_at IS NULL THEN NOW() + INTERVAL '6 months' ELSE discount_expires_at END
+                 WHERE id=$2`,
+                [plan, instId, preapproval.id]
+            );
             console.log(`[MP Verify B2B] ✅ Institución ${instId} → plan: ${plan.toUpperCase()} (preapproval: ${preapproval.id})`);
             return res.json({ plan, status: 'authorized' });
         }
@@ -2898,7 +2932,7 @@ app.post('/api/b2b/auth/login', authRateLimit, async (req, res) => {
         if (!email || !password) return res.status(400).json({ error: 'Email y contraseña requeridos' });
 
         const result = await pool.query(
-            `SELECT u.*, i.nombre as institucion_nombre, i.plan, i.activa as institucion_activa, i.permisos_equipo, i.onboarding_done, i.stock_modelo, i.shared_mode, i.trial_started_at
+            `SELECT u.*, i.nombre as institucion_nombre, i.plan, i.activa as institucion_activa, i.permisos_equipo, i.onboarding_done, i.stock_modelo, i.shared_mode, i.trial_started_at, i.discount_expires_at
              FROM usuarios_b2b u JOIN instituciones_b2b i ON u.institucion_id = i.id
              WHERE u.email = $1`,
             [email.toLowerCase()]
@@ -2916,7 +2950,7 @@ app.post('/api/b2b/auth/login', authRateLimit, async (req, res) => {
             { id: user.id, institucion_id: user.institucion_id, rol: user.rol, email: user.email, nombre: user.nombre, b2b: true, email_verified: !!user.email_verified },
             JWT_SECRET, { expiresIn: '30d' }
         );
-        res.json({ token, user: { id: user.id, nombre: user.nombre, email: user.email, rol: user.rol, institucion_id: user.institucion_id, institucion_nombre: user.institucion_nombre, plan: user.plan, institucion_permisos: user.permisos_equipo || {}, onboarding_done: !!user.onboarding_done, email_verified: !!user.email_verified, stock_modelo: user.stock_modelo || 'familiar', shared_mode: !!user.shared_mode, trial_started_at: user.trial_started_at || null } });
+        res.json({ token, user: { id: user.id, nombre: user.nombre, email: user.email, rol: user.rol, institucion_id: user.institucion_id, institucion_nombre: user.institucion_nombre, plan: user.plan, institucion_permisos: user.permisos_equipo || {}, onboarding_done: !!user.onboarding_done, email_verified: !!user.email_verified, stock_modelo: user.stock_modelo || 'familiar', shared_mode: !!user.shared_mode, trial_started_at: user.trial_started_at || null, notif_prefs: user.notif_prefs || {}, discount_expires_at: user.discount_expires_at || null } });
     } catch (err) {
         console.error('POST /api/b2b/auth/login:', err.message);
         res.status(500).json({ error: 'Error al iniciar sesión' });
@@ -2967,6 +3001,31 @@ app.patch('/api/b2b/auth/me', authB2BMiddleware, async (req, res) => {
     } catch (err) {
         console.error('PATCH /api/b2b/auth/me:', err.message);
         res.status(500).json({ error: 'Error al actualizar perfil' });
+    }
+});
+
+// GET /api/b2b/me/notif-prefs — Obtener preferencias de alertas del dashboard
+app.get('/api/b2b/me/notif-prefs', authB2BMiddleware, async (req, res) => {
+    try {
+        const r = await pool.query('SELECT notif_prefs FROM usuarios_b2b WHERE id=$1', [req.b2bUser.id]);
+        res.json(r.rows[0]?.notif_prefs || {});
+    } catch (err) {
+        console.error('GET /api/b2b/me/notif-prefs:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// PATCH /api/b2b/me/notif-prefs — Guardar preferencias de alertas del dashboard
+app.patch('/api/b2b/me/notif-prefs', authB2BMiddleware, async (req, res) => {
+    try {
+        const prefs = req.body;
+        if (typeof prefs !== 'object' || Array.isArray(prefs))
+            return res.status(400).json({ error: 'Formato de preferencias inválido' });
+        await pool.query('UPDATE usuarios_b2b SET notif_prefs=$1 WHERE id=$2', [JSON.stringify(prefs), req.b2bUser.id]);
+        res.json({ ok: true });
+    } catch (err) {
+        console.error('PATCH /api/b2b/me/notif-prefs:', err.message);
+        res.status(500).json({ error: err.message });
     }
 });
 
@@ -3217,10 +3276,16 @@ app.post('/api/b2b/staff', authB2BMiddleware, requireB2BRole('admin_institucion'
 app.patch('/api/b2b/staff/:id', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
     try {
         const { id } = req.params;
-        const { nombre, rol, activo, password } = req.body;
+        const { nombre, email, rol, activo, password } = req.body;
         const check = await pool.query('SELECT id FROM usuarios_b2b WHERE id=$1 AND institucion_id=$2', [id, req.b2bUser.institucion_id]);
         if (check.rowCount === 0) return res.status(404).json({ error: 'Staff no encontrado' });
         if (nombre) await pool.query('UPDATE usuarios_b2b SET nombre=$1 WHERE id=$2', [nombre, id]);
+        if (email) {
+            const emailLower = email.toLowerCase().trim();
+            const conflict = await pool.query('SELECT id FROM usuarios_b2b WHERE email=$1 AND id<>$2', [emailLower, id]);
+            if (conflict.rowCount > 0) return res.status(409).json({ error: 'El email ya está en uso por otro usuario' });
+            await pool.query('UPDATE usuarios_b2b SET email=$1 WHERE id=$2', [emailLower, id]);
+        }
         if (rol) await pool.query('UPDATE usuarios_b2b SET rol=$1 WHERE id=$2', [rol, id]);
         if (activo !== undefined) await pool.query('UPDATE usuarios_b2b SET activo=$1 WHERE id=$2', [activo, id]);
         if (password) { const h = await bcrypt.hash(password, SALT_ROUNDS); await pool.query('UPDATE usuarios_b2b SET password_hash=$1 WHERE id=$2', [h, id]); }
@@ -4183,6 +4248,18 @@ app.post('/api/b2b/documentos', authB2BMiddleware, async (req, res) => {
         // Base64 de 5 MB ≈ 6.8 MB de texto; con margen: 7 MB de chars
         if (datos.length > 7 * 1024 * 1024)
             return res.status(413).json({ error: 'El archivo supera el límite de 5 MB' });
+        // Límite de almacenamiento por institución: 200 MB de datos base64
+        // (Railway Hobby plan: 5 GB total — 200 MB/institución deja margen para muchas instituciones)
+        const DOC_LIMIT = 200 * 1024 * 1024;
+        const storageCheck = await pool.query(
+            `SELECT COALESCE(SUM(LENGTH(datos)), 0) AS total FROM documentos_b2b WHERE institucion_id=$1`,
+            [req.b2bUser.institucion_id]
+        );
+        const usedBytes = parseInt(storageCheck.rows[0].total);
+        if (usedBytes + datos.length > DOC_LIMIT) {
+            const usedMB = (usedBytes / 1024 / 1024).toFixed(1);
+            return res.status(413).json({ error: `Límite de almacenamiento alcanzado (${usedMB} MB de 200 MB usados). Eliminá documentos anteriores para liberar espacio.` });
+        }
         const tamanio_bytes = Math.round(datos.length * 0.75);
         const result = await pool.query(
             `INSERT INTO documentos_b2b (institucion_id, paciente_id, nombre_archivo, tipo_mime, tamanio_bytes, datos, subido_por, subido_nombre)
