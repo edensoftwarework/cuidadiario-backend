@@ -179,7 +179,8 @@ app.use(cors({
     credentials: true
 }));
 app.use('/api/paypal/webhook', express.raw({ type: 'application/json' }));
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // ========== VAPID — Web Push (NUEVO) ==========
 const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY;
