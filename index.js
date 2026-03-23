@@ -3577,19 +3577,16 @@ app.post('/api/b2b/medicamentos/:id/toma', authB2BMiddleware, requireB2BRole('ad
         if (med.rowCount === 0) return res.status(404).json({ error: 'Medicamento no encontrado' });
         const m = med.rows[0];
 
-        // Determine stock model first (needed for the stock check below)
-        const instRow = await pool.query('SELECT stock_modelo FROM instituciones_b2b WHERE id=$1', [req.b2bUser.institucion_id]);
-        const stockModelo = instRow.rows[0]?.stock_modelo || 'familiar';
-
         // STOCK GUARD: block toma if there is no stock remaining
-        if (stockModelo === 'institucion' && m.catalogo_id) {
+        // Hybrid model: if linked to a catalog item, check catalog stock regardless of stock_modelo field
+        if (m.catalogo_id) {
             const catRow = await pool.query(
                 'SELECT stock_actual FROM catalogo_medicamentos_b2b WHERE id=$1 AND institucion_id=$2',
                 [m.catalogo_id, req.b2bUser.institucion_id]
             );
             const catStock = catRow.rows[0]?.stock_actual ?? 0;
             if (catStock <= 0) {
-                return res.status(400).json({ error: 'Sin stock disponible en el cat\u00e1logo. Repon\u00e9 el medicamento antes de registrar una toma.', code: 'STOCK_ZERO' });
+                return res.status(400).json({ error: 'Sin stock disponible en el cat\u00e1logo. Repon\u00e9 el insumo antes de registrar una toma.', code: 'STOCK_ZERO' });
             }
         } else if (m.stock !== null && m.stock <= 0) {
             return res.status(400).json({ error: 'Sin stock disponible. Actualiz\u00e1 el stock antes de registrar una toma.', code: 'STOCK_ZERO' });
@@ -3605,15 +3602,15 @@ app.post('/api/b2b/medicamentos/:id/toma', authB2BMiddleware, requireB2BRole('ad
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8, NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires') RETURNING *`,
             [req.b2bUser.institucion_id, m.paciente_id, m.id, m.nombre, m.dosis, req.b2bUser.id, _adminNombre, req.body.notas||null]
         );
-        // Auto-decrement stock based on institution model
-        if (stockModelo === 'institucion' && m.catalogo_id) {
-            // Decrement global catalog stock (never below 0)
+        // Auto-decrement stock — hybrid model: catalog wins when linked, else per-patient/individual stock
+        if (m.catalogo_id) {
+            // Decrement catalog stock (institutional or patient-specific), never below 0
             await pool.query(
                 'UPDATE catalogo_medicamentos_b2b SET stock_actual = GREATEST(0, stock_actual - 1), updated_at = NOW() WHERE id=$1 AND institucion_id=$2',
                 [m.catalogo_id, req.b2bUser.institucion_id]
             );
         } else if (m.stock !== null && m.stock > 0) {
-            // Decrement per-patient stock (familiar model or non-cataloged)
+            // Decrement individual/manual stock (non-cataloged)
             await pool.query(
                 'UPDATE medicamentos_b2b SET stock = GREATEST(0, stock - 1) WHERE id=$1 AND institucion_id=$2',
                 [m.id, req.b2bUser.institucion_id]
