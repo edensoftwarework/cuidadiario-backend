@@ -2700,46 +2700,78 @@ app.delete('/api/notas/:id', authMiddleware, async (req, res) => {
  * Retorna { allowed: true } o { allowed: false, error, code? }
  */
 async function checkInstPlanForAction(instId, action) {
-    const r = await pool.query('SELECT plan, trial_started_at FROM instituciones_b2b WHERE id=$1', [instId]);
+    const r = await pool.query(
+        `SELECT plan, trial_started_at,
+            (SELECT COUNT(*) FROM pacientes_b2b WHERE institucion_id=$1 AND activo=TRUE AND fecha_egreso IS NULL) AS pacientes_count,
+            (SELECT COUNT(*) FROM usuarios_b2b WHERE institucion_id=$1 AND activo=TRUE) AS staff_count
+         FROM instituciones_b2b WHERE id=$1`,
+        [instId]
+    );
     const inst = r.rows[0];
     if (!inst) return { allowed: false, error: 'Institución no encontrada' };
+
+    const pacientesCount = parseInt(inst.pacientes_count) || 0;
+    const staffCount = parseInt(inst.staff_count) || 0;
 
     // Verificar expiración del trial (plan 'free' = período de prueba)
     if (inst.plan === 'free') {
         const started = inst.trial_started_at ? new Date(inst.trial_started_at) : new Date();
         const daysDiff = (Date.now() - started.getTime()) / (1000 * 60 * 60 * 24);
         if (daysDiff > 60) {
-            return {
-                allowed: false,
-                code: 'TRIAL_EXPIRED',
-                error: 'Tu período de prueba de 60 días ha vencido. Activá un plan desde Configuración para continuar.'
-            };
+            // Permitir solo lectura y modificaciones/eliminaciones de pacientes y staff
+            // (para que puedan reducir el conteo antes de contratar Básico)
+            const allowedInExpiredTrial = ['editar_paciente', 'eliminar_paciente', 'archivar_paciente', 'editar_staff', 'eliminar_staff'];
+            if (!allowedInExpiredTrial.includes(action)) {
+                return {
+                    allowed: false,
+                    code: 'TRIAL_EXPIRED',
+                    pacientes_count: pacientesCount,
+                    staff_count: staffCount,
+                    can_use_basico: pacientesCount <= 20 && staffCount <= 5,
+                    error: 'Tu período de prueba de 60 días ha vencido. Activá un plan desde Configuración para continuar.'
+                };
+            }
         }
     }
 
     // Verificar límites del plan Básico
     if (inst.plan === 'basico') {
         if (action === 'crear_paciente') {
-            const cnt = await pool.query(
-                'SELECT COUNT(*) as c FROM pacientes_b2b WHERE institucion_id=$1 AND activo=TRUE AND fecha_egreso IS NULL',
-                [instId]
-            );
-            if (parseInt(cnt.rows[0].c) >= 20) {
+            if (pacientesCount >= 20) {
                 return { allowed: false, error: 'Tu plan Básico permite hasta 20 pacientes activos. Actualizá a PRO para agregar más.' };
             }
         }
         if (action === 'crear_staff') {
-            const cnt = await pool.query(
-                'SELECT COUNT(*) as c FROM usuarios_b2b WHERE institucion_id=$1 AND activo=TRUE',
-                [instId]
-            );
-            if (parseInt(cnt.rows[0].c) >= 5) {
+            if (staffCount >= 5) {
                 return { allowed: false, error: 'Tu plan Básico permite hasta 5 miembros del equipo. Actualizá a PRO para agregar más.' };
             }
         }
     }
 
     return { allowed: true };
+}
+
+/**
+ * Middleware Express: bloquea cualquier escritura clínica si el trial expiró.
+ * Se aplica a todos los endpoints POST/PATCH/PUT de datos clínicos.
+ */
+async function requireActivePlan(req, res, next) {
+    try {
+        const check = await checkInstPlanForAction(req.b2bUser.institucion_id, 'accion_clinica');
+        if (!check.allowed) {
+            return res.status(403).json({
+                error: check.error,
+                code: check.code || 'PLAN_REQUIRED',
+                pacientes_count: check.pacientes_count,
+                staff_count: check.staff_count,
+                can_use_basico: check.can_use_basico
+            });
+        }
+        next();
+    } catch (err) {
+        console.error('requireActivePlan:', err.message);
+        next(); // ante fallo de la verificación, no bloquear
+    }
 }
 
 // ---------- B2B: Middleware de autenticación ----------
@@ -3157,9 +3189,18 @@ app.post('/api/b2b/auth/resend-verification', authB2BMiddleware, async (req, res
 // GET /api/b2b/institucion
 app.get('/api/b2b/institucion', authB2BMiddleware, async (req, res) => {
     try {
-        const result = await pool.query('SELECT * FROM instituciones_b2b WHERE id=$1', [req.b2bUser.institucion_id]);
+        const result = await pool.query(
+            `SELECT i.*,
+                (SELECT COUNT(*) FROM pacientes_b2b WHERE institucion_id=i.id AND activo=TRUE AND fecha_egreso IS NULL) AS pacientes_count,
+                (SELECT COUNT(*) FROM usuarios_b2b WHERE institucion_id=i.id AND activo=TRUE) AS staff_count
+             FROM instituciones_b2b i WHERE i.id=$1`,
+            [req.b2bUser.institucion_id]
+        );
         if (result.rowCount === 0) return res.status(404).json({ error: 'Institución no encontrada' });
-        res.json(result.rows[0]);
+        const inst = result.rows[0];
+        inst.pacientes_count = parseInt(inst.pacientes_count) || 0;
+        inst.staff_count = parseInt(inst.staff_count) || 0;
+        res.json(inst);
     } catch (err) {
         console.error('GET /api/b2b/institucion:', err.message);
         res.status(500).json({ error: 'Error al obtener institución' });
@@ -3507,7 +3548,7 @@ app.get('/api/b2b/medicamentos', authB2BMiddleware, async (req, res) => {
 });
 
 // POST /api/b2b/medicamentos
-app.post('/api/b2b/medicamentos', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.post('/api/b2b/medicamentos', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), requireActivePlan, async (req, res) => {
     try {
         const { paciente_id, nombre, dosis, frecuencia, hora_inicio, hora_fin, horarios_custom, instrucciones, stock, catalogo_id } = req.body;
         if (!paciente_id || !nombre) return res.status(400).json({ error: 'paciente_id y nombre obligatorios' });
@@ -3525,7 +3566,7 @@ app.post('/api/b2b/medicamentos', authB2BMiddleware, requireB2BRole('admin_insti
 });
 
 // POST /api/b2b/medicamentos/:id/toma
-app.post('/api/b2b/medicamentos/:id/toma', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.post('/api/b2b/medicamentos/:id/toma', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), requireActivePlan, async (req, res) => {
     try {
         const med = await pool.query('SELECT * FROM medicamentos_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         if (med.rowCount === 0) return res.status(404).json({ error: 'Medicamento no encontrado' });
@@ -3644,7 +3685,7 @@ app.get('/api/b2b/catalogo', authB2BMiddleware, async (req, res) => {
 });
 
 // POST /api/b2b/catalogo
-app.post('/api/b2b/catalogo', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+app.post('/api/b2b/catalogo', authB2BMiddleware, requireB2BRole('admin_institucion'), requireActivePlan, async (req, res) => {
     try {
         const { nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo } = req.body;
         if (!nombre) return res.status(400).json({ error: 'nombre obligatorio' });
@@ -3711,7 +3752,7 @@ app.get('/api/b2b/citas', authB2BMiddleware, async (req, res) => {
 });
 
 // POST /api/b2b/citas
-app.post('/api/b2b/citas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.post('/api/b2b/citas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), requireActivePlan, async (req, res) => {
     try {
         const { paciente_id, titulo, descripcion, fecha, medico, especialidad, lugar } = req.body;
         if (!paciente_id || !titulo || !fecha) return res.status(400).json({ error: 'paciente_id, titulo y fecha obligatorios' });
@@ -3790,7 +3831,7 @@ app.get('/api/b2b/tareas', authB2BMiddleware, async (req, res) => {
 });
 
 // POST /api/b2b/tareas
-app.post('/api/b2b/tareas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.post('/api/b2b/tareas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), requireActivePlan, async (req, res) => {
     try {
         const { paciente_id, titulo, descripcion, categoria, frecuencia, hora } = req.body;
         if (!paciente_id || !titulo) return res.status(400).json({ error: 'paciente_id y titulo obligatorios' });
@@ -3807,7 +3848,7 @@ app.post('/api/b2b/tareas', authB2BMiddleware, requireB2BRole('admin_institucion
 });
 
 // POST /api/b2b/tareas/:id/completar
-app.post('/api/b2b/tareas/:id/completar', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.post('/api/b2b/tareas/:id/completar', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), requireActivePlan, async (req, res) => {
     try {
         const tarea = await pool.query('SELECT * FROM tareas_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         if (tarea.rowCount === 0) return res.status(404).json({ error: 'Tarea no encontrada' });
@@ -3872,7 +3913,7 @@ app.get('/api/b2b/sintomas', authB2BMiddleware, async (req, res) => {
 });
 
 // POST /api/b2b/sintomas
-app.post('/api/b2b/sintomas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.post('/api/b2b/sintomas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), requireActivePlan, async (req, res) => {
     try {
         const { paciente_id, descripcion, intensidad } = req.body;
         if (!paciente_id || !descripcion) return res.status(400).json({ error: 'paciente_id y descripcion obligatorios' });
@@ -3937,7 +3978,7 @@ app.get('/api/b2b/signos-vitales', authB2BMiddleware, async (req, res) => {
 });
 
 // POST /api/b2b/signos-vitales
-app.post('/api/b2b/signos-vitales', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.post('/api/b2b/signos-vitales', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), requireActivePlan, async (req, res) => {
     try {
         const { paciente_id, tipo, valor, unidad, notas } = req.body;
         if (!paciente_id || !tipo || !valor) return res.status(400).json({ error: 'paciente_id, tipo y valor obligatorios' });
@@ -4046,7 +4087,7 @@ app.get('/api/b2b/notas', authB2BMiddleware, async (req, res) => {
 });
 
 // POST /api/b2b/notas
-app.post('/api/b2b/notas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.post('/api/b2b/notas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), requireActivePlan, async (req, res) => {
     try {
         const { paciente_id, titulo, contenido, urgente } = req.body;
         if (!paciente_id) return res.status(400).json({ error: 'paciente_id obligatorio' });
@@ -4238,7 +4279,7 @@ app.get('/api/b2b/reporte/export', authB2BMiddleware, async (req, res) => {
 // ---------- B2B: DOCUMENTOS ADJUNTOS ----------
 
 // POST /api/b2b/documentos — subir documento (base64) para un paciente (máx 5 MB)
-app.post('/api/b2b/documentos', authB2BMiddleware, async (req, res) => {
+app.post('/api/b2b/documentos', authB2BMiddleware, requireActivePlan, async (req, res) => {
     try {
         const { paciente_id, nombre_archivo, tipo_mime, datos } = req.body;
         if (!paciente_id || !nombre_archivo || !datos)
