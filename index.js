@@ -598,6 +598,11 @@ async function runMigrations() {
         await pool.query(`ALTER TABLE instituciones_b2b ADD COLUMN IF NOT EXISTS mp_preapproval_id TEXT`).catch(() => {});
         await pool.query(`ALTER TABLE instituciones_b2b ADD COLUMN IF NOT EXISTS discount_expires_at TIMESTAMPTZ`).catch(() => {});
         console.log('✅ Migraciones B2B v9 completadas');
+
+        // MIGRACIONES B2B v10 — Catálogo híbrido: insumos específicos por paciente
+        // paciente_id NULL = insumo institucional general; paciente_id != NULL = insumo propio del paciente
+        await pool.query(`ALTER TABLE catalogo_medicamentos_b2b ADD COLUMN IF NOT EXISTS paciente_id INTEGER REFERENCES pacientes_b2b(id) ON DELETE SET NULL`).catch(() => {});
+        console.log('✅ Migraciones B2B v10 completadas');
         // ============================================================
         // FIN MIGRACIONES B2B
         // ============================================================
@@ -3660,7 +3665,11 @@ app.delete('/api/b2b/medicamentos/:id', authB2BMiddleware, requireB2BRole('admin
 app.get('/api/b2b/catalogo/stock-bajo', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
     try {
         const result = await pool.query(
-            'SELECT * FROM catalogo_medicamentos_b2b WHERE institucion_id=$1 AND activo=TRUE AND stock_actual <= stock_minimo ORDER BY stock_actual ASC',
+            `SELECT c.*, p.nombre AS paciente_nombre, p.apellido AS paciente_apellido
+             FROM catalogo_medicamentos_b2b c
+             LEFT JOIN pacientes_b2b p ON c.paciente_id = p.id
+             WHERE c.institucion_id=$1 AND c.activo=TRUE AND c.stock_actual <= c.stock_minimo
+             ORDER BY c.stock_actual ASC`,
             [req.b2bUser.institucion_id]
         );
         res.json(result.rows);
@@ -3671,13 +3680,27 @@ app.get('/api/b2b/catalogo/stock-bajo', authB2BMiddleware, requireB2BRole('admin
 });
 
 // GET /api/b2b/catalogo
+// ?paciente_id=X → insumos específicos del paciente X
+// sin parámetro   → insumos institucionales (paciente_id IS NULL)
 app.get('/api/b2b/catalogo', authB2BMiddleware, async (req, res) => {
     try {
-        const result = await pool.query(
-            'SELECT * FROM catalogo_medicamentos_b2b WHERE institucion_id=$1 AND activo=TRUE ORDER BY nombre',
-            [req.b2bUser.institucion_id]
-        );
-        res.json(result.rows);
+        const { paciente_id } = req.query;
+        let query, params;
+        if (paciente_id) {
+            query = `SELECT c.*, p.nombre AS paciente_nombre, p.apellido AS paciente_apellido
+                     FROM catalogo_medicamentos_b2b c
+                     LEFT JOIN pacientes_b2b p ON c.paciente_id = p.id
+                     WHERE c.institucion_id=$1 AND c.activo=TRUE AND c.paciente_id=$2
+                     ORDER BY c.nombre`;
+            params = [req.b2bUser.institucion_id, paciente_id];
+        } else {
+            query = `SELECT c.*, NULL::TEXT AS paciente_nombre, NULL::TEXT AS paciente_apellido
+                     FROM catalogo_medicamentos_b2b c
+                     WHERE c.institucion_id=$1 AND c.activo=TRUE AND c.paciente_id IS NULL
+                     ORDER BY c.nombre`;
+            params = [req.b2bUser.institucion_id];
+        }
+        res.json((await pool.query(query, params)).rows);
     } catch (err) {
         console.error('GET /api/b2b/catalogo:', err.message);
         res.status(500).json({ error: 'Error al obtener catálogo' });
@@ -3687,12 +3710,17 @@ app.get('/api/b2b/catalogo', authB2BMiddleware, async (req, res) => {
 // POST /api/b2b/catalogo
 app.post('/api/b2b/catalogo', authB2BMiddleware, requireB2BRole('admin_institucion'), requireActivePlan, async (req, res) => {
     try {
-        const { nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo } = req.body;
+        const { nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo, paciente_id } = req.body;
         if (!nombre) return res.status(400).json({ error: 'nombre obligatorio' });
+        // Si se especifica paciente_id, validar que pertenece a la institución
+        if (paciente_id) {
+            const pCheck = await pool.query('SELECT id FROM pacientes_b2b WHERE id=$1 AND institucion_id=$2', [paciente_id, req.b2bUser.institucion_id]);
+            if (pCheck.rowCount === 0) return res.status(403).json({ error: 'Paciente no pertenece a la institución' });
+        }
         const result = await pool.query(
-            `INSERT INTO catalogo_medicamentos_b2b (institucion_id, nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo)
-             VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-            [req.b2bUser.institucion_id, nombre, principio_activo||null, presentacion||null, unidad||'comprimido', stock_actual||0, stock_minimo||5]
+            `INSERT INTO catalogo_medicamentos_b2b (institucion_id, nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo, paciente_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+            [req.b2bUser.institucion_id, nombre, principio_activo||null, presentacion||null, unidad||'comprimido', stock_actual||0, stock_minimo||5, paciente_id||null]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -4164,19 +4192,25 @@ app.get('/api/b2b/dashboard', authB2BMiddleware, async (req, res) => {
                         AND TO_CHAR(fecha_nacimiento,'MM-DD') = TO_CHAR(NOW(),'MM-DD')`, [iid]),
             pool.query(`
                 SELECT * FROM (
-                    -- Medicamentos individuales con stock bajo (modelo familiar o sin vínculo a catálogo)
-                    SELECT id::INTEGER, nombre,
-                        TRIM(COALESCE(dosis,'') || CASE WHEN frecuencia IS NOT NULL AND frecuencia <> '' THEN ' · ' || frecuencia ELSE '' END) AS dosis_horario,
-                        stock, NULL::TEXT AS unidad, 'individual'::TEXT AS tipo
-                    FROM medicamentos_b2b
-                    WHERE institucion_id=$1 AND activo=TRUE AND stock IS NOT NULL AND stock < 5
+                    -- Insumos individuales con stock bajo (no vinculados a catálogo)
+                    SELECT m.id::INTEGER, m.nombre,
+                        TRIM(COALESCE(m.dosis,'') || CASE WHEN m.frecuencia IS NOT NULL AND m.frecuencia <> '' THEN ' · ' || m.frecuencia ELSE '' END) AS dosis_horario,
+                        m.stock, NULL::TEXT AS unidad, 'individual'::TEXT AS tipo,
+                        m.paciente_id, p.nombre AS paciente_nombre, p.apellido AS paciente_apellido
+                    FROM medicamentos_b2b m
+                    LEFT JOIN pacientes_b2b p ON m.paciente_id = p.id
+                    WHERE m.institucion_id=$1 AND m.activo=TRUE AND m.catalogo_id IS NULL
+                      AND m.stock IS NOT NULL AND m.stock < 10
                     UNION ALL
-                    -- Medicamentos del catálogo institucional con stock bajo
-                    SELECT id::INTEGER, nombre, presentacion AS dosis_horario,
-                        stock_actual AS stock, unidad, 'catalogo'::TEXT AS tipo
-                    FROM catalogo_medicamentos_b2b
-                    WHERE institucion_id=$1 AND stock_actual IS NOT NULL
-                      AND stock_actual <= COALESCE(stock_minimo, 5)
+                    -- Insumos del catálogo (institucional y por paciente) con stock bajo
+                    SELECT c.id::INTEGER, c.nombre, c.presentacion AS dosis_horario,
+                        c.stock_actual AS stock, c.unidad,
+                        CASE WHEN c.paciente_id IS NULL THEN 'catalogo'::TEXT ELSE 'catalogo_paciente'::TEXT END AS tipo,
+                        c.paciente_id, p.nombre AS paciente_nombre, p.apellido AS paciente_apellido
+                    FROM catalogo_medicamentos_b2b c
+                    LEFT JOIN pacientes_b2b p ON c.paciente_id = p.id
+                    WHERE c.institucion_id=$1 AND c.stock_actual IS NOT NULL
+                      AND c.stock_actual <= COALESCE(c.stock_minimo, 5)
                 ) combinado
                 ORDER BY stock ASC LIMIT 15`, [iid])
         ]);
