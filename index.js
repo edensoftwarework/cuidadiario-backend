@@ -603,6 +603,27 @@ async function runMigrations() {
         // paciente_id NULL = insumo institucional general; paciente_id != NULL = insumo propio del paciente
         await pool.query(`ALTER TABLE catalogo_medicamentos_b2b ADD COLUMN IF NOT EXISTS paciente_id INTEGER REFERENCES pacientes_b2b(id) ON DELETE SET NULL`).catch(() => {});
         console.log('✅ Migraciones B2B v10 completadas');
+        // MIGRACIONES B2B v11 — Historial de citas (reutilizar citas)
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS historial_citas_b2b (
+                id              SERIAL PRIMARY KEY,
+                institucion_id  INTEGER NOT NULL REFERENCES instituciones_b2b(id) ON DELETE CASCADE,
+                cita_id         INTEGER REFERENCES citas_b2b(id) ON DELETE SET NULL,
+                paciente_id     INTEGER NOT NULL REFERENCES pacientes_b2b(id) ON DELETE CASCADE,
+                titulo          VARCHAR(255) NOT NULL,
+                descripcion     TEXT,
+                fecha           TIMESTAMP NOT NULL,
+                medico          VARCHAR(255),
+                especialidad    VARCHAR(255),
+                lugar           VARCHAR(255),
+                estado          VARCHAR(50),
+                archivado_en    TIMESTAMP DEFAULT NOW(),
+                archivado_por   INTEGER REFERENCES usuarios_b2b(id) ON DELETE SET NULL
+            )
+        `).catch(() => {});
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_historial_citas_paciente ON historial_citas_b2b (paciente_id, fecha DESC)`).catch(() => {});
+        console.log('✅ Migraciones B2B v11 completadas');
+
         // ============================================================
         // FIN MIGRACIONES B2B
         // ============================================================
@@ -3797,6 +3818,21 @@ app.post('/api/b2b/citas', authB2BMiddleware, requireB2BRole('admin_institucion'
 app.patch('/api/b2b/citas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
     try {
         const { titulo, descripcion, fecha, medico, especialidad, lugar, estado } = req.body;
+        // Auto-archivar en historial si la cita estaba como 'realizada' y se reutiliza (cambia fecha o estado)
+        const curRes = await pool.query(
+            'SELECT * FROM citas_b2b WHERE id=$1 AND institucion_id=$2',
+            [req.params.id, req.b2bUser.institucion_id]
+        );
+        const cur = curRes.rows[0];
+        if (cur && cur.estado === 'realizada' && (fecha || (estado && estado !== 'realizada'))) {
+            await pool.query(
+                `INSERT INTO historial_citas_b2b
+                 (institucion_id, cita_id, paciente_id, titulo, descripcion, fecha, medico, especialidad, lugar, estado, archivado_por)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+                [cur.institucion_id, cur.id, cur.paciente_id, cur.titulo, cur.descripcion,
+                 cur.fecha, cur.medico, cur.especialidad, cur.lugar, cur.estado, req.b2bUser.id]
+            ).catch(e => console.error('historial_citas insert error:', e.message));
+        }
         await pool.query(
             `UPDATE citas_b2b SET titulo=COALESCE($1,titulo), descripcion=COALESCE($2,descripcion), fecha=COALESCE($3,fecha),
              medico=COALESCE($4,medico), especialidad=COALESCE($5,especialidad), lugar=COALESCE($6,lugar), estado=COALESCE($7,estado)
@@ -3807,6 +3843,24 @@ app.patch('/api/b2b/citas/:id', authB2BMiddleware, requireB2BRole('admin_institu
     } catch (err) {
         console.error('PATCH /api/b2b/citas/:id:', err.message);
         res.status(500).json({ error: 'Error al actualizar cita' });
+    }
+});
+
+// GET /api/b2b/citas/historial?paciente_id=X  — historial de citas archivadas
+app.get('/api/b2b/citas/historial', authB2BMiddleware, async (req, res) => {
+    try {
+        const { paciente_id } = req.query;
+        let query = `SELECT h.*, u.nombre as archivado_por_nombre
+                     FROM historial_citas_b2b h
+                     LEFT JOIN usuarios_b2b u ON h.archivado_por = u.id
+                     WHERE h.institucion_id=$1`;
+        const params = [req.b2bUser.institucion_id];
+        if (paciente_id) { query += ` AND h.paciente_id=$2`; params.push(paciente_id); }
+        query += ' ORDER BY h.fecha DESC';
+        res.json((await pool.query(query, params)).rows);
+    } catch (err) {
+        console.error('GET /api/b2b/citas/historial:', err.message);
+        res.status(500).json({ error: 'Error al obtener historial de citas' });
     }
 });
 
