@@ -624,6 +624,28 @@ async function runMigrations() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_historial_citas_paciente ON historial_citas_b2b (paciente_id, fecha DESC)`).catch(() => {});
         console.log('✅ Migraciones B2B v11 completadas');
 
+        // MIGRACIONES B2B v12 — Historial de restock de insumos + timestamp para campana de notificaciones
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS historial_restock_b2b (
+                id                SERIAL PRIMARY KEY,
+                institucion_id    INTEGER NOT NULL REFERENCES instituciones_b2b(id) ON DELETE CASCADE,
+                catalogo_id       INTEGER REFERENCES catalogo_medicamentos_b2b(id) ON DELETE SET NULL,
+                paciente_id       INTEGER REFERENCES pacientes_b2b(id) ON DELETE SET NULL,
+                nombre_item       TEXT NOT NULL,
+                stock_anterior    INTEGER NOT NULL DEFAULT 0,
+                cantidad_repuesta INTEGER NOT NULL DEFAULT 0,
+                stock_nuevo       INTEGER NOT NULL DEFAULT 0,
+                notas             TEXT,
+                registrado_por    INTEGER REFERENCES usuarios_b2b(id) ON DELETE SET NULL,
+                registrado_nombre TEXT,
+                created_at        TIMESTAMPTZ DEFAULT NOW()
+            )
+        `).catch(() => {});
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_restock_paciente ON historial_restock_b2b (paciente_id, created_at DESC)`).catch(() => {});
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_restock_catalogo ON historial_restock_b2b (catalogo_id, created_at DESC)`).catch(() => {});
+        await pool.query(`ALTER TABLE usuarios_b2b ADD COLUMN IF NOT EXISTS notif_last_seen_at TIMESTAMPTZ`).catch(() => {});
+        console.log('✅ Migraciones B2B v12 completadas');
+
         // ============================================================
         // FIN MIGRACIONES B2B
         // ============================================================
@@ -3750,7 +3772,12 @@ app.post('/api/b2b/catalogo', authB2BMiddleware, requireB2BRole('admin_instituci
 // PATCH /api/b2b/catalogo/:id
 app.patch('/api/b2b/catalogo/:id', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
     try {
-        const { nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo } = req.body;
+        const { nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo, notas_restock } = req.body;
+        const iid = req.b2bUser.institucion_id;
+        // Fetch current state to detect stock changes for restock log
+        const curRes = await pool.query('SELECT * FROM catalogo_medicamentos_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, iid]);
+        if (curRes.rowCount === 0) return res.status(404).json({ error: 'Ítem no encontrado' });
+        const cur = curRes.rows[0];
         const result = await pool.query(
             `UPDATE catalogo_medicamentos_b2b
              SET nombre=COALESCE($1,nombre), principio_activo=COALESCE($2,principio_activo),
@@ -3758,13 +3785,48 @@ app.patch('/api/b2b/catalogo/:id', authB2BMiddleware, requireB2BRole('admin_inst
                  stock_actual=COALESCE($5,stock_actual), stock_minimo=COALESCE($6,stock_minimo),
                  updated_at=NOW()
              WHERE id=$7 AND institucion_id=$8 RETURNING *`,
-            [nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo, req.params.id, req.b2bUser.institucion_id]
+            [nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo, req.params.id, iid]
         );
-        if (result.rowCount === 0) return res.status(404).json({ error: 'Ítem no encontrado' });
+        // Log restock entry if stock_actual was increased
+        if (stock_actual !== undefined && stock_actual !== null) {
+            const prev = parseInt(cur.stock_actual) || 0;
+            const nuevo = parseInt(stock_actual);
+            if (!isNaN(nuevo) && nuevo > prev) {
+                await pool.query(
+                    `INSERT INTO historial_restock_b2b
+                     (institucion_id, catalogo_id, paciente_id, nombre_item, stock_anterior, cantidad_repuesta, stock_nuevo, notas, registrado_por, registrado_nombre)
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+                    [iid, cur.id, cur.paciente_id || null, cur.nombre, prev, nuevo - prev, nuevo,
+                     notas_restock || null, req.b2bUser.id, req.b2bUser.nombre || null]
+                ).catch(e => console.error('restock log insert:', e.message));
+            }
+        }
         res.json(result.rows[0]);
     } catch (err) {
         console.error('PATCH /api/b2b/catalogo/:id:', err.message);
         res.status(500).json({ error: 'Error al actualizar ítem del catálogo' });
+    }
+});
+
+// GET /api/b2b/catalogo/restock-historial
+// ?catalogo_id=X → historial de un ítem específico
+// ?paciente_id=X → historial de todos los ítems de un paciente
+app.get('/api/b2b/catalogo/restock-historial', authB2BMiddleware, async (req, res) => {
+    try {
+        const { catalogo_id, paciente_id } = req.query;
+        const iid = req.b2bUser.institucion_id;
+        let query = `SELECT h.*, COALESCE(h.registrado_nombre, u.nombre, 'Sistema') AS registrador
+                     FROM historial_restock_b2b h
+                     LEFT JOIN usuarios_b2b u ON h.registrado_por = u.id
+                     WHERE h.institucion_id=$1`;
+        const params = [iid];
+        if (catalogo_id) { query += ` AND h.catalogo_id=$${params.length + 1}`; params.push(catalogo_id); }
+        if (paciente_id) { query += ` AND h.paciente_id=$${params.length + 1}`; params.push(paciente_id); }
+        query += ' ORDER BY h.created_at DESC LIMIT 50';
+        res.json((await pool.query(query, params)).rows);
+    } catch (err) {
+        console.error('GET /api/b2b/catalogo/restock-historial:', err.message);
+        res.status(500).json({ error: 'Error al obtener historial de restock' });
     }
 });
 
@@ -4210,6 +4272,78 @@ app.delete('/api/b2b/notas/:id', authB2BMiddleware, requireB2BRole('admin_instit
     }
 });
 
+// ---------- B2B: NOTIFICACIONES ----------
+
+// GET /api/b2b/notificaciones — devuelve alertas agrupadas + conteo de no vistas
+app.get('/api/b2b/notificaciones', authB2BMiddleware, async (req, res) => {
+    try {
+        const iid = req.b2bUser.institucion_id;
+        const uid = req.b2bUser.id;
+        // Obtener cuándo abrió la campana por última vez este usuario
+        const lsRes = await pool.query('SELECT notif_last_seen_at FROM usuarios_b2b WHERE id=$1', [uid]);
+        const lastSeen = lsRes.rows[0]?.notif_last_seen_at || new Date(0);
+        const [citasR, notasR, sintomasR, stockR, cumpleR, ingresosR, egresosR] = await Promise.all([
+            // Citas próximas (15 días) pendientes
+            pool.query(`SELECT c.id, c.titulo, c.fecha, c.created_at, p.nombre||' '||p.apellido AS paciente_nombre, p.id AS paciente_id
+                        FROM citas_b2b c JOIN pacientes_b2b p ON c.paciente_id=p.id
+                        WHERE c.institucion_id=$1 AND c.estado='pendiente' AND c.fecha BETWEEN NOW() AND NOW()+INTERVAL '15 days'
+                        AND p.fecha_egreso IS NULL ORDER BY c.fecha LIMIT 20`, [iid]),
+            // Notas urgentes activas
+            pool.query(`SELECT n.id, n.texto, n.created_at, p.nombre||' '||p.apellido AS paciente_nombre, p.id AS paciente_id
+                        FROM notas_b2b n JOIN pacientes_b2b p ON n.paciente_id=p.id
+                        WHERE n.institucion_id=$1 AND n.urgente=TRUE AND n.archivada=FALSE
+                        AND p.fecha_egreso IS NULL ORDER BY n.created_at DESC LIMIT 10`, [iid]),
+            // Síntomas registrados en las últimas 24h
+            pool.query(`SELECT s.id, s.tipo, s.descripcion, s.created_at, p.nombre||' '||p.apellido AS paciente_nombre, p.id AS paciente_id
+                        FROM sintomas_b2b s JOIN pacientes_b2b p ON s.paciente_id=p.id
+                        WHERE s.institucion_id=$1 AND s.created_at > NOW()-INTERVAL '24 hours'
+                        AND p.fecha_egreso IS NULL ORDER BY s.created_at DESC LIMIT 10`, [iid]),
+            // Insumos con stock bajo
+            pool.query(`SELECT id, nombre, stock_actual, stock_minimo, paciente_id
+                        FROM catalogo_medicamentos_b2b
+                        WHERE institucion_id=$1 AND activo=TRUE AND stock_actual < stock_minimo
+                        ORDER BY (stock_minimo - stock_actual) DESC LIMIT 20`, [iid]),
+            // Cumpleaños en los próximos 7 días
+            pool.query(`SELECT id, nombre, apellido, fecha_nacimiento
+                        FROM pacientes_b2b
+                        WHERE institucion_id=$1 AND activo=TRUE AND fecha_egreso IS NULL AND fecha_nacimiento IS NOT NULL
+                        AND TO_CHAR(fecha_nacimiento::date, 'MM-DD') BETWEEN TO_CHAR(NOW(), 'MM-DD') AND TO_CHAR(NOW()+INTERVAL '7 days', 'MM-DD')
+                        ORDER BY TO_CHAR(fecha_nacimiento::date, 'MM-DD') LIMIT 10`, [iid]),
+            // Ingresos recientes (últimas 24h)
+            pool.query(`SELECT id, nombre, apellido, created_at FROM pacientes_b2b
+                        WHERE institucion_id=$1 AND created_at > NOW()-INTERVAL '24 hours'
+                        ORDER BY created_at DESC LIMIT 10`, [iid]),
+            // Egresos recientes (últimas 24h)
+            pool.query(`SELECT id, nombre, apellido, fecha_egreso FROM pacientes_b2b
+                        WHERE institucion_id=$1 AND fecha_egreso IS NOT NULL AND fecha_egreso > NOW()-INTERVAL '24 hours'
+                        ORDER BY fecha_egreso DESC LIMIT 10`, [iid]),
+        ]);
+        const items = [];
+        citasR.rows.forEach(c => items.push({ tipo: 'cita', icono: '📅', titulo: c.titulo, descripcion: `${c.paciente_nombre} · ${new Date(c.fecha).toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit' })}`, href: `paciente.html?id=${c.paciente_id}`, ts: c.created_at, es_nuevo: new Date(c.created_at) > new Date(lastSeen) }));
+        notasR.rows.forEach(n => items.push({ tipo: 'nota_urgente', icono: '🚨', titulo: 'Nota urgente', descripcion: `${n.paciente_nombre}: ${String(n.texto || '').slice(0, 70)}`, href: `paciente.html?id=${n.paciente_id}`, ts: n.created_at, es_nuevo: new Date(n.created_at) > new Date(lastSeen) }));
+        sintomasR.rows.forEach(s => items.push({ tipo: 'sintoma', icono: '🤒', titulo: `Síntoma: ${s.tipo}`, descripcion: s.paciente_nombre, href: `paciente.html?id=${s.paciente_id}`, ts: s.created_at, es_nuevo: new Date(s.created_at) > new Date(lastSeen) }));
+        stockR.rows.forEach(s => items.push({ tipo: 'stock_bajo', icono: '⚠️', titulo: `Stock bajo: ${s.nombre}`, descripcion: `Actual: ${s.stock_actual} / Mínimo: ${s.stock_minimo}`, href: s.paciente_id ? `paciente.html?id=${s.paciente_id}` : 'catalogo.html', ts: null, es_nuevo: false }));
+        cumpleR.rows.forEach(p => items.push({ tipo: 'cumpleanos', icono: '🎂', titulo: `Cumpleaños: ${p.nombre} ${p.apellido}`, descripcion: new Date(String(p.fecha_nacimiento).slice(0, 10) + 'T12:00:00').toLocaleDateString('es-AR', { day: '2-digit', month: 'long' }), href: `paciente.html?id=${p.id}`, ts: null, es_nuevo: false }));
+        ingresosR.rows.forEach(p => items.push({ tipo: 'ingreso', icono: '🏥', titulo: `Nuevo ingreso: ${p.nombre} ${p.apellido}`, descripcion: 'Residente dado de alta recientemente', href: `paciente.html?id=${p.id}`, ts: p.created_at, es_nuevo: new Date(p.created_at) > new Date(lastSeen) }));
+        egresosR.rows.forEach(p => items.push({ tipo: 'egreso', icono: '🏠', titulo: `Egreso: ${p.nombre} ${p.apellido}`, descripcion: 'Residente dado de egreso recientemente', href: `paciente.html?id=${p.id}`, ts: p.fecha_egreso, es_nuevo: new Date(p.fecha_egreso) > new Date(lastSeen) }));
+        res.json({ unread: items.filter(i => i.es_nuevo).length, items });
+    } catch (err) {
+        console.error('GET /api/b2b/notificaciones:', err.message);
+        res.status(500).json({ error: 'Error al obtener notificaciones' });
+    }
+});
+
+// POST /api/b2b/notificaciones/vistas — marca la campana como vista (actualiza timestamp)
+app.post('/api/b2b/notificaciones/vistas', authB2BMiddleware, async (req, res) => {
+    try {
+        await pool.query('UPDATE usuarios_b2b SET notif_last_seen_at=NOW() WHERE id=$1', [req.b2bUser.id]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('POST /api/b2b/notificaciones/vistas:', err.message);
+        res.status(500).json({ error: 'Error al marcar notificaciones como vistas' });
+    }
+});
+
 // ---------- B2B: DASHBOARD ----------
 
 // GET /api/b2b/dashboard
@@ -4221,7 +4355,7 @@ app.get('/api/b2b/dashboard', authB2BMiddleware, async (req, res) => {
             pool.query('SELECT COUNT(*) as total, rol FROM usuarios_b2b WHERE institucion_id=$1 AND activo=TRUE GROUP BY rol', [iid]),
             pool.query(`SELECT c.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
                         FROM citas_b2b c JOIN pacientes_b2b p ON c.paciente_id=p.id
-                        WHERE c.institucion_id=$1 AND c.fecha BETWEEN NOW() AND NOW()+INTERVAL '7 days' AND c.estado='pendiente'
+                        WHERE c.institucion_id=$1 AND c.fecha BETWEEN NOW() AND NOW()+INTERVAL '15 days' AND c.estado='pendiente'
                         AND p.fecha_egreso IS NULL
                         ORDER BY c.fecha LIMIT 10`, [iid]),
             pool.query(`SELECT s.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
