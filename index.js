@@ -725,6 +725,10 @@ async function runMigrations() {
             console.log('✅ Migración TZ v2 completada');
         }
 
+        // MIGRACIÓN B2B v13 — updated_at en citas para rastrear cuándo se marcó como realizada
+        await pool.query(`ALTER TABLE citas_b2b ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()`).catch(() => {});
+        console.log('✅ Migración B2B v13 completada');
+
         // ============================================================
         // FIN MIGRACIONES B2B
         // ============================================================
@@ -3978,7 +3982,8 @@ app.patch('/api/b2b/citas/:id', authB2BMiddleware, requireB2BRole('admin_institu
         }
         await pool.query(
             `UPDATE citas_b2b SET titulo=COALESCE($1,titulo), descripcion=COALESCE($2,descripcion), fecha=COALESCE($3,fecha),
-             medico=COALESCE($4,medico), especialidad=COALESCE($5,especialidad), lugar=COALESCE($6,lugar), estado=COALESCE($7,estado)
+             medico=COALESCE($4,medico), especialidad=COALESCE($5,especialidad), lugar=COALESCE($6,lugar),
+             estado=COALESCE($7,estado), updated_at=NOW()
              WHERE id=$8 AND institucion_id=$9`,
             [titulo, descripcion, fecha, medico, especialidad, lugar, estado, req.params.id, req.b2bUser.institucion_id]
         );
@@ -4422,14 +4427,30 @@ app.get('/api/b2b/notificaciones', authB2BMiddleware, async (req, res) => {
                         AND fecha_egreso::timestamptz > NOW()-INTERVAL '24 hours'
                         ORDER BY fecha_egreso DESC LIMIT 10`, [iid]).catch(() => ({ rows: [] })),
         ]);
+
+
+        // Fecha de hoy en Argentina â€” para comparar cumpleaÃ±os con lastSeen
+
+        const todayAR = new Intl.DateTimeFormat('sv-SE', { timeZone: 'America/Argentina/Buenos_Aires' }).format(new Date());
+
+        const lastSeenDateStr = (lastSeen && !(lastSeen instanceof Date && lastSeen.getTime() === 0)) ? String(lastSeen).slice(0, 10) : '1970-01-01';
+
         const items = [];
-        citasR.rows.forEach(c => items.push({ tipo: 'cita', icono: '📅', titulo: c.titulo, descripcion: `${c.paciente_nombre} · ${new Date(c.fecha).toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit' })}`, href: `paciente.html?id=${c.paciente_id}`, ts: c.created_at, es_nuevo: new Date(c.created_at) > new Date(lastSeen) }));
-        notasR.rows.forEach(n => items.push({ tipo: 'nota_urgente', icono: '🚨', titulo: 'Nota urgente', descripcion: `${n.paciente_nombre}: ${String(n.contenido || '').slice(0, 70)}`, href: `paciente.html?id=${n.paciente_id}`, ts: n.created_at, es_nuevo: new Date(n.created_at) > new Date(lastSeen) }));
-        sintomasR.rows.forEach(s => items.push({ tipo: 'sintoma', icono: '�', titulo: 'Síntoma registrado', descripcion: `${s.paciente_nombre}: ${s.descripcion}${s.intensidad ? ' · Intensidad: '+s.intensidad+'/10' : ''}`, href: `paciente.html?id=${s.paciente_id}`, ts: s.fecha, es_nuevo: new Date(s.fecha) > new Date(lastSeen) }));
-        stockR.rows.forEach(s => items.push({ tipo: 'stock_bajo', icono: '⚠️', titulo: `Stock bajo: ${s.nombre}`, descripcion: `Actual: ${s.stock_actual} / Mínimo: ${s.stock_minimo}`, href: s.paciente_id ? `paciente.html?id=${s.paciente_id}` : 'catalogo.html', ts: s.updated_at, es_nuevo: !!s.updated_at && new Date(s.updated_at) > new Date(lastSeen) }));
-        cumpleR.rows.forEach(p => { const desc = p.fn_iso ? new Date(p.fn_iso + 'T12:00:00').toLocaleDateString('es-AR', { day: '2-digit', month: 'long' }) : '—'; items.push({ tipo: 'cumpleanos', icono: '🎂', titulo: `Cumpleaños: ${p.nombre} ${p.apellido}`, descripcion: desc, href: `paciente.html?id=${p.id}`, ts: null, es_nuevo: !!p.es_hoy }); });
-        ingresosR.rows.forEach(p => items.push({ tipo: 'ingreso', icono: '🏥', titulo: `Nuevo ingreso: ${p.nombre} ${p.apellido}`, descripcion: 'Residente dado de alta recientemente', href: `paciente.html?id=${p.id}`, ts: p.created_at, es_nuevo: new Date(p.created_at) > new Date(lastSeen) }));
-        egresosR.rows.forEach(p => items.push({ tipo: 'egreso', icono: '🏠', titulo: `Egreso: ${p.nombre} ${p.apellido}`, descripcion: 'Residente dado de egreso recientemente', href: `paciente.html?id=${p.id}`, ts: p.fecha_egreso, es_nuevo: p.fecha_egreso && new Date(p.fecha_egreso) > new Date(lastSeen) }));
+
+        citasR.rows.forEach(c => items.push({ tipo: 'cita', icono: '\uD83D\uDCC5', titulo: c.titulo, descripcion: `${c.paciente_nombre} \u00B7 ${new Date(c.fecha).toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit' })}`, href: `paciente.html?id=${c.paciente_id}`, ts: c.created_at, es_nuevo: new Date(c.created_at) > new Date(lastSeen) }));
+
+        notasR.rows.forEach(n => items.push({ tipo: 'nota_urgente', icono: '\uD83D\uDEA8', titulo: 'Nota urgente', descripcion: `${n.paciente_nombre}: ${String(n.contenido || '').slice(0, 70)}`, href: `paciente.html?id=${n.paciente_id}`, ts: n.created_at, es_nuevo: new Date(n.created_at) > new Date(lastSeen) }));
+
+        sintomasR.rows.forEach(s => items.push({ tipo: 'sintoma', icono: '\uD83E\uDE7A', titulo: 'S\u00EDntoma registrado', descripcion: `${s.paciente_nombre}: ${s.descripcion}${s.intensidad ? ' \u00B7 Intensidad: '+s.intensidad+'/10' : ''}`, href: `paciente.html?id=${s.paciente_id}`, ts: s.fecha, es_nuevo: new Date(s.fecha) > new Date(lastSeen) }));
+
+        stockR.rows.forEach(s => items.push({ tipo: 'stock_bajo', icono: '\u26A0\uFE0F', titulo: `Stock bajo: ${s.nombre}`, descripcion: `Actual: ${s.stock_actual} / M\u00EDnimo: ${s.stock_minimo}`, href: s.paciente_id ? `paciente.html?id=${s.paciente_id}` : 'catalogo.html', ts: s.updated_at, es_nuevo: !!s.updated_at && new Date(s.updated_at) > new Date(lastSeen) }));
+
+        cumpleR.rows.forEach(p => { const desc = p.fn_iso ? new Date(p.fn_iso + 'T12:00:00').toLocaleDateString('es-AR', { day: '2-digit', month: 'long' }) : '\u2014'; const bts = p.es_hoy ? todayAR + 'T00:00:00' : null; items.push({ tipo: 'cumpleanos', icono: '\uD83C\uDF82', titulo: `Cumplea\u00F1os: ${p.nombre} ${p.apellido}`, descripcion: desc, href: `paciente.html?id=${p.id}`, ts: bts, es_nuevo: !!p.es_hoy && lastSeenDateStr < todayAR }); });
+
+        ingresosR.rows.forEach(p => items.push({ tipo: 'ingreso', icono: '\uD83C\uDFE5', titulo: `Nuevo ingreso: ${p.nombre} ${p.apellido}`, descripcion: 'Residente dado de alta recientemente', href: `paciente.html?id=${p.id}`, ts: p.created_at, es_nuevo: new Date(p.created_at) > new Date(lastSeen) }));
+
+        egresosR.rows.forEach(p => items.push({ tipo: 'egreso', icono: '\uD83C\uDFE0', titulo: `Egreso: ${p.nombre} ${p.apellido}`, descripcion: 'Residente dado de egreso recientemente', href: `paciente.html?id=${p.id}`, ts: p.fecha_egreso, es_nuevo: p.fecha_egreso && new Date(p.fecha_egreso) > new Date(lastSeen) }));
+
         // Ordenar por momento de generación (ts) descendente — más reciente primero
         items.sort((a, b) => {
             if (!a.ts && !b.ts) return 0;
