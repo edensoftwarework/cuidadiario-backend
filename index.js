@@ -4287,45 +4287,46 @@ app.get('/api/b2b/notificaciones', authB2BMiddleware, async (req, res) => {
             pool.query(`SELECT c.id, c.titulo, c.fecha, c.created_at, p.nombre||' '||p.apellido AS paciente_nombre, p.id AS paciente_id
                         FROM citas_b2b c JOIN pacientes_b2b p ON c.paciente_id=p.id
                         WHERE c.institucion_id=$1 AND c.estado='pendiente' AND c.fecha BETWEEN NOW() AND NOW()+INTERVAL '15 days'
-                        AND p.fecha_egreso IS NULL ORDER BY c.fecha LIMIT 20`, [iid]),
-            // Notas urgentes activas
-            pool.query(`SELECT n.id, n.texto, n.created_at, p.nombre||' '||p.apellido AS paciente_nombre, p.id AS paciente_id
+                        AND p.fecha_egreso IS NULL ORDER BY c.fecha LIMIT 20`, [iid]).catch(() => ({ rows: [] })),
+            // Notas urgentes activas (no archivadas — usa solo columnas existentes)
+            pool.query(`SELECT n.id, n.contenido, n.created_at, p.nombre||' '||p.apellido AS paciente_nombre, p.id AS paciente_id
                         FROM notas_b2b n JOIN pacientes_b2b p ON n.paciente_id=p.id
-                        WHERE n.institucion_id=$1 AND n.urgente=TRUE AND n.archivada=FALSE
-                        AND p.fecha_egreso IS NULL ORDER BY n.created_at DESC LIMIT 10`, [iid]),
+                        WHERE n.institucion_id=$1 AND n.urgente=TRUE
+                        AND p.fecha_egreso IS NULL ORDER BY n.created_at DESC LIMIT 10`, [iid]).catch(() => ({ rows: [] })),
             // Síntomas registrados en las últimas 24h
             pool.query(`SELECT s.id, s.tipo, s.descripcion, s.created_at, p.nombre||' '||p.apellido AS paciente_nombre, p.id AS paciente_id
                         FROM sintomas_b2b s JOIN pacientes_b2b p ON s.paciente_id=p.id
                         WHERE s.institucion_id=$1 AND s.created_at > NOW()-INTERVAL '24 hours'
-                        AND p.fecha_egreso IS NULL ORDER BY s.created_at DESC LIMIT 10`, [iid]),
+                        AND p.fecha_egreso IS NULL ORDER BY s.created_at DESC LIMIT 10`, [iid]).catch(() => ({ rows: [] })),
             // Insumos con stock bajo
             pool.query(`SELECT id, nombre, stock_actual, stock_minimo, paciente_id
                         FROM catalogo_medicamentos_b2b
                         WHERE institucion_id=$1 AND activo=TRUE AND stock_actual < stock_minimo
-                        ORDER BY (stock_minimo - stock_actual) DESC LIMIT 20`, [iid]),
+                        ORDER BY (stock_minimo - stock_actual) DESC LIMIT 20`, [iid]).catch(() => ({ rows: [] })),
             // Cumpleaños en los próximos 7 días
             pool.query(`SELECT id, nombre, apellido, fecha_nacimiento
                         FROM pacientes_b2b
                         WHERE institucion_id=$1 AND activo=TRUE AND fecha_egreso IS NULL AND fecha_nacimiento IS NOT NULL
                         AND TO_CHAR(fecha_nacimiento::date, 'MM-DD') BETWEEN TO_CHAR(NOW(), 'MM-DD') AND TO_CHAR(NOW()+INTERVAL '7 days', 'MM-DD')
-                        ORDER BY TO_CHAR(fecha_nacimiento::date, 'MM-DD') LIMIT 10`, [iid]),
+                        ORDER BY TO_CHAR(fecha_nacimiento::date, 'MM-DD') LIMIT 10`, [iid]).catch(() => ({ rows: [] })),
             // Ingresos recientes (últimas 24h)
             pool.query(`SELECT id, nombre, apellido, created_at FROM pacientes_b2b
                         WHERE institucion_id=$1 AND created_at > NOW()-INTERVAL '24 hours'
-                        ORDER BY created_at DESC LIMIT 10`, [iid]),
+                        ORDER BY created_at DESC LIMIT 10`, [iid]).catch(() => ({ rows: [] })),
             // Egresos recientes (últimas 24h)
             pool.query(`SELECT id, nombre, apellido, fecha_egreso FROM pacientes_b2b
-                        WHERE institucion_id=$1 AND fecha_egreso IS NOT NULL AND fecha_egreso > NOW()-INTERVAL '24 hours'
-                        ORDER BY fecha_egreso DESC LIMIT 10`, [iid]),
+                        WHERE institucion_id=$1 AND fecha_egreso IS NOT NULL
+                        AND fecha_egreso::timestamptz > NOW()-INTERVAL '24 hours'
+                        ORDER BY fecha_egreso DESC LIMIT 10`, [iid]).catch(() => ({ rows: [] })),
         ]);
         const items = [];
         citasR.rows.forEach(c => items.push({ tipo: 'cita', icono: '📅', titulo: c.titulo, descripcion: `${c.paciente_nombre} · ${new Date(c.fecha).toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit' })}`, href: `paciente.html?id=${c.paciente_id}`, ts: c.created_at, es_nuevo: new Date(c.created_at) > new Date(lastSeen) }));
-        notasR.rows.forEach(n => items.push({ tipo: 'nota_urgente', icono: '🚨', titulo: 'Nota urgente', descripcion: `${n.paciente_nombre}: ${String(n.texto || '').slice(0, 70)}`, href: `paciente.html?id=${n.paciente_id}`, ts: n.created_at, es_nuevo: new Date(n.created_at) > new Date(lastSeen) }));
+        notasR.rows.forEach(n => items.push({ tipo: 'nota_urgente', icono: '🚨', titulo: 'Nota urgente', descripcion: `${n.paciente_nombre}: ${String(n.contenido || '').slice(0, 70)}`, href: `paciente.html?id=${n.paciente_id}`, ts: n.created_at, es_nuevo: new Date(n.created_at) > new Date(lastSeen) }));
         sintomasR.rows.forEach(s => items.push({ tipo: 'sintoma', icono: '🤒', titulo: `Síntoma: ${s.tipo}`, descripcion: s.paciente_nombre, href: `paciente.html?id=${s.paciente_id}`, ts: s.created_at, es_nuevo: new Date(s.created_at) > new Date(lastSeen) }));
         stockR.rows.forEach(s => items.push({ tipo: 'stock_bajo', icono: '⚠️', titulo: `Stock bajo: ${s.nombre}`, descripcion: `Actual: ${s.stock_actual} / Mínimo: ${s.stock_minimo}`, href: s.paciente_id ? `paciente.html?id=${s.paciente_id}` : 'catalogo.html', ts: null, es_nuevo: false }));
         cumpleR.rows.forEach(p => items.push({ tipo: 'cumpleanos', icono: '🎂', titulo: `Cumpleaños: ${p.nombre} ${p.apellido}`, descripcion: new Date(String(p.fecha_nacimiento).slice(0, 10) + 'T12:00:00').toLocaleDateString('es-AR', { day: '2-digit', month: 'long' }), href: `paciente.html?id=${p.id}`, ts: null, es_nuevo: false }));
         ingresosR.rows.forEach(p => items.push({ tipo: 'ingreso', icono: '🏥', titulo: `Nuevo ingreso: ${p.nombre} ${p.apellido}`, descripcion: 'Residente dado de alta recientemente', href: `paciente.html?id=${p.id}`, ts: p.created_at, es_nuevo: new Date(p.created_at) > new Date(lastSeen) }));
-        egresosR.rows.forEach(p => items.push({ tipo: 'egreso', icono: '🏠', titulo: `Egreso: ${p.nombre} ${p.apellido}`, descripcion: 'Residente dado de egreso recientemente', href: `paciente.html?id=${p.id}`, ts: p.fecha_egreso, es_nuevo: new Date(p.fecha_egreso) > new Date(lastSeen) }));
+        egresosR.rows.forEach(p => items.push({ tipo: 'egreso', icono: '🏠', titulo: `Egreso: ${p.nombre} ${p.apellido}`, descripcion: 'Residente dado de egreso recientemente', href: `paciente.html?id=${p.id}`, ts: p.fecha_egreso, es_nuevo: p.fecha_egreso && new Date(p.fecha_egreso) > new Date(lastSeen) }));
         res.json({ unread: items.filter(i => i.es_nuevo).length, items });
     } catch (err) {
         console.error('GET /api/b2b/notificaciones:', err.message);
