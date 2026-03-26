@@ -59,6 +59,15 @@
 const express = require('express');
 const app = express();
 const pool = require('./db');
+// ─── Zona horaria Argentina para todas las conexiones del pool ───────────────
+// Esto asegura que NOW() devuelva la hora local de Argentina en vez de UTC.
+// Afecta INSERT DEFAULT NOW(), comparaciones, y serialización de TIMESTAMP.
+pool.on('connect', client => {
+    client.query("SET TIME ZONE 'America/Argentina/Buenos_Aires'").catch(err =>
+        console.error('[DB] Error al configurar timezone:', err.message)
+    );
+});
+// ─────────────────────────────────────────────────────────────────────────────
 const bcrypt = require('bcrypt');
 const SALT_ROUNDS = 10;
 const jwt = require('jsonwebtoken');
@@ -645,6 +654,58 @@ async function runMigrations() {
         await pool.query(`CREATE INDEX IF NOT EXISTS idx_restock_catalogo ON historial_restock_b2b (catalogo_id, created_at DESC)`).catch(() => {});
         await pool.query(`ALTER TABLE usuarios_b2b ADD COLUMN IF NOT EXISTS notif_last_seen_at TIMESTAMPTZ`).catch(() => {});
         console.log('✅ Migraciones B2B v12 completadas');
+
+        // ============================================================
+        // MIGRACIÓN TZ v1 — corrección única de zona horaria (UTC → Argentina)
+        // Se ejecuta una sola vez al detectar que aún no fue aplicada.
+        // ============================================================
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS _migrations (
+                name   TEXT PRIMARY KEY,
+                ran_at TIMESTAMP DEFAULT NOW()
+            )
+        `).catch(() => {});
+        const tzM = await pool.query(
+            `INSERT INTO _migrations (name) VALUES ('tz_ar_v1') ON CONFLICT (name) DO NOTHING RETURNING name`
+        ).catch(() => ({ rows: [] }));
+        if (tzM.rows.length > 0) {
+            // 1. Convertir columnas TIMESTAMPTZ a TIMESTAMP con valor ya en hora argentina
+            //    (así el truco de strip-Z del frontend las trata como hora local directamente)
+            await pool.query(`
+                ALTER TABLE historial_restock_b2b
+                ALTER COLUMN created_at TYPE TIMESTAMP
+                USING (created_at AT TIME ZONE 'America/Argentina/Buenos_Aires')
+            `).catch(e => console.error('[TZ-mig] restock created_at:', e.message));
+            await pool.query(`
+                ALTER TABLE usuarios_b2b
+                ALTER COLUMN notif_last_seen_at TYPE TIMESTAMP
+                USING (notif_last_seen_at AT TIME ZONE 'America/Argentina/Buenos_Aires')
+            `).catch(e => console.error('[TZ-mig] notif_last_seen_at:', e.message));
+            // 2. Corregir timestamps TIMESTAMP que fueron almacenados como UTC (-3h → hora AR)
+            const tzCols = [
+                ['instituciones_b2b',          'created_at'  ],
+                ['usuarios_b2b',               'created_at'  ],
+                ['pacientes_b2b',              'created_at'  ],
+                ['medicamentos_b2b',           'created_at'  ],
+                ['tareas_b2b',                 'created_at'  ],
+                ['notas_b2b',                  'created_at'  ],
+                ['contactos_b2b',              'created_at'  ],
+                ['citas_b2b',                  'created_at'  ],
+                ['historial_medicamentos_b2b', 'fecha'       ],
+                ['historial_tareas_b2b',       'fecha'       ],
+                ['sintomas_b2b',               'fecha'       ],
+                ['signos_vitales_b2b',         'fecha'       ],
+                ['historial_citas_b2b',        'archivado_en'],
+                ['catalogo_medicamentos_b2b',  'created_at'  ],
+                ['historial_restock_b2b',      'created_at'  ],
+            ];
+            for (const [tbl, col] of tzCols) {
+                await pool.query(
+                    `UPDATE ${tbl} SET ${col} = ${col} - INTERVAL '3 hours' WHERE ${col} IS NOT NULL`
+                ).catch(e => console.error(`[TZ-mig] ${tbl}.${col}:`, e.message));
+            }
+            console.log('✅ Migración TZ v1 completada — timestamps ajustados a hora de Argentina');
+        }
 
         // ============================================================
         // FIN MIGRACIONES B2B
@@ -3886,7 +3947,9 @@ app.patch('/api/b2b/citas/:id', authB2BMiddleware, requireB2BRole('admin_institu
             [req.params.id, req.b2bUser.institucion_id]
         );
         const cur = curRes.rows[0];
-        if (cur && cur.estado === 'realizada' && (fecha || (estado && estado !== 'realizada'))) {
+        // Solo archivar en historial cuando se REUTILIZA la cita: estado pasa de 'realizada' → 'pendiente' con nueva fecha
+        const isReutilizando = cur && cur.estado === 'realizada' && estado === 'pendiente' && fecha;
+        if (isReutilizando) {
             await pool.query(
                 `INSERT INTO historial_citas_b2b
                  (institucion_id, cita_id, paciente_id, titulo, descripcion, fecha, medico, especialidad, lugar, estado, archivado_por)
@@ -3908,17 +3971,30 @@ app.patch('/api/b2b/citas/:id', authB2BMiddleware, requireB2BRole('admin_institu
     }
 });
 
-// GET /api/b2b/citas/historial?paciente_id=X  — historial de citas archivadas
+// GET /api/b2b/citas/historial?paciente_id=X  — historial de citas archivadas + citas actualmente realizadas
 app.get('/api/b2b/citas/historial', authB2BMiddleware, async (req, res) => {
     try {
         const { paciente_id } = req.query;
-        let query = `SELECT h.*, u.nombre as archivado_por_nombre
-                     FROM historial_citas_b2b h
-                     LEFT JOIN usuarios_b2b u ON h.archivado_por = u.id
-                     WHERE h.institucion_id=$1`;
-        const params = [req.b2bUser.institucion_id];
-        if (paciente_id) { query += ` AND h.paciente_id=$2`; params.push(paciente_id); }
-        query += ' ORDER BY h.fecha DESC';
+        const iid = req.b2bUser.institucion_id;
+        const params = [iid];
+        let pacienteFilter = '';
+        if (paciente_id) { params.push(paciente_id); pacienteFilter = `AND paciente_id=$${params.length}`; }
+        // UNION: citas archivadas (reutilizadas) + citas activas en estado 'realizada'
+        const query = `
+            SELECT h.id, h.titulo, h.descripcion, h.fecha, h.medico, h.especialidad, h.lugar, h.estado,
+                   h.archivado_en, u.nombre AS archivado_por_nombre, 'historial' AS fuente,
+                   h.paciente_id
+            FROM historial_citas_b2b h
+            LEFT JOIN usuarios_b2b u ON h.archivado_por = u.id
+            WHERE h.institucion_id=$1 ${pacienteFilter}
+            UNION ALL
+            SELECT c.id, c.titulo, c.descripcion, c.fecha, c.medico, c.especialidad, c.lugar, c.estado,
+                   c.updated_at AS archivado_en, NULL AS archivado_por_nombre, 'realizada' AS fuente,
+                   c.paciente_id
+            FROM citas_b2b c
+            WHERE c.institucion_id=$1 AND c.estado='realizada' ${paciente_id ? `AND c.paciente_id=$2` : ''}
+            ORDER BY fecha DESC
+        `;
         res.json((await pool.query(query, params)).rows);
     } catch (err) {
         console.error('GET /api/b2b/citas/historial:', err.message);
@@ -4294,21 +4370,27 @@ app.get('/api/b2b/notificaciones', authB2BMiddleware, async (req, res) => {
                         WHERE n.institucion_id=$1 AND n.urgente=TRUE
                         AND p.fecha_egreso IS NULL ORDER BY n.created_at DESC LIMIT 10`, [iid]).catch(() => ({ rows: [] })),
             // Síntomas registrados en las últimas 24h
-            pool.query(`SELECT s.id, s.tipo, s.descripcion, s.created_at, p.nombre||' '||p.apellido AS paciente_nombre, p.id AS paciente_id
+            pool.query(`SELECT s.id, s.descripcion, s.intensidad, s.fecha, p.nombre||' '||p.apellido AS paciente_nombre, p.id AS paciente_id
                         FROM sintomas_b2b s JOIN pacientes_b2b p ON s.paciente_id=p.id
-                        WHERE s.institucion_id=$1 AND s.created_at > NOW()-INTERVAL '24 hours'
-                        AND p.fecha_egreso IS NULL ORDER BY s.created_at DESC LIMIT 10`, [iid]).catch(() => ({ rows: [] })),
+                        WHERE s.institucion_id=$1 AND s.fecha > NOW()-INTERVAL '24 hours'
+                        AND p.fecha_egreso IS NULL ORDER BY s.fecha DESC LIMIT 10`, [iid]).catch(() => ({ rows: [] })),
             // Insumos con stock bajo
             pool.query(`SELECT id, nombre, stock_actual, stock_minimo, paciente_id
                         FROM catalogo_medicamentos_b2b
                         WHERE institucion_id=$1 AND activo=TRUE AND stock_actual < stock_minimo
                         ORDER BY (stock_minimo - stock_actual) DESC LIMIT 20`, [iid]).catch(() => ({ rows: [] })),
-            // Cumpleaños en los próximos 7 días
+            // Cumpleaños en los próximos 7 días (robusto para cambio de año)
             pool.query(`SELECT id, nombre, apellido, fecha_nacimiento
                         FROM pacientes_b2b
                         WHERE institucion_id=$1 AND activo=TRUE AND fecha_egreso IS NULL AND fecha_nacimiento IS NOT NULL
-                        AND TO_CHAR(fecha_nacimiento::date, 'MM-DD') BETWEEN TO_CHAR(NOW(), 'MM-DD') AND TO_CHAR(NOW()+INTERVAL '7 days', 'MM-DD')
-                        ORDER BY TO_CHAR(fecha_nacimiento::date, 'MM-DD') LIMIT 10`, [iid]).catch(() => ({ rows: [] })),
+                        AND (
+                          MAKE_DATE(EXTRACT(YEAR FROM NOW())::int, EXTRACT(MONTH FROM fecha_nacimiento::date)::int, EXTRACT(DAY FROM fecha_nacimiento::date)::int)
+                            BETWEEN NOW()::date AND (NOW()::date + INTERVAL '7 days')::date
+                          OR
+                          MAKE_DATE((EXTRACT(YEAR FROM NOW())+1)::int, EXTRACT(MONTH FROM fecha_nacimiento::date)::int, EXTRACT(DAY FROM fecha_nacimiento::date)::int)
+                            BETWEEN NOW()::date AND (NOW()::date + INTERVAL '7 days')::date
+                        )
+                        ORDER BY EXTRACT(MONTH FROM fecha_nacimiento::date), EXTRACT(DAY FROM fecha_nacimiento::date) LIMIT 10`, [iid]).catch(() => ({ rows: [] })),
             // Ingresos recientes (últimas 24h)
             pool.query(`SELECT id, nombre, apellido, created_at FROM pacientes_b2b
                         WHERE institucion_id=$1 AND created_at > NOW()-INTERVAL '24 hours'
@@ -4322,11 +4404,18 @@ app.get('/api/b2b/notificaciones', authB2BMiddleware, async (req, res) => {
         const items = [];
         citasR.rows.forEach(c => items.push({ tipo: 'cita', icono: '📅', titulo: c.titulo, descripcion: `${c.paciente_nombre} · ${new Date(c.fecha).toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit' })}`, href: `paciente.html?id=${c.paciente_id}`, ts: c.created_at, es_nuevo: new Date(c.created_at) > new Date(lastSeen) }));
         notasR.rows.forEach(n => items.push({ tipo: 'nota_urgente', icono: '🚨', titulo: 'Nota urgente', descripcion: `${n.paciente_nombre}: ${String(n.contenido || '').slice(0, 70)}`, href: `paciente.html?id=${n.paciente_id}`, ts: n.created_at, es_nuevo: new Date(n.created_at) > new Date(lastSeen) }));
-        sintomasR.rows.forEach(s => items.push({ tipo: 'sintoma', icono: '🤒', titulo: `Síntoma: ${s.tipo}`, descripcion: s.paciente_nombre, href: `paciente.html?id=${s.paciente_id}`, ts: s.created_at, es_nuevo: new Date(s.created_at) > new Date(lastSeen) }));
+        sintomasR.rows.forEach(s => items.push({ tipo: 'sintoma', icono: '🤒', titulo: 'Síntoma registrado', descripcion: `${s.paciente_nombre}: ${s.descripcion}${s.intensidad ? ' · Intensidad: '+s.intensidad+'/10' : ''}`, href: `paciente.html?id=${s.paciente_id}`, ts: s.fecha, es_nuevo: new Date(s.fecha) > new Date(lastSeen) }));
         stockR.rows.forEach(s => items.push({ tipo: 'stock_bajo', icono: '⚠️', titulo: `Stock bajo: ${s.nombre}`, descripcion: `Actual: ${s.stock_actual} / Mínimo: ${s.stock_minimo}`, href: s.paciente_id ? `paciente.html?id=${s.paciente_id}` : 'catalogo.html', ts: null, es_nuevo: false }));
         cumpleR.rows.forEach(p => items.push({ tipo: 'cumpleanos', icono: '🎂', titulo: `Cumpleaños: ${p.nombre} ${p.apellido}`, descripcion: new Date(String(p.fecha_nacimiento).slice(0, 10) + 'T12:00:00').toLocaleDateString('es-AR', { day: '2-digit', month: 'long' }), href: `paciente.html?id=${p.id}`, ts: null, es_nuevo: false }));
         ingresosR.rows.forEach(p => items.push({ tipo: 'ingreso', icono: '🏥', titulo: `Nuevo ingreso: ${p.nombre} ${p.apellido}`, descripcion: 'Residente dado de alta recientemente', href: `paciente.html?id=${p.id}`, ts: p.created_at, es_nuevo: new Date(p.created_at) > new Date(lastSeen) }));
         egresosR.rows.forEach(p => items.push({ tipo: 'egreso', icono: '🏠', titulo: `Egreso: ${p.nombre} ${p.apellido}`, descripcion: 'Residente dado de egreso recientemente', href: `paciente.html?id=${p.id}`, ts: p.fecha_egreso, es_nuevo: p.fecha_egreso && new Date(p.fecha_egreso) > new Date(lastSeen) }));
+        // Ordenar por momento de generación (ts) descendente — más reciente primero
+        items.sort((a, b) => {
+            if (!a.ts && !b.ts) return 0;
+            if (!a.ts) return 1;
+            if (!b.ts) return -1;
+            return new Date(b.ts) - new Date(a.ts);
+        });
         res.json({ unread: items.filter(i => i.es_nuevo).length, items });
     } catch (err) {
         console.error('GET /api/b2b/notificaciones:', err.message);
