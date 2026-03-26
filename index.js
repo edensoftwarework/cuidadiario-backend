@@ -2090,8 +2090,9 @@ app.post('/api/b2b/create-subscription', authB2BMiddleware, requireB2BRole('admi
         if (instRes.rows.length === 0) return res.status(404).json({ error: 'Institución no encontrada' });
         const inst = instRes.rows[0];
         const PLANES_MP = {
-            pro:    { reason: 'CuidaDiario PRO — Plan PRO',    amount: 15000, amount_full: 30000 },
-            basico: { reason: 'CuidaDiario PRO — Plan Básico', amount: 10000, amount_full: 20000 }
+            total:  { reason: 'CuidaDiario PRO — Plan Total',   amount: 60000 },
+            pro:    { reason: 'CuidaDiario PRO — Plan PRO',     amount: 30000 },
+            basico: { reason: 'CuidaDiario PRO — Plan Básico',  amount: 15000 }
         };
         const planKey  = Object.keys(PLANES_MP).includes(req.body.plan) ? req.body.plan : 'pro';
         const testMode = req.body.test_mode === true;
@@ -2142,25 +2143,10 @@ app.post('/api/b2b/webhook/mercadopago', async (req, res) => {
                     if (preapproval.status === 'authorized') {
                         const plan = _mpPlanFromPreapproval(preapproval);
                         await pool.query(
-                            `UPDATE instituciones_b2b
-                             SET plan=$1, mp_preapproval_id=$3,
-                                 discount_expires_at = CASE WHEN discount_expires_at IS NULL THEN NOW() + INTERVAL '6 months' ELSE discount_expires_at END
-                             WHERE id=$2`,
+                            `UPDATE instituciones_b2b SET plan=$1, mp_preapproval_id=$3 WHERE id=$2`,
                             [plan, instId, preapproval.id]
                         );
-                        console.log(`[MP Webhook B2B] ✅ Institución ${instId} → plan: ${plan.toUpperCase()} (estado MP: "${preapproval.status}")`);
-                        // Auto-escalate price if discount period has expired
-                        const discountCheck = await pool.query('SELECT discount_expires_at FROM instituciones_b2b WHERE id=$1', [instId]);
-                        const expiry = discountCheck.rows[0]?.discount_expires_at;
-                        if (expiry && new Date() > new Date(expiry)) {
-                            const fullAmounts = { pro: 30000, basico: 20000 };
-                            const fullAmount = fullAmounts[plan];
-                            const currentAmount = preapproval?.auto_recurring?.transaction_amount;
-                            if (fullAmount && currentAmount < fullAmount) {
-                                await mpRequest(`/preapproval/${preapproval.id}`, 'PATCH', { auto_recurring: { transaction_amount: fullAmount } });
-                                console.log(`[MP Webhook B2B] 💰 Período promocional expirado — institución ${instId} actualizada a $${fullAmount}/mes`);
-                            }
-                        }
+                        console.log(`[MP Webhook B2B] ✅ Institución ${instId} → plan: ${plan.toUpperCase()} (estado MP: "${preapproval.status}")`)
                     } else if (['cancelled', 'paused', 'expired'].includes(preapproval.status)) {
                         await pool.query('UPDATE instituciones_b2b SET plan=$1 WHERE id=$2', ['free', instId]);
                         console.log(`[MP Webhook B2B] 🔻 Institución ${instId} → plan: free (estado MP: "${preapproval.status}")`);
@@ -2183,16 +2169,17 @@ app.post('/api/b2b/webhook/mercadopago', async (req, res) => {
     }
 });
 
-// Helper: determina el plan (pro/basico) a partir de un objeto preapproval de MP
+// Helper: determina el plan (total/pro/basico) a partir de un objeto preapproval de MP
 function _mpPlanFromPreapproval(preapproval) {
     const reason = (preapproval?.reason || '').toLowerCase();
     const amount = preapproval?.auto_recurring?.transaction_amount;
-    // Detectar por descripción (más fiable — los precios intro y completo se superponen)
+    // Detectar por descripción (más fiable)
+    if (reason.includes('total')) return 'total';
     if (reason.includes('plan pro')) return 'pro';
     if (reason.includes('básico') || reason.includes('basico')) return 'basico';
-    // Fallback por monto: PRO intro=15000, full=30000; Básico intro=10000, full=20000
-    // Umbral conservador: ≥25000 → PRO full; resto → básico
-    if (amount >= 25000) return 'pro';
+    // Fallback por monto
+    if (amount >= 50000) return 'total';
+    if (amount >= 20000) return 'pro';
     return 'basico';
 }
 
@@ -2858,18 +2845,18 @@ async function checkInstPlanForAction(instId, action) {
                     code: 'TRIAL_EXPIRED',
                     pacientes_count: pacientesCount,
                     staff_count: staffCount,
-                    can_use_basico: pacientesCount <= 20 && staffCount <= 5,
+                    can_use_basico: pacientesCount <= 10 && staffCount <= 5,
                     error: 'Tu período de prueba de 60 días ha vencido. Activá un plan desde Configuración para continuar.'
                 };
             }
         }
     }
 
-    // Verificar límites del plan Básico
+        // Verificar límites del plan Básico
     if (inst.plan === 'basico') {
         if (action === 'crear_paciente') {
-            if (pacientesCount >= 20) {
-                return { allowed: false, error: 'Tu plan Básico permite hasta 20 pacientes activos. Actualizá a PRO para agregar más.' };
+            if (pacientesCount >= 10) {
+                return { allowed: false, error: 'Tu plan Básico permite hasta 10 pacientes activos. Actualizá a PRO para agregar más.' };
             }
         }
         if (action === 'crear_staff') {
@@ -2878,6 +2865,21 @@ async function checkInstPlanForAction(instId, action) {
             }
         }
     }
+
+    // Verificar límites del plan PRO
+    if (inst.plan === 'pro') {
+        if (action === 'crear_paciente') {
+            if (pacientesCount >= 30) {
+                return { allowed: false, error: 'Tu plan PRO permite hasta 30 pacientes activos. Actualizá a Total para agregar más.' };
+            }
+        }
+        if (action === 'crear_staff') {
+            if (staffCount >= 20) {
+                return { allowed: false, error: 'Tu plan PRO permite hasta 20 miembros del equipo. Actualizá a Total para agregar más.' };
+            }
+        }
+    }
+    // plan === 'total' → sin límites
 
     return { allowed: true };
 }
@@ -3963,23 +3965,6 @@ app.post('/api/b2b/citas', authB2BMiddleware, requireB2BRole('admin_institucion'
 app.patch('/api/b2b/citas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
     try {
         const { titulo, descripcion, fecha, medico, especialidad, lugar, estado } = req.body;
-        // Auto-archivar en historial si la cita estaba como 'realizada' y se reutiliza (cambia fecha o estado)
-        const curRes = await pool.query(
-            'SELECT * FROM citas_b2b WHERE id=$1 AND institucion_id=$2',
-            [req.params.id, req.b2bUser.institucion_id]
-        );
-        const cur = curRes.rows[0];
-        // Solo archivar en historial cuando se REUTILIZA la cita: estado pasa de 'realizada' → 'pendiente' con nueva fecha
-        const isReutilizando = cur && cur.estado === 'realizada' && estado === 'pendiente' && fecha;
-        if (isReutilizando) {
-            await pool.query(
-                `INSERT INTO historial_citas_b2b
-                 (institucion_id, cita_id, paciente_id, titulo, descripcion, fecha, medico, especialidad, lugar, estado, archivado_por)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-                [cur.institucion_id, cur.id, cur.paciente_id, cur.titulo, cur.descripcion,
-                 cur.fecha, cur.medico, cur.especialidad, cur.lugar, cur.estado, req.b2bUser.id]
-            ).catch(e => console.error('historial_citas insert error:', e.message));
-        }
         await pool.query(
             `UPDATE citas_b2b SET titulo=COALESCE($1,titulo), descripcion=COALESCE($2,descripcion), fecha=COALESCE($3,fecha),
              medico=COALESCE($4,medico), especialidad=COALESCE($5,especialidad), lugar=COALESCE($6,lugar),
@@ -3994,29 +3979,20 @@ app.patch('/api/b2b/citas/:id', authB2BMiddleware, requireB2BRole('admin_institu
     }
 });
 
-// GET /api/b2b/citas/historial?paciente_id=X  — historial de citas archivadas + citas actualmente realizadas
+// GET /api/b2b/citas/historial?paciente_id=X  — citas marcadas como realizadas
 app.get('/api/b2b/citas/historial', authB2BMiddleware, async (req, res) => {
     try {
         const { paciente_id } = req.query;
         const iid = req.b2bUser.institucion_id;
         const params = [iid];
         let pacienteFilter = '';
-        if (paciente_id) { params.push(paciente_id); pacienteFilter = `AND paciente_id=$${params.length}`; }
-        // UNION: citas archivadas (reutilizadas) + citas activas en estado 'realizada'
+        if (paciente_id) { params.push(paciente_id); pacienteFilter = `AND c.paciente_id=$${params.length}`; }
         const query = `
-            SELECT h.id, h.titulo, h.descripcion, h.fecha, h.medico, h.especialidad, h.lugar, h.estado,
-                   h.archivado_en, u.nombre AS archivado_por_nombre, 'historial' AS fuente,
-                   h.paciente_id
-            FROM historial_citas_b2b h
-            LEFT JOIN usuarios_b2b u ON h.archivado_por = u.id
-            WHERE h.institucion_id=$1 ${pacienteFilter}
-            UNION ALL
             SELECT c.id, c.titulo, c.descripcion, c.fecha, c.medico, c.especialidad, c.lugar, c.estado,
-                   c.updated_at AS archivado_en, NULL AS archivado_por_nombre, 'realizada' AS fuente,
-                   c.paciente_id
+                   c.updated_at, c.paciente_id
             FROM citas_b2b c
-            WHERE c.institucion_id=$1 AND c.estado='realizada' ${paciente_id ? `AND c.paciente_id=$2` : ''}
-            ORDER BY fecha DESC
+            WHERE c.institucion_id=$1 AND c.estado='realizada' ${pacienteFilter}
+            ORDER BY c.fecha DESC
         `;
         res.json((await pool.query(query, params)).rows);
     } catch (err) {
