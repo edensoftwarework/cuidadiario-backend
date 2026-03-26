@@ -708,6 +708,24 @@ async function runMigrations() {
         }
 
         // ============================================================
+        // MIGRACIÓN TZ v2 — convierte catalogo.updated_at a TIMESTAMP local AR
+        // ============================================================
+        const tzM2 = await pool.query(
+            `INSERT INTO _migrations (name) VALUES ('tz_ar_v2') ON CONFLICT (name) DO NOTHING RETURNING name`
+        ).catch(() => ({ rows: [] }));
+        if (tzM2.rows.length > 0) {
+            await pool.query(`
+                ALTER TABLE catalogo_medicamentos_b2b
+                ALTER COLUMN updated_at TYPE TIMESTAMP
+                USING (updated_at AT TIME ZONE 'America/Argentina/Buenos_Aires')
+            `).catch(e => console.error('[TZ-mig v2] catalogo updated_at:', e.message));
+            await pool.query(
+                `UPDATE catalogo_medicamentos_b2b SET updated_at = updated_at - INTERVAL '3 hours' WHERE updated_at IS NOT NULL`
+            ).catch(e => console.error('[TZ-mig v2] catalogo updated_at adjust:', e.message));
+            console.log('✅ Migración TZ v2 completada');
+        }
+
+        // ============================================================
         // FIN MIGRACIONES B2B
         // ============================================================
 
@@ -4375,12 +4393,15 @@ app.get('/api/b2b/notificaciones', authB2BMiddleware, async (req, res) => {
                         WHERE s.institucion_id=$1 AND s.fecha > NOW()-INTERVAL '24 hours'
                         AND p.fecha_egreso IS NULL ORDER BY s.fecha DESC LIMIT 10`, [iid]).catch(() => ({ rows: [] })),
             // Insumos con stock bajo
-            pool.query(`SELECT id, nombre, stock_actual, stock_minimo, paciente_id
+            pool.query(`SELECT id, nombre, stock_actual, stock_minimo, paciente_id, updated_at
                         FROM catalogo_medicamentos_b2b
                         WHERE institucion_id=$1 AND activo=TRUE AND stock_actual < stock_minimo
                         ORDER BY (stock_minimo - stock_actual) DESC LIMIT 20`, [iid]).catch(() => ({ rows: [] })),
             // Cumpleaños en los próximos 7 días (robusto para cambio de año)
-            pool.query(`SELECT id, nombre, apellido, fecha_nacimiento
+            pool.query(`SELECT id, nombre, apellido,
+                          TO_CHAR(fecha_nacimiento::date, 'YYYY-MM-DD') AS fn_iso,
+                          (EXTRACT(MONTH FROM fecha_nacimiento::date) = EXTRACT(MONTH FROM NOW())
+                           AND EXTRACT(DAY FROM fecha_nacimiento::date) = EXTRACT(DAY FROM NOW())) AS es_hoy
                         FROM pacientes_b2b
                         WHERE institucion_id=$1 AND activo=TRUE AND fecha_egreso IS NULL AND fecha_nacimiento IS NOT NULL
                         AND (
@@ -4404,9 +4425,9 @@ app.get('/api/b2b/notificaciones', authB2BMiddleware, async (req, res) => {
         const items = [];
         citasR.rows.forEach(c => items.push({ tipo: 'cita', icono: '📅', titulo: c.titulo, descripcion: `${c.paciente_nombre} · ${new Date(c.fecha).toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit' })}`, href: `paciente.html?id=${c.paciente_id}`, ts: c.created_at, es_nuevo: new Date(c.created_at) > new Date(lastSeen) }));
         notasR.rows.forEach(n => items.push({ tipo: 'nota_urgente', icono: '🚨', titulo: 'Nota urgente', descripcion: `${n.paciente_nombre}: ${String(n.contenido || '').slice(0, 70)}`, href: `paciente.html?id=${n.paciente_id}`, ts: n.created_at, es_nuevo: new Date(n.created_at) > new Date(lastSeen) }));
-        sintomasR.rows.forEach(s => items.push({ tipo: 'sintoma', icono: '🤒', titulo: 'Síntoma registrado', descripcion: `${s.paciente_nombre}: ${s.descripcion}${s.intensidad ? ' · Intensidad: '+s.intensidad+'/10' : ''}`, href: `paciente.html?id=${s.paciente_id}`, ts: s.fecha, es_nuevo: new Date(s.fecha) > new Date(lastSeen) }));
-        stockR.rows.forEach(s => items.push({ tipo: 'stock_bajo', icono: '⚠️', titulo: `Stock bajo: ${s.nombre}`, descripcion: `Actual: ${s.stock_actual} / Mínimo: ${s.stock_minimo}`, href: s.paciente_id ? `paciente.html?id=${s.paciente_id}` : 'catalogo.html', ts: null, es_nuevo: false }));
-        cumpleR.rows.forEach(p => items.push({ tipo: 'cumpleanos', icono: '🎂', titulo: `Cumpleaños: ${p.nombre} ${p.apellido}`, descripcion: new Date(String(p.fecha_nacimiento).slice(0, 10) + 'T12:00:00').toLocaleDateString('es-AR', { day: '2-digit', month: 'long' }), href: `paciente.html?id=${p.id}`, ts: null, es_nuevo: false }));
+        sintomasR.rows.forEach(s => items.push({ tipo: 'sintoma', icono: '�', titulo: 'Síntoma registrado', descripcion: `${s.paciente_nombre}: ${s.descripcion}${s.intensidad ? ' · Intensidad: '+s.intensidad+'/10' : ''}`, href: `paciente.html?id=${s.paciente_id}`, ts: s.fecha, es_nuevo: new Date(s.fecha) > new Date(lastSeen) }));
+        stockR.rows.forEach(s => items.push({ tipo: 'stock_bajo', icono: '⚠️', titulo: `Stock bajo: ${s.nombre}`, descripcion: `Actual: ${s.stock_actual} / Mínimo: ${s.stock_minimo}`, href: s.paciente_id ? `paciente.html?id=${s.paciente_id}` : 'catalogo.html', ts: s.updated_at, es_nuevo: !!s.updated_at && new Date(s.updated_at) > new Date(lastSeen) }));
+        cumpleR.rows.forEach(p => { const desc = p.fn_iso ? new Date(p.fn_iso + 'T12:00:00').toLocaleDateString('es-AR', { day: '2-digit', month: 'long' }) : '—'; items.push({ tipo: 'cumpleanos', icono: '🎂', titulo: `Cumpleaños: ${p.nombre} ${p.apellido}`, descripcion: desc, href: `paciente.html?id=${p.id}`, ts: null, es_nuevo: !!p.es_hoy }); });
         ingresosR.rows.forEach(p => items.push({ tipo: 'ingreso', icono: '🏥', titulo: `Nuevo ingreso: ${p.nombre} ${p.apellido}`, descripcion: 'Residente dado de alta recientemente', href: `paciente.html?id=${p.id}`, ts: p.created_at, es_nuevo: new Date(p.created_at) > new Date(lastSeen) }));
         egresosR.rows.forEach(p => items.push({ tipo: 'egreso', icono: '🏠', titulo: `Egreso: ${p.nombre} ${p.apellido}`, descripcion: 'Residente dado de egreso recientemente', href: `paciente.html?id=${p.id}`, ts: p.fecha_egreso, es_nuevo: p.fecha_egreso && new Date(p.fecha_egreso) > new Date(lastSeen) }));
         // Ordenar por momento de generación (ts) descendente — más reciente primero
