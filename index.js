@@ -2089,6 +2089,12 @@ app.post('/api/b2b/create-subscription', authB2BMiddleware, requireB2BRole('admi
         const instRes = await pool.query('SELECT id, nombre, email FROM instituciones_b2b WHERE id=$1', [req.b2bUser.institucion_id]);
         if (instRes.rows.length === 0) return res.status(404).json({ error: 'Institución no encontrada' });
         const inst = instRes.rows[0];
+        const PLANES_MP = {
+            total:  { reason: 'CuidaDiario PRO — Plan Total',   amount: 60000 },
+            pro:    { reason: 'CuidaDiario PRO — Plan PRO',     amount: 30000 },
+            basico: { reason: 'CuidaDiario PRO — Plan Básico',  amount: 15000 }
+        };
+        const planKey  = Object.keys(PLANES_MP).includes(req.body.plan) ? req.body.plan : 'pro';
         // Validar elegibilidad del plan según conteos actuales (familiares excluidos del staff)
         const eligR = await pool.query(
             `SELECT (SELECT COUNT(*) FROM pacientes_b2b WHERE institucion_id=$1 AND activo=TRUE AND fecha_egreso IS NULL) AS pac,
@@ -2100,7 +2106,7 @@ app.post('/api/b2b/create-subscription', authB2BMiddleware, requireB2BRole('admi
             const parts = [];
             if (curPac > 10) parts.push(`${curPac} pacientes activos (máx. 10 en Básico)`);
             if (curStf > 5)  parts.push(`${curStf} miembros de staff (máx. 5 en Básico)`);
-            return res.status(403).json({ error: `No podés contratar el Plan Básico con tu configuración actual: ${parts.join(' y ')}. Reduí primero tus registros desde Pacientes o Staff.`, code: 'PLAN_LIMIT_EXCEEDED' });
+            return res.status(403).json({ error: `No podés contratar el Plan Básico con tu configuración actual: ${parts.join(' y ')}. Reducí primero tus registros desde Pacientes o Staff.`, code: 'PLAN_LIMIT_EXCEEDED' });
         }
         if (planKey === 'pro' && (curPac > 30 || curStf > 20)) {
             const parts = [];
@@ -2108,12 +2114,6 @@ app.post('/api/b2b/create-subscription', authB2BMiddleware, requireB2BRole('admi
             if (curStf > 20) parts.push(`${curStf} miembros de staff (máx. 20 en PRO)`);
             return res.status(403).json({ error: `No podés contratar el Plan PRO con tu configuración actual: ${parts.join(' y ')}. Actualizá a Plan Total para continuar.`, code: 'PLAN_LIMIT_EXCEEDED' });
         }
-        const PLANES_MP = {
-            total:  { reason: 'CuidaDiario PRO — Plan Total',   amount: 60000 },
-            pro:    { reason: 'CuidaDiario PRO — Plan PRO',     amount: 30000 },
-            basico: { reason: 'CuidaDiario PRO — Plan Básico',  amount: 15000 }
-        };
-        const planKey  = Object.keys(PLANES_MP).includes(req.body.plan) ? req.body.plan : 'pro';
         const testMode = req.body.test_mode === true;
         const planInfo = PLANES_MP[planKey];
         const payload = {
