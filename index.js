@@ -2089,6 +2089,25 @@ app.post('/api/b2b/create-subscription', authB2BMiddleware, requireB2BRole('admi
         const instRes = await pool.query('SELECT id, nombre, email FROM instituciones_b2b WHERE id=$1', [req.b2bUser.institucion_id]);
         if (instRes.rows.length === 0) return res.status(404).json({ error: 'Institución no encontrada' });
         const inst = instRes.rows[0];
+        // Validar elegibilidad del plan según conteos actuales (familiares excluidos del staff)
+        const eligR = await pool.query(
+            `SELECT (SELECT COUNT(*) FROM pacientes_b2b WHERE institucion_id=$1 AND activo=TRUE AND fecha_egreso IS NULL) AS pac,
+                    (SELECT COUNT(*) FROM usuarios_b2b WHERE institucion_id=$1 AND activo=TRUE AND rol != 'familiar') AS stf`,
+            [inst.id]);
+        const curPac = parseInt(eligR.rows[0].pac) || 0;
+        const curStf = parseInt(eligR.rows[0].stf) || 0;
+        if (planKey === 'basico' && (curPac > 10 || curStf > 5)) {
+            const parts = [];
+            if (curPac > 10) parts.push(`${curPac} pacientes activos (máx. 10 en Básico)`);
+            if (curStf > 5)  parts.push(`${curStf} miembros de staff (máx. 5 en Básico)`);
+            return res.status(403).json({ error: `No podés contratar el Plan Básico con tu configuración actual: ${parts.join(' y ')}. Reduí primero tus registros desde Pacientes o Staff.`, code: 'PLAN_LIMIT_EXCEEDED' });
+        }
+        if (planKey === 'pro' && (curPac > 30 || curStf > 20)) {
+            const parts = [];
+            if (curPac > 30) parts.push(`${curPac} pacientes activos (máx. 30 en PRO)`);
+            if (curStf > 20) parts.push(`${curStf} miembros de staff (máx. 20 en PRO)`);
+            return res.status(403).json({ error: `No podés contratar el Plan PRO con tu configuración actual: ${parts.join(' y ')}. Actualizá a Plan Total para continuar.`, code: 'PLAN_LIMIT_EXCEEDED' });
+        }
         const PLANES_MP = {
             total:  { reason: 'CuidaDiario PRO — Plan Total',   amount: 60000 },
             pro:    { reason: 'CuidaDiario PRO — Plan PRO',     amount: 30000 },
@@ -2821,7 +2840,7 @@ async function checkInstPlanForAction(instId, action) {
     const r = await pool.query(
         `SELECT plan, trial_started_at,
             (SELECT COUNT(*) FROM pacientes_b2b WHERE institucion_id=$1 AND activo=TRUE AND fecha_egreso IS NULL) AS pacientes_count,
-            (SELECT COUNT(*) FROM usuarios_b2b WHERE institucion_id=$1 AND activo=TRUE) AS staff_count
+            (SELECT COUNT(*) FROM usuarios_b2b WHERE institucion_id=$1 AND activo=TRUE AND rol != 'familiar') AS staff_count
          FROM instituciones_b2b WHERE id=$1`,
         [instId]
     );
@@ -3325,7 +3344,7 @@ app.get('/api/b2b/institucion', authB2BMiddleware, async (req, res) => {
         const result = await pool.query(
             `SELECT i.*,
                 (SELECT COUNT(*) FROM pacientes_b2b WHERE institucion_id=i.id AND activo=TRUE AND fecha_egreso IS NULL) AS pacientes_count,
-                (SELECT COUNT(*) FROM usuarios_b2b WHERE institucion_id=i.id AND activo=TRUE) AS staff_count
+                (SELECT COUNT(*) FROM usuarios_b2b WHERE institucion_id=i.id AND activo=TRUE AND rol != 'familiar') AS staff_count
              FROM instituciones_b2b i WHERE i.id=$1`,
             [req.b2bUser.institucion_id]
         );
