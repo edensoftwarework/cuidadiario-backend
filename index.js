@@ -3810,6 +3810,17 @@ app.get('/api/b2b/catalogo/stock-bajo', authB2BMiddleware, requireB2BRole('admin
 app.get('/api/b2b/catalogo', authB2BMiddleware, async (req, res) => {
     try {
         const { paciente_id } = req.query;
+
+        // Familiar: solo puede ver insumos específicos de sus pacientes asignados
+        if (req.b2bUser.rol === 'familiar') {
+            if (!paciente_id) return res.json([]); // sin inventario institucional
+            const acc = await pool.query(
+                'SELECT id FROM asignaciones_b2b WHERE cuidador_id=$1 AND paciente_id=$2 AND activa=TRUE',
+                [req.b2bUser.id, paciente_id]
+            );
+            if (acc.rowCount === 0) return res.status(403).json({ error: 'No tenés acceso a este paciente' });
+        }
+
         let query, params;
         if (paciente_id) {
             query = `SELECT c.*, p.nombre AS paciente_nombre, p.apellido AS paciente_apellido
@@ -4357,6 +4368,22 @@ app.get('/api/b2b/notificaciones', authB2BMiddleware, async (req, res) => {
         // Obtener cuándo abrió la campana por última vez este usuario
         const lsRes = await pool.query('SELECT notif_last_seen_at FROM usuarios_b2b WHERE id=$1', [uid]);
         const lastSeen = lsRes.rows[0]?.notif_last_seen_at || new Date(0);
+
+        // Familiares solo ven notificaciones de sus pacientes asignados
+        let familiarPatientIds = new Set();
+        if (req.b2bUser.rol === 'familiar') {
+            const assignedR = await pool.query(
+                'SELECT paciente_id FROM asignaciones_b2b WHERE cuidador_id=$1 AND activa=TRUE',
+                [uid]
+            );
+            if (assignedR.rows.length === 0) return res.json({ unread: 0, items: [] });
+            assignedR.rows.forEach(r => familiarPatientIds.add(r.paciente_id));
+        }
+        // Helpers de filtro: _fp filtra por paciente_id, _fpById filtra por id (cuando la row es el paciente)
+        const _fp    = (rows) => familiarPatientIds.size === 0 ? rows : rows.filter(r => familiarPatientIds.has(r.paciente_id));
+        const _fpById = (rows) => familiarPatientIds.size === 0 ? rows : rows.filter(r => familiarPatientIds.has(r.id));
+        const _fpStock = (rows) => familiarPatientIds.size === 0 ? rows : rows.filter(r => r.paciente_id !== null && familiarPatientIds.has(r.paciente_id));
+
         const [citasR, notasR, sintomasR, stockR, cumpleR, ingresosR, egresosR] = await Promise.all([
             // Citas próximas (15 días) pendientes
             pool.query(`SELECT c.id, c.titulo, c.fecha, c.created_at, p.nombre||' '||p.apellido AS paciente_nombre, p.id AS paciente_id
@@ -4413,19 +4440,19 @@ app.get('/api/b2b/notificaciones', authB2BMiddleware, async (req, res) => {
 
         const items = [];
 
-        citasR.rows.forEach(c => items.push({ tipo: 'cita', icono: '\uD83D\uDCC5', titulo: c.titulo, descripcion: `${c.paciente_nombre} \u00B7 ${new Date(c.fecha).toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit' })}`, href: `paciente.html?id=${c.paciente_id}`, ts: c.created_at, es_nuevo: new Date(c.created_at) > new Date(lastSeen) }));
+        citasR.rows.length && _fp(citasR.rows).forEach(c => items.push({ tipo: 'cita', icono: '\uD83D\uDCC5', titulo: c.titulo, descripcion: `${c.paciente_nombre} \u00B7 ${new Date(c.fecha).toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit' })}`, href: `paciente.html?id=${c.paciente_id}`, ts: c.created_at, es_nuevo: new Date(c.created_at) > new Date(lastSeen) }));
 
-        notasR.rows.forEach(n => items.push({ tipo: 'nota_urgente', icono: '\uD83D\uDEA8', titulo: 'Nota urgente', descripcion: `${n.paciente_nombre}: ${String(n.contenido || '').slice(0, 70)}`, href: `paciente.html?id=${n.paciente_id}`, ts: n.created_at, es_nuevo: new Date(n.created_at) > new Date(lastSeen) }));
+        notasR.rows.length && _fp(notasR.rows).forEach(n => items.push({ tipo: 'nota_urgente', icono: '\uD83D\uDEA8', titulo: 'Nota urgente', descripcion: `${n.paciente_nombre}: ${String(n.contenido || '').slice(0, 70)}`, href: `paciente.html?id=${n.paciente_id}`, ts: n.created_at, es_nuevo: new Date(n.created_at) > new Date(lastSeen) }));
 
-        sintomasR.rows.forEach(s => items.push({ tipo: 'sintoma', icono: '\uD83E\uDE7A', titulo: 'S\u00EDntoma registrado', descripcion: `${s.paciente_nombre}: ${s.descripcion}${s.intensidad ? ' \u00B7 Intensidad: '+s.intensidad+'/10' : ''}`, href: `paciente.html?id=${s.paciente_id}`, ts: s.fecha, es_nuevo: new Date(s.fecha) > new Date(lastSeen) }));
+        sintomasR.rows.length && _fp(sintomasR.rows).forEach(s => items.push({ tipo: 'sintoma', icono: '\uD83E\uDE7A', titulo: 'S\u00EDntoma registrado', descripcion: `${s.paciente_nombre}: ${s.descripcion}${s.intensidad ? ' \u00B7 Intensidad: '+s.intensidad+'/10' : ''}`, href: `paciente.html?id=${s.paciente_id}`, ts: s.fecha, es_nuevo: new Date(s.fecha) > new Date(lastSeen) }));
 
-        stockR.rows.forEach(s => items.push({ tipo: 'stock_bajo', icono: '\u26A0\uFE0F', titulo: `Stock bajo: ${s.nombre}`, descripcion: `Actual: ${s.stock_actual} / M\u00EDnimo: ${s.stock_minimo}`, href: s.paciente_id ? `paciente.html?id=${s.paciente_id}` : 'catalogo.html', ts: s.updated_at, es_nuevo: !!s.updated_at && new Date(s.updated_at) > new Date(lastSeen) }));
+        stockR.rows.length && _fpStock(stockR.rows).forEach(s => items.push({ tipo: 'stock_bajo', icono: '\u26A0\uFE0F', titulo: `Stock bajo: ${s.nombre}`, descripcion: `Actual: ${s.stock_actual} / M\u00EDnimo: ${s.stock_minimo}`, href: s.paciente_id ? `paciente.html?id=${s.paciente_id}` : 'catalogo.html', ts: s.updated_at, es_nuevo: !!s.updated_at && new Date(s.updated_at) > new Date(lastSeen) }));
 
-        cumpleR.rows.forEach(p => { const desc = p.fn_iso ? new Date(p.fn_iso + 'T12:00:00').toLocaleDateString('es-AR', { day: '2-digit', month: 'long' }) : '\u2014'; const bts = p.es_hoy ? todayAR + 'T00:00:00' : null; items.push({ tipo: 'cumpleanos', icono: '\uD83C\uDF82', titulo: `Cumplea\u00F1os: ${p.nombre} ${p.apellido}`, descripcion: desc, href: `paciente.html?id=${p.id}`, ts: bts, es_nuevo: !!p.es_hoy && lastSeenDateStr < todayAR }); });
+        cumpleR.rows.length && _fpById(cumpleR.rows).forEach(p => { const desc = p.fn_iso ? new Date(p.fn_iso + 'T12:00:00').toLocaleDateString('es-AR', { day: '2-digit', month: 'long' }) : '\u2014'; const bts = p.es_hoy ? todayAR + 'T00:00:00' : null; items.push({ tipo: 'cumpleanos', icono: '\uD83C\uDF82', titulo: `Cumplea\u00F1os: ${p.nombre} ${p.apellido}`, descripcion: desc, href: `paciente.html?id=${p.id}`, ts: bts, es_nuevo: !!p.es_hoy && lastSeenDateStr < todayAR }); });
 
-        ingresosR.rows.forEach(p => items.push({ tipo: 'ingreso', icono: '\uD83C\uDFE5', titulo: `Nuevo ingreso: ${p.nombre} ${p.apellido}`, descripcion: 'Residente dado de alta recientemente', href: `paciente.html?id=${p.id}`, ts: p.created_at, es_nuevo: new Date(p.created_at) > new Date(lastSeen) }));
+        ingresosR.rows.length && _fpById(ingresosR.rows).forEach(p => items.push({ tipo: 'ingreso', icono: '\uD83C\uDFE5', titulo: `Nuevo ingreso: ${p.nombre} ${p.apellido}`, descripcion: 'Residente dado de alta recientemente', href: `paciente.html?id=${p.id}`, ts: p.created_at, es_nuevo: new Date(p.created_at) > new Date(lastSeen) }));
 
-        egresosR.rows.forEach(p => items.push({ tipo: 'egreso', icono: '\uD83C\uDFE0', titulo: `Egreso: ${p.nombre} ${p.apellido}`, descripcion: 'Residente dado de egreso recientemente', href: `paciente.html?id=${p.id}`, ts: p.fecha_egreso, es_nuevo: p.fecha_egreso && new Date(p.fecha_egreso) > new Date(lastSeen) }));
+        egresosR.rows.length && _fpById(egresosR.rows).forEach(p => items.push({ tipo: 'egreso', icono: '\uD83C\uDFE0', titulo: `Egreso: ${p.nombre} ${p.apellido}`, descripcion: 'Residente dado de egreso recientemente', href: `paciente.html?id=${p.id}`, ts: p.fecha_egreso, es_nuevo: p.fecha_egreso && new Date(p.fecha_egreso) > new Date(lastSeen) }));
 
         // Ordenar por momento de generación (ts) descendente — más reciente primero
         items.sort((a, b) => {
