@@ -2198,10 +2198,10 @@ app.post('/api/b2b/webhook/mercadopago', async (req, res) => {
                     if (preapproval.status === 'authorized') {
                         const plan = _mpPlanFromPreapproval(preapproval);
                         await pool.query(
-                            `UPDATE instituciones_b2b SET plan=$1, mp_preapproval_id=$3 WHERE id=$2`,
+                            `UPDATE instituciones_b2b SET plan=$1, mp_preapproval_id=$3, plan_manual_expires_at=NOW() + INTERVAL '31 days' WHERE id=$2`,
                             [plan, instId, preapproval.id]
                         );
-                        console.log(`[MP Webhook B2B] ✅ Institución ${instId} → plan: ${plan.toUpperCase()} (estado MP: "${preapproval.status}")`)
+                        console.log(`[MP Webhook B2B] ✅ Institución ${instId} → plan: ${plan.toUpperCase()} (estado MP: "${preapproval.status}") — renovación en 31 días`)
                     } else if (['cancelled', 'paused', 'expired'].includes(preapproval.status)) {
                         await pool.query('UPDATE instituciones_b2b SET plan=$1 WHERE id=$2', ['free', instId]);
                         console.log(`[MP Webhook B2B] 🔻 Institución ${instId} → plan: free (estado MP: "${preapproval.status}")`);
@@ -2275,11 +2275,12 @@ app.get('/api/b2b/verify-subscription', authB2BMiddleware, requireB2BRole('admin
             await pool.query(
                 `UPDATE instituciones_b2b
                  SET plan=$1, mp_preapproval_id=$3,
+                     plan_manual_expires_at=NOW() + INTERVAL '31 days',
                      discount_expires_at = CASE WHEN discount_expires_at IS NULL THEN NOW() + INTERVAL '6 months' ELSE discount_expires_at END
                  WHERE id=$2`,
                 [plan, instId, preapproval.id]
             );
-            console.log(`[MP Verify B2B] ✅ Institución ${instId} → plan: ${plan.toUpperCase()} (preapproval: ${preapproval.id})`);
+            console.log(`[MP Verify B2B] ✅ Institución ${instId} → plan: ${plan.toUpperCase()} (preapproval: ${preapproval.id}) — renovación en 31 días`);
             return res.json({ plan, status: 'authorized' });
         }
 
@@ -2310,7 +2311,11 @@ app.post('/api/b2b/cancel-subscription', authB2BMiddleware, requireB2BRole('admi
         if (instRes.rowCount === 0) return res.status(404).json({ error: 'Institución no encontrada' });
         const inst = instRes.rows[0];
 
-        // Cancelar en MercadoPago si hay preapproval activo
+        if (!['basico','pro','total'].includes(inst.plan)) {
+            return res.status(400).json({ error: 'No hay ningún plan activo para cancelar.' });
+        }
+
+        // Cancelar en MercadoPago solo si hay preapproval (suscripción MP)
         if (inst.mp_preapproval_id && MP_ACCESS_TOKEN) {
             const mp = await mpRequest(`/preapproval/${inst.mp_preapproval_id}`, 'PUT', { status: 'cancelled' });
             if (mp.status === 200) {
@@ -4885,6 +4890,31 @@ app.post('/api/admin/set-plan', async (req, res) => {
         if (!institucion_id || !plan) return res.status(400).json({ error: 'institucion_id y plan son requeridos' });
         const validPlans = ['free', 'basico', 'pro', 'total'];
         if (!validPlans.includes(plan)) return res.status(400).json({ error: `Plan inválido. Debe ser uno de: ${validPlans.join(', ')}` });
+
+        // Validar límites de pacientes/staff para planes basico y pro
+        if (['basico', 'pro'].includes(plan)) {
+            const eligR = await pool.query(
+                `SELECT
+                    (SELECT COUNT(*) FROM pacientes_b2b WHERE institucion_id=$1 AND activo=TRUE AND fecha_egreso IS NULL) AS pac,
+                    (SELECT COUNT(*) FROM usuarios_b2b WHERE institucion_id=$1 AND activo=TRUE AND rol != 'familiar') AS stf`,
+                [parseInt(institucion_id)]
+            );
+            const curPac = parseInt(eligR.rows[0]?.pac) || 0;
+            const curStf = parseInt(eligR.rows[0]?.stf) || 0;
+            const limPac = plan === 'basico' ? 15 : 40;
+            const limStf = plan === 'basico' ? 8  : 20;
+            if (curPac > limPac || curStf > limStf) {
+                const parts = [];
+                if (curPac > limPac) parts.push(`${curPac} pacientes activos (máx. ${limPac})`);
+                if (curStf > limStf) parts.push(`${curStf} staff activo (máx. ${limStf})`);
+                const planLabel = plan === 'basico' ? 'Básico' : 'PRO';
+                return res.status(403).json({
+                    error: `No se puede asignar Plan ${planLabel}: la institución tiene ${parts.join(' y ')}. Usá Plan Total o reducí los registros primero.`,
+                    pacientes_count: curPac,
+                    staff_count: curStf
+                });
+            }
+        }
 
         // Calcular fecha de vencimiento manual
         let expiresAt = null;
