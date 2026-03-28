@@ -103,6 +103,27 @@ function rateLimit(maxReq = 10, windowMs = 60000) {
     };
 }
 const authRateLimit = rateLimit(10, 60000); // 10 intentos / 60 seg
+
+// ── Helper: convierte un ISO UTC string (enviado por el cliente) a una fecha naive
+// que representa la hora local de Argentina (UTC-3), para insertarla en columnas
+// TIMESTAMP sin zona. Si el valor es inválido, devuelve null y el backend usará NOW().
+function utcIsoToArgentinaNaive(isoStr) {
+    if (!isoStr) return null;
+    try {
+        const d = new Date(isoStr);
+        if (isNaN(d.getTime())) return null;
+        // Formatea la fecha en la zona Argentina para obtener la hora local correcta
+        const ar = new Intl.DateTimeFormat('sv-SE', {
+            timeZone: 'America/Argentina/Buenos_Aires',
+            year: 'numeric', month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', second: '2-digit',
+            hour12: false,
+        }).format(d);
+        // 'sv-SE' produce "YYYY-MM-DD HH:MM:SS" — parseable como naive local
+        return new Date(ar);
+    } catch { return null; }
+}
+
 const https = require('https');
 const crypto = require('crypto');          // ← nativo Node.js, sin instalar nada
 const webPush = require('web-push');       // ← push notifications
@@ -3744,7 +3765,7 @@ app.post('/api/b2b/medicamentos/:id/toma', authB2BMiddleware, requireB2BRole('ad
         // TIMESTAMP reflects local Argentine time and displays correctly on the frontend.
         const _adminNombre = (req.body._quien && typeof req.body._quien === 'string' && req.body._quien.trim()) ? req.body._quien.trim() : req.b2bUser.nombre;
         // Use the client-side timestamp when the action was performed offline; fall back to server NOW().
-        const _fecha = req.body._offline_ts ? new Date(req.body._offline_ts) : null;
+        const _fecha = utcIsoToArgentinaNaive(req.body._offline_ts);
         const result = await pool.query(
             `INSERT INTO historial_medicamentos_b2b
              (institucion_id, paciente_id, medicamento_id, medicamento_nombre, dosis, administrado_por, administrador_nombre, notas, fecha)
@@ -4103,7 +4124,7 @@ app.post('/api/b2b/tareas/:id/completar', authB2BMiddleware, requireB2BRole('adm
         const t = tarea.rows[0];
         const _compNombre = (req.body._quien && typeof req.body._quien === 'string' && req.body._quien.trim()) ? req.body._quien.trim() : req.b2bUser.nombre;
         // Use the client-side timestamp when the action was performed offline; fall back to server NOW().
-        const _fechaTarea = req.body._offline_ts ? new Date(req.body._offline_ts) : null;
+        const _fechaTarea = utcIsoToArgentinaNaive(req.body._offline_ts);
         const result = await pool.query(
             `INSERT INTO historial_tareas_b2b (institucion_id, paciente_id, tarea_id, tarea_titulo, completado_por, completador_nombre, notas, fecha)
              VALUES ($1,$2,$3,$4,$5,$6,$7, COALESCE($8, NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')) RETURNING *`,
@@ -4168,7 +4189,7 @@ app.post('/api/b2b/sintomas', authB2BMiddleware, requireB2BRole('admin_instituci
         const { paciente_id, descripcion, intensidad } = req.body;
         if (!paciente_id || !descripcion) return res.status(400).json({ error: 'paciente_id y descripcion obligatorios' });
         const _regNombreSint = (req.body._quien && typeof req.body._quien === 'string' && req.body._quien.trim()) ? req.body._quien.trim() : req.b2bUser.nombre;
-        const _fechaSint = req.body._offline_ts ? new Date(req.body._offline_ts) : null;
+        const _fechaSint = utcIsoToArgentinaNaive(req.body._offline_ts);
         const result = await pool.query(
             `INSERT INTO sintomas_b2b (institucion_id, paciente_id, descripcion, intensidad, registrado_por, registrador_nombre, fecha)
              VALUES ($1,$2,$3,$4,$5,$6, COALESCE($7, NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')) RETURNING *`,
@@ -4234,7 +4255,7 @@ app.post('/api/b2b/signos-vitales', authB2BMiddleware, requireB2BRole('admin_ins
         const { paciente_id, tipo, valor, unidad, notas } = req.body;
         if (!paciente_id || !tipo || !valor) return res.status(400).json({ error: 'paciente_id, tipo y valor obligatorios' });
         const _regNombreSigno = (req.body._quien && typeof req.body._quien === 'string' && req.body._quien.trim()) ? req.body._quien.trim() : req.b2bUser.nombre;
-        const _fechaSigno = req.body._offline_ts ? new Date(req.body._offline_ts) : null;
+        const _fechaSigno = utcIsoToArgentinaNaive(req.body._offline_ts);
         const result = await pool.query(
             `INSERT INTO signos_vitales_b2b (institucion_id, paciente_id, tipo, valor, unidad, notas, registrado_por, registrador_nombre, fecha)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8, COALESCE($9, NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')) RETURNING *`,
