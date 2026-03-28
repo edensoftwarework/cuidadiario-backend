@@ -2882,7 +2882,7 @@ async function checkInstPlanForAction(instId, action) {
             // Vencer automáticamente en DB y tratar como free expirado
             pool.query(`UPDATE instituciones_b2b SET plan='free', plan_manual_expires_at=NULL WHERE id=$1`, [instId]).catch(() => {});
             inst.plan = 'free';
-            inst.trial_started_at = null; // forzar expiración inmediata del trial también
+            // NO tocar trial_started_at — se usa la fecha real de creación para calcular si el trial venció
         }
     }
 
