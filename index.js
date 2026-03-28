@@ -676,6 +676,10 @@ async function runMigrations() {
         await pool.query(`ALTER TABLE usuarios_b2b ADD COLUMN IF NOT EXISTS notif_last_seen_at TIMESTAMPTZ`).catch(() => {});
         console.log('✅ Migraciones B2B v12 completadas');
 
+        // MIGRACIONES B2B v13 — Fecha de vencimiento de plan asignado manualmente
+        await pool.query(`ALTER TABLE instituciones_b2b ADD COLUMN IF NOT EXISTS plan_manual_expires_at TIMESTAMPTZ`).catch(() => {});
+        console.log('✅ Migraciones B2B v13 completadas');
+
         // ============================================================
         // MIGRACIÓN TZ v1 — corrección única de zona horaria (UTC → Argentina)
         // Se ejecuta una sola vez al detectar que aún no fue aplicada.
@@ -746,9 +750,9 @@ async function runMigrations() {
             console.log('✅ Migración TZ v2 completada');
         }
 
-        // MIGRACIÓN B2B v13 — updated_at en citas para rastrear cuándo se marcó como realizada
+        // MIGRACIÓN B2B v14 — updated_at en citas para rastrear cuándo se marcó como realizada
         await pool.query(`ALTER TABLE citas_b2b ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()`).catch(() => {});
-        console.log('✅ Migración B2B v13 completada');
+        console.log('✅ Migración B2B v14 completada');
 
         // ============================================================
         // FIN MIGRACIONES B2B
@@ -2111,9 +2115,9 @@ app.post('/api/b2b/create-subscription', authB2BMiddleware, requireB2BRole('admi
         if (instRes.rows.length === 0) return res.status(404).json({ error: 'Institución no encontrada' });
         const inst = instRes.rows[0];
         const PLANES_MP = {
-            total:  { reason: 'CuidaDiario PRO — Plan Total',   amount: 60000 },
-            pro:    { reason: 'CuidaDiario PRO — Plan PRO',     amount: 30000 },
-            basico: { reason: 'CuidaDiario PRO — Plan Básico',  amount: 15000 }
+            total:  { reason: 'CuidaDiario PRO — Plan Total',   amount: 99000 },
+            pro:    { reason: 'CuidaDiario PRO — Plan PRO',     amount: 59000 },
+            basico: { reason: 'CuidaDiario PRO — Plan Básico',  amount: 29000 }
         };
         const planKey  = Object.keys(PLANES_MP).includes(req.body.plan) ? req.body.plan : 'pro';
         // Validar elegibilidad del plan según conteos actuales (familiares excluidos del staff)
@@ -2123,15 +2127,15 @@ app.post('/api/b2b/create-subscription', authB2BMiddleware, requireB2BRole('admi
             [inst.id]);
         const curPac = parseInt(eligR.rows[0].pac) || 0;
         const curStf = parseInt(eligR.rows[0].stf) || 0;
-        if (planKey === 'basico' && (curPac > 10 || curStf > 5)) {
+        if (planKey === 'basico' && (curPac > 15 || curStf > 8)) {
             const parts = [];
-            if (curPac > 10) parts.push(`${curPac} pacientes activos (máx. 10 en Básico)`);
-            if (curStf > 5)  parts.push(`${curStf} miembros de staff (máx. 5 en Básico)`);
+            if (curPac > 15) parts.push(`${curPac} pacientes activos (máx. 15 en Básico)`);
+            if (curStf > 8)  parts.push(`${curStf} miembros de staff (máx. 8 en Básico)`);
             return res.status(403).json({ error: `No podés contratar el Plan Básico con tu configuración actual: ${parts.join(' y ')}. Reducí primero tus registros desde Pacientes o Staff.`, code: 'PLAN_LIMIT_EXCEEDED' });
         }
-        if (planKey === 'pro' && (curPac > 30 || curStf > 20)) {
+        if (planKey === 'pro' && (curPac > 40 || curStf > 20)) {
             const parts = [];
-            if (curPac > 30) parts.push(`${curPac} pacientes activos (máx. 30 en PRO)`);
+            if (curPac > 40) parts.push(`${curPac} pacientes activos (máx. 40 en PRO)`);
             if (curStf > 20) parts.push(`${curStf} miembros de staff (máx. 20 en PRO)`);
             return res.status(403).json({ error: `No podés contratar el Plan PRO con tu configuración actual: ${parts.join(' y ')}. Actualizá a Plan Total para continuar.`, code: 'PLAN_LIMIT_EXCEEDED' });
         }
@@ -2859,7 +2863,7 @@ app.delete('/api/notas/:id', authMiddleware, async (req, res) => {
  */
 async function checkInstPlanForAction(instId, action) {
     const r = await pool.query(
-        `SELECT plan, trial_started_at,
+        `SELECT plan, trial_started_at, plan_manual_expires_at,
             (SELECT COUNT(*) FROM pacientes_b2b WHERE institucion_id=$1 AND activo=TRUE AND fecha_egreso IS NULL) AS pacientes_count,
             (SELECT COUNT(*) FROM usuarios_b2b WHERE institucion_id=$1 AND activo=TRUE AND rol != 'familiar') AS staff_count
          FROM instituciones_b2b WHERE id=$1`,
@@ -2870,6 +2874,17 @@ async function checkInstPlanForAction(instId, action) {
 
     const pacientesCount = parseInt(inst.pacientes_count) || 0;
     const staffCount = parseInt(inst.staff_count) || 0;
+
+    // Verificar si el plan manual ha vencido → degradar a free
+    if (inst.plan !== 'free' && inst.plan_manual_expires_at) {
+        const expiry = new Date(inst.plan_manual_expires_at);
+        if (expiry < new Date()) {
+            // Vencer automáticamente en DB y tratar como free expirado
+            pool.query(`UPDATE instituciones_b2b SET plan='free', plan_manual_expires_at=NULL WHERE id=$1`, [instId]).catch(() => {});
+            inst.plan = 'free';
+            inst.trial_started_at = null; // forzar expiración inmediata del trial también
+        }
+    }
 
     // Verificar expiración del trial (plan 'free' = período de prueba)
     if (inst.plan === 'free') {
@@ -2885,7 +2900,7 @@ async function checkInstPlanForAction(instId, action) {
                     code: 'TRIAL_EXPIRED',
                     pacientes_count: pacientesCount,
                     staff_count: staffCount,
-                    can_use_basico: pacientesCount <= 10 && staffCount <= 5,
+                    can_use_basico: pacientesCount <= 15 && staffCount <= 8,
                     error: 'Tu período de prueba de 60 días ha vencido. Activá un plan desde Configuración para continuar.'
                 };
             }
@@ -2895,13 +2910,13 @@ async function checkInstPlanForAction(instId, action) {
         // Verificar límites del plan Básico
     if (inst.plan === 'basico') {
         if (action === 'crear_paciente') {
-            if (pacientesCount >= 10) {
-                return { allowed: false, error: 'Tu plan Básico permite hasta 10 pacientes activos. Actualizá a PRO para agregar más.' };
+            if (pacientesCount >= 15) {
+                return { allowed: false, error: 'Tu plan Básico permite hasta 15 pacientes activos. Actualizá a PRO para agregar más.' };
             }
         }
         if (action === 'crear_staff') {
-            if (staffCount >= 5) {
-                return { allowed: false, error: 'Tu plan Básico permite hasta 5 miembros del equipo. Actualizá a PRO para agregar más.' };
+            if (staffCount >= 8) {
+                return { allowed: false, error: 'Tu plan Básico permite hasta 8 miembros del equipo. Actualizá a PRO para agregar más.' };
             }
         }
     }
@@ -2909,8 +2924,8 @@ async function checkInstPlanForAction(instId, action) {
     // Verificar límites del plan PRO
     if (inst.plan === 'pro') {
         if (action === 'crear_paciente') {
-            if (pacientesCount >= 30) {
-                return { allowed: false, error: 'Tu plan PRO permite hasta 30 pacientes activos. Actualizá a Total para agregar más.' };
+            if (pacientesCount >= 40) {
+                return { allowed: false, error: 'Tu plan PRO permite hasta 40 pacientes activos. Actualizá a Total para agregar más.' };
             }
         }
         if (action === 'crear_staff') {
@@ -4786,7 +4801,11 @@ app.get('/api/admin/institucion/:id', async (req, res) => {
     if (!adminKey || adminKey !== expectedKey) return res.status(401).json({ error: 'Clave de administrador inválida' });
     try {
         const result = await pool.query(
-            'SELECT id, nombre, tipo, email, telefono, plan, activa, created_at FROM instituciones_b2b WHERE id=$1',
+            `SELECT i.id, i.nombre, i.tipo, i.email, i.telefono, i.plan, i.activa, i.created_at,
+                    i.trial_started_at, i.plan_manual_expires_at, i.mp_preapproval_id,
+                    (SELECT COUNT(*) FROM pacientes_b2b WHERE institucion_id=i.id AND activo=TRUE AND fecha_egreso IS NULL)::int AS pacientes_count,
+                    (SELECT COUNT(*) FROM usuarios_b2b WHERE institucion_id=i.id AND activo=TRUE AND rol != 'familiar')::int AS staff_count
+             FROM instituciones_b2b i WHERE i.id=$1`,
             [parseInt(req.params.id)]
         );
         if (result.rowCount === 0) return res.status(404).json({ error: 'Institución no encontrada' });
@@ -4814,18 +4833,38 @@ app.post('/api/admin/set-plan', async (req, res) => {
     if (!expectedKey) return res.status(503).json({ error: 'SUPERADMIN_KEY no configurada en el servidor' });
     if (!adminKey || adminKey !== expectedKey) return res.status(401).json({ error: 'Clave de administrador inválida' });
     try {
-        const { institucion_id, plan, note } = req.body;
+        const { institucion_id, plan, months, note } = req.body;
         if (!institucion_id || !plan) return res.status(400).json({ error: 'institucion_id y plan son requeridos' });
-        const validPlans = ['free', 'basico', 'pro'];
+        const validPlans = ['free', 'basico', 'pro', 'total'];
         if (!validPlans.includes(plan)) return res.status(400).json({ error: `Plan inválido. Debe ser uno de: ${validPlans.join(', ')}` });
+
+        // Calcular fecha de vencimiento manual
+        let expiresAt = null;
+        if (plan !== 'free' && months && parseInt(months) > 0) {
+            expiresAt = new Date();
+            expiresAt.setMonth(expiresAt.getMonth() + parseInt(months));
+        }
+
         const result = await pool.query(
-            'UPDATE instituciones_b2b SET plan=$1 WHERE id=$2 RETURNING id, nombre, plan',
-            [plan, parseInt(institucion_id)]
+            `UPDATE instituciones_b2b
+             SET plan=$1, plan_manual_expires_at=$2
+             WHERE id=$3
+             RETURNING id, nombre, plan, plan_manual_expires_at`,
+            [plan, expiresAt, parseInt(institucion_id)]
         );
         if (result.rowCount === 0) return res.status(404).json({ error: 'Institución no encontrada' });
         const inst = result.rows[0];
-        console.log(`[SuperAdmin] ✅ Plan actualizado manualmente — institución ${inst.id} (${inst.nombre}) → ${plan}${note ? ` | Nota: ${note}` : ''}`);
-        res.json({ success: true, institucion_id: inst.id, nombre: inst.nombre, plan: inst.plan });
+        const expiryLabel = inst.plan_manual_expires_at
+            ? ` | Vence: ${new Date(inst.plan_manual_expires_at).toLocaleDateString('es-AR')}`
+            : (plan !== 'free' ? ' | Sin vencimiento' : '');
+        console.log(`[SuperAdmin] ✅ Plan actualizado — inst ${inst.id} (${inst.nombre}) → ${plan}${expiryLabel}${note ? ` | Nota: ${note}` : ''}`);
+        res.json({
+            success: true,
+            institucion_id: inst.id,
+            nombre: inst.nombre,
+            plan: inst.plan,
+            plan_manual_expires_at: inst.plan_manual_expires_at
+        });
     } catch (err) {
         console.error('[SuperAdmin] set-plan error:', err.message);
         res.status(500).json({ error: err.message });
