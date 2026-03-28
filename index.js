@@ -2111,7 +2111,7 @@ app.delete('/api/share/:id', authMiddleware, async (req, res) => {
 app.post('/api/b2b/create-subscription', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
     try {
         // Obtener datos de la institución
-        const instRes = await pool.query('SELECT id, nombre, email FROM instituciones_b2b WHERE id=$1', [req.b2bUser.institucion_id]);
+        const instRes = await pool.query('SELECT id, nombre, email, mp_preapproval_id FROM instituciones_b2b WHERE id=$1', [req.b2bUser.institucion_id]);
         if (instRes.rows.length === 0) return res.status(404).json({ error: 'Institución no encontrada' });
         const inst = instRes.rows[0];
         const PLANES_MP = {
@@ -2139,6 +2139,17 @@ app.post('/api/b2b/create-subscription', authB2BMiddleware, requireB2BRole('admi
             if (curStf > 20) parts.push(`${curStf} miembros de staff (máx. 20 en PRO)`);
             return res.status(403).json({ error: `No podés contratar el Plan PRO con tu configuración actual: ${parts.join(' y ')}. Actualizá a Plan Total para continuar.`, code: 'PLAN_LIMIT_EXCEEDED' });
         }
+        // Cancelar suscripción MP anterior antes de crear la nueva (evita doble cobro)
+        if (inst.mp_preapproval_id && MP_ACCESS_TOKEN) {
+            try {
+                await mpRequest(`/preapproval/${inst.mp_preapproval_id}`, 'PUT', { status: 'cancelled' });
+                console.log(`[MP B2B] create-subscription: cancelada suscripción anterior ${inst.mp_preapproval_id} — inst ${inst.id}`);
+                await pool.query('UPDATE instituciones_b2b SET mp_preapproval_id=NULL WHERE id=$1', [inst.id]);
+            } catch (cancelErr) {
+                console.warn(`[MP B2B] No se pudo cancelar suscripción anterior: ${cancelErr.message}`);
+            }
+        }
+
         const testMode = req.body.test_mode === true;
         const planInfo = PLANES_MP[planKey];
         const payload = {
@@ -2282,6 +2293,43 @@ app.get('/api/b2b/verify-subscription', authB2BMiddleware, requireB2BRole('admin
 
     } catch (err) {
         console.error('[MP Verify B2B] Error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/b2b/cancel-subscription — Cancela la suscripción MP activa de la institución
+// Llama a la API de MP (PUT /preapproval/:id status:cancelled) y setea plan='free' en DB.
+// Funciona independientemente de si el usuario tiene cuenta MP o pagó como invitado con tarjeta.
+app.post('/api/b2b/cancel-subscription', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+    const instId = req.b2bUser.institucion_id;
+    try {
+        const instRes = await pool.query(
+            'SELECT mp_preapproval_id, plan FROM instituciones_b2b WHERE id=$1',
+            [instId]
+        );
+        if (instRes.rowCount === 0) return res.status(404).json({ error: 'Institución no encontrada' });
+        const inst = instRes.rows[0];
+
+        // Cancelar en MercadoPago si hay preapproval activo
+        if (inst.mp_preapproval_id && MP_ACCESS_TOKEN) {
+            const mp = await mpRequest(`/preapproval/${inst.mp_preapproval_id}`, 'PUT', { status: 'cancelled' });
+            if (mp.status === 200) {
+                console.log(`[MP Cancel B2B] ✅ Preapproval ${inst.mp_preapproval_id} cancelado — inst ${instId}`);
+            } else {
+                console.warn(`[MP Cancel B2B] HTTP ${mp.status} al cancelar ${inst.mp_preapproval_id}:`, mp.body?.message);
+                // Continuamos igual: actualizamos DB aunque MP retorne error
+            }
+        }
+
+        // Actualizar DB: free, sin preapproval, sin vencimiento manual
+        await pool.query(
+            `UPDATE instituciones_b2b SET plan='free', mp_preapproval_id=NULL, plan_manual_expires_at=NULL WHERE id=$1`,
+            [instId]
+        );
+        console.log(`[Cancel B2B] ✅ Inst ${instId} → plan free (era ${inst.plan})`);
+        res.json({ success: true, message: 'Suscripción cancelada correctamente.' });
+    } catch (err) {
+        console.error('[Cancel B2B] Error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
