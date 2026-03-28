@@ -3743,11 +3743,13 @@ app.post('/api/b2b/medicamentos/:id/toma', authB2BMiddleware, requireB2BRole('ad
         // Use NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires' so the stored naive
         // TIMESTAMP reflects local Argentine time and displays correctly on the frontend.
         const _adminNombre = (req.body._quien && typeof req.body._quien === 'string' && req.body._quien.trim()) ? req.body._quien.trim() : req.b2bUser.nombre;
+        // Use the client-side timestamp when the action was performed offline; fall back to server NOW().
+        const _fecha = req.body._offline_ts ? new Date(req.body._offline_ts) : null;
         const result = await pool.query(
             `INSERT INTO historial_medicamentos_b2b
              (institucion_id, paciente_id, medicamento_id, medicamento_nombre, dosis, administrado_por, administrador_nombre, notas, fecha)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8, NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires') RETURNING *`,
-            [req.b2bUser.institucion_id, m.paciente_id, m.id, m.nombre, m.dosis, req.b2bUser.id, _adminNombre, req.body.notas||null]
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8, COALESCE($9, NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')) RETURNING *`,
+            [req.b2bUser.institucion_id, m.paciente_id, m.id, m.nombre, m.dosis, req.b2bUser.id, _adminNombre, req.body.notas||null, _fecha]
         );
         // Auto-decrement stock — hybrid model: catalog wins when linked, else per-patient/individual stock
         if (m.catalogo_id) {
@@ -4100,10 +4102,12 @@ app.post('/api/b2b/tareas/:id/completar', authB2BMiddleware, requireB2BRole('adm
         if (tarea.rowCount === 0) return res.status(404).json({ error: 'Tarea no encontrada' });
         const t = tarea.rows[0];
         const _compNombre = (req.body._quien && typeof req.body._quien === 'string' && req.body._quien.trim()) ? req.body._quien.trim() : req.b2bUser.nombre;
+        // Use the client-side timestamp when the action was performed offline; fall back to server NOW().
+        const _fechaTarea = req.body._offline_ts ? new Date(req.body._offline_ts) : null;
         const result = await pool.query(
             `INSERT INTO historial_tareas_b2b (institucion_id, paciente_id, tarea_id, tarea_titulo, completado_por, completador_nombre, notas, fecha)
-             VALUES ($1,$2,$3,$4,$5,$6,$7, NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires') RETURNING *`,
-            [req.b2bUser.institucion_id, t.paciente_id, t.id, t.titulo, req.b2bUser.id, _compNombre, req.body.notas||null]
+             VALUES ($1,$2,$3,$4,$5,$6,$7, COALESCE($8, NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')) RETURNING *`,
+            [req.b2bUser.institucion_id, t.paciente_id, t.id, t.titulo, req.b2bUser.id, _compNombre, req.body.notas||null, _fechaTarea]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -4164,10 +4168,11 @@ app.post('/api/b2b/sintomas', authB2BMiddleware, requireB2BRole('admin_instituci
         const { paciente_id, descripcion, intensidad } = req.body;
         if (!paciente_id || !descripcion) return res.status(400).json({ error: 'paciente_id y descripcion obligatorios' });
         const _regNombreSint = (req.body._quien && typeof req.body._quien === 'string' && req.body._quien.trim()) ? req.body._quien.trim() : req.b2bUser.nombre;
+        const _fechaSint = req.body._offline_ts ? new Date(req.body._offline_ts) : null;
         const result = await pool.query(
-            `INSERT INTO sintomas_b2b (institucion_id, paciente_id, descripcion, intensidad, registrado_por, registrador_nombre)
-             VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-            [req.b2bUser.institucion_id, paciente_id, descripcion, intensidad||null, req.b2bUser.id, _regNombreSint]
+            `INSERT INTO sintomas_b2b (institucion_id, paciente_id, descripcion, intensidad, registrado_por, registrador_nombre, fecha)
+             VALUES ($1,$2,$3,$4,$5,$6, COALESCE($7, NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')) RETURNING *`,
+            [req.b2bUser.institucion_id, paciente_id, descripcion, intensidad||null, req.b2bUser.id, _regNombreSint, _fechaSint]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -4229,10 +4234,11 @@ app.post('/api/b2b/signos-vitales', authB2BMiddleware, requireB2BRole('admin_ins
         const { paciente_id, tipo, valor, unidad, notas } = req.body;
         if (!paciente_id || !tipo || !valor) return res.status(400).json({ error: 'paciente_id, tipo y valor obligatorios' });
         const _regNombreSigno = (req.body._quien && typeof req.body._quien === 'string' && req.body._quien.trim()) ? req.body._quien.trim() : req.b2bUser.nombre;
+        const _fechaSigno = req.body._offline_ts ? new Date(req.body._offline_ts) : null;
         const result = await pool.query(
-            `INSERT INTO signos_vitales_b2b (institucion_id, paciente_id, tipo, valor, unidad, notas, registrado_por, registrador_nombre)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-            [req.b2bUser.institucion_id, paciente_id, tipo, valor, unidad, notas, req.b2bUser.id, _regNombreSigno]
+            `INSERT INTO signos_vitales_b2b (institucion_id, paciente_id, tipo, valor, unidad, notas, registrado_por, registrador_nombre, fecha)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8, COALESCE($9, NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')) RETURNING *`,
+            [req.b2bUser.institucion_id, paciente_id, tipo, valor, unidad, notas, req.b2bUser.id, _regNombreSigno, _fechaSigno]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
