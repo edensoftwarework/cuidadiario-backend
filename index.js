@@ -2140,7 +2140,8 @@ app.post('/api/b2b/create-subscription', authB2BMiddleware, requireB2BRole('admi
             return res.status(403).json({ error: `No podés contratar el Plan PRO con tu configuración actual: ${parts.join(' y ')}. Actualizá a Plan Total para continuar.`, code: 'PLAN_LIMIT_EXCEEDED' });
         }
         // Cancelar suscripción MP anterior antes de crear la nueva (evita doble cobro)
-        if (inst.mp_preapproval_id && MP_ACCESS_TOKEN) {
+        // Guard: ignorar el sentinel 'baja_programada' que no es un ID real de MP
+        if (inst.mp_preapproval_id && inst.mp_preapproval_id !== 'baja_programada' && MP_ACCESS_TOKEN) {
             try {
                 await mpRequest(`/preapproval/${inst.mp_preapproval_id}`, 'PUT', { status: 'cancelled' });
                 console.log(`[MP B2B] create-subscription: cancelada suscripción anterior ${inst.mp_preapproval_id} — inst ${inst.id}`);
@@ -2203,8 +2204,18 @@ app.post('/api/b2b/webhook/mercadopago', async (req, res) => {
                         );
                         console.log(`[MP Webhook B2B] ✅ Institución ${instId} → plan: ${plan.toUpperCase()} (estado MP: "${preapproval.status}") — renovación en 31 días`)
                     } else if (['cancelled', 'paused', 'expired'].includes(preapproval.status)) {
-                        await pool.query('UPDATE instituciones_b2b SET plan=$1 WHERE id=$2', ['free', instId]);
-                        console.log(`[MP Webhook B2B] 🔻 Institución ${instId} → plan: free (estado MP: "${preapproval.status}")`);
+                        // Solo revertir a free si el mp_preapproval_id en DB todavía coincide con este preapproval.
+                        // Si ya tiene el sentinel 'baja_programada' (baja diferida), el AND no hace match
+                        // y el plan se mantiene activo hasta plan_manual_expires_at (comportamiento correcto).
+                        const upd = await pool.query(
+                            `UPDATE instituciones_b2b SET plan='free' WHERE id=$1 AND mp_preapproval_id=$2 RETURNING id`,
+                            [instId, preapproval.id]
+                        );
+                        if (upd.rowCount > 0) {
+                            console.log(`[MP Webhook B2B] 🔻 Institución ${instId} → plan: free (estado MP: "${preapproval.status}")`); 
+                        } else {
+                            console.log(`[MP Webhook B2B] ℹ️ Institución ${instId} — estado MP: "${preapproval.status}" ignorado (baja diferida activa o preapproval obsoleto)`);
+                        }
                     } else {
                         console.log(`[MP Webhook B2B] ℹ️ Institución ${instId} — estado MP: "${preapproval.status}" (sin cambio de plan)`);
                     }
@@ -2315,8 +2326,8 @@ app.post('/api/b2b/cancel-subscription', authB2BMiddleware, requireB2BRole('admi
             return res.status(400).json({ error: 'No hay ningún plan activo para cancelar.' });
         }
 
-        // Cancelar en MercadoPago solo si hay preapproval (suscripción MP)
-        if (inst.mp_preapproval_id && MP_ACCESS_TOKEN) {
+        // Cancelar en MercadoPago solo si hay preapproval real (no el sentinel 'baja_programada')
+        if (inst.mp_preapproval_id && inst.mp_preapproval_id !== 'baja_programada' && MP_ACCESS_TOKEN) {
             const mp = await mpRequest(`/preapproval/${inst.mp_preapproval_id}`, 'PUT', { status: 'cancelled' });
             if (mp.status === 200) {
                 console.log(`[MP Cancel B2B] ✅ Preapproval ${inst.mp_preapproval_id} cancelado — inst ${instId}`);
@@ -2338,9 +2349,10 @@ app.post('/api/b2b/cancel-subscription', authB2BMiddleware, requireB2BRole('admi
             accessUntil.setDate(accessUntil.getDate() + 31);
         }
 
-        // Actualizar DB: limpiar preapproval pero MANTENER plan + fijar fecha de vencimiento
+        // Actualizar DB: marcar con sentinel 'baja_programada' para distinguir
+        // baja real de plan manual de admin. El plan se mantiene activo hasta plan_manual_expires_at.
         await pool.query(
-            `UPDATE instituciones_b2b SET mp_preapproval_id=NULL, plan_manual_expires_at=$2 WHERE id=$1`,
+            `UPDATE instituciones_b2b SET mp_preapproval_id='baja_programada', plan_manual_expires_at=$2 WHERE id=$1`,
             [instId, accessUntil]
         );
         console.log(`[Cancel B2B] ✅ Inst ${instId} — baja programada (era ${inst.plan}) — acceso hasta ${accessUntil.toLocaleDateString('es-AR')}`);
@@ -2765,6 +2777,7 @@ async function syncMPSubscriptions() {
             `SELECT id, mp_preapproval_id FROM instituciones_b2b
              WHERE plan IN ('basico','pro','total')
                AND mp_preapproval_id IS NOT NULL
+               AND mp_preapproval_id != 'baja_programada'
                AND (plan_manual_expires_at IS NULL OR plan_manual_expires_at > NOW())`
         );
         if (b2bInsts.rows.length > 0) {
@@ -4901,7 +4914,7 @@ app.get('/api/admin/institucion/:id', async (req, res) => {
 //        -H "X-Admin-Key: tu_clave_secreta" \
 //        -H "Content-Type: application/json" \
 //        -d '{"institucion_id": 5, "plan": "pro", "note": "Transferencia 15/03"}'
-// Planes válidos: free | basico | pro
+// Planes válidos: free | free_trial | free_expired | basico | pro | total
 app.post('/api/admin/set-plan', async (req, res) => {
     const adminKey   = req.headers['x-admin-key'];
     const expectedKey = process.env.SUPERADMIN_KEY;
@@ -4998,7 +5011,7 @@ app.post('/api/admin/set-plan', async (req, res) => {
 
         const result = await pool.query(
             `UPDATE instituciones_b2b
-             SET plan=$1, plan_manual_expires_at=$2
+             SET plan=$1, plan_manual_expires_at=$2, mp_preapproval_id=NULL
              WHERE id=$3
              RETURNING id, nombre, plan, plan_manual_expires_at`,
             [plan, expiresAt, parseInt(institucion_id)]
