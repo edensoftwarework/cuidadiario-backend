@@ -4910,8 +4910,34 @@ app.post('/api/admin/set-plan', async (req, res) => {
     try {
         const { institucion_id, plan, months, note } = req.body;
         if (!institucion_id || !plan) return res.status(400).json({ error: 'institucion_id y plan son requeridos' });
-        const validPlans = ['free', 'basico', 'pro', 'total'];
+        const validPlans = ['free', 'free_expired', 'basico', 'pro', 'total'];
         if (!validPlans.includes(plan)) return res.status(400).json({ error: `Plan inválido. Debe ser uno de: ${validPlans.join(', ')}` });
+
+        // free_expired: simular trial vencido para testing
+        // Setea plan='free' + trial_started_at=61 días atrás → el sistema lo trata como expirado
+        if (plan === 'free_expired') {
+            const expiredTrialDate = new Date();
+            expiredTrialDate.setDate(expiredTrialDate.getDate() - 61);
+            const result = await pool.query(
+                `UPDATE instituciones_b2b
+                 SET plan='free', plan_manual_expires_at=NULL, mp_preapproval_id=NULL,
+                     trial_started_at=$2
+                 WHERE id=$1
+                 RETURNING id, nombre, plan, trial_started_at`,
+                [parseInt(institucion_id), expiredTrialDate]
+            );
+            if (result.rowCount === 0) return res.status(404).json({ error: 'Institución no encontrada' });
+            const inst = result.rows[0];
+            console.log(`[SuperAdmin] 🧪 Plan TEST: inst ${inst.id} (${inst.nombre}) → free_expired (trial_started_at: ${expiredTrialDate.toLocaleDateString('es-AR')})${note ? ` | Nota: ${note}` : ''}`);
+            return res.json({
+                success: true,
+                test_mode: true,
+                institucion_id: inst.id,
+                nombre: inst.nombre,
+                plan: 'free_expired',
+                trial_started_at: inst.trial_started_at
+            });
+        }
 
         // Validar límites de pacientes/staff para planes basico y pro
         if (['basico', 'pro'].includes(plan)) {
