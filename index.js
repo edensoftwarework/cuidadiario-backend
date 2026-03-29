@@ -2326,13 +2326,30 @@ app.post('/api/b2b/cancel-subscription', authB2BMiddleware, requireB2BRole('admi
             }
         }
 
-        // Actualizar DB: free, sin preapproval, sin vencimiento manual
+        // Baja programada: cancelar en MP para detener futuros cobros,
+        // pero mantener el plan activo hasta que venza plan_manual_expires_at.
+        // El sistema ya revierte a free automáticamente cuando esa fecha llega (checkInstPlanForAction).
+
+        // Determinar fecha hasta la que se mantiene el acceso
+        let accessUntil = inst.plan_manual_expires_at ? new Date(inst.plan_manual_expires_at) : null;
+        if (!accessUntil) {
+            // Sin fecha registrada (suscripción antigua o primer ciclo): dar 31 días desde hoy
+            accessUntil = new Date();
+            accessUntil.setDate(accessUntil.getDate() + 31);
+        }
+
+        // Actualizar DB: limpiar preapproval pero MANTENER plan + fijar fecha de vencimiento
         await pool.query(
-            `UPDATE instituciones_b2b SET plan='free', mp_preapproval_id=NULL, plan_manual_expires_at=NULL WHERE id=$1`,
-            [instId]
+            `UPDATE instituciones_b2b SET mp_preapproval_id=NULL, plan_manual_expires_at=$2 WHERE id=$1`,
+            [instId, accessUntil]
         );
-        console.log(`[Cancel B2B] ✅ Inst ${instId} → plan free (era ${inst.plan})`);
-        res.json({ success: true, message: 'Suscripción cancelada correctamente.' });
+        console.log(`[Cancel B2B] ✅ Inst ${instId} — baja programada (era ${inst.plan}) — acceso hasta ${accessUntil.toLocaleDateString('es-AR')}`);
+        res.json({
+            success: true,
+            deferred: true,
+            access_until: accessUntil.toISOString(),
+            message: `Suscripción cancelada. Tu plan sigue activo hasta el ${accessUntil.toLocaleDateString('es-AR', { day: 'numeric', month: 'long', year: 'numeric' })}. Después de esa fecha, la cuenta pasará automáticamente a Free.`
+        });
     } catch (err) {
         console.error('[Cancel B2B] Error:', err.message);
         res.status(500).json({ error: err.message });
@@ -2744,13 +2761,18 @@ async function syncMPSubscriptions() {
 
     // B2B — sincronizar instituciones con planes pagos
     try {
-        const b2bInsts = await pool.query("SELECT id FROM instituciones_b2b WHERE plan IN ('basico','pro')");
+        const b2bInsts = await pool.query(
+            `SELECT id, mp_preapproval_id FROM instituciones_b2b
+             WHERE plan IN ('basico','pro','total')
+               AND mp_preapproval_id IS NOT NULL
+               AND (plan_manual_expires_at IS NULL OR plan_manual_expires_at > NOW())`
+        );
         if (b2bInsts.rows.length > 0) {
             console.log(`[MP Sync B2B] Verificando ${b2bInsts.rows.length} institución(es) con plan activo...`);
             let b2bDeactivated = 0;
             for (const inst of b2bInsts.rows) {
                 try {
-                    const search = await mpRequest(`/preapproval/search?external_reference=b2b_${inst.id}&status=authorized`);
+                    const search = await mpRequest(`/preapproval/search?external_reference=${inst.id}&status=authorized`);
                     if (search.status !== 200) continue;
                     const hasAuthorized = (search.body?.results || []).some(p => p.status === 'authorized');
                     if (!hasAuthorized) {
