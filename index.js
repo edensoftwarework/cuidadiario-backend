@@ -2305,7 +2305,7 @@ app.post('/api/b2b/cancel-subscription', authB2BMiddleware, requireB2BRole('admi
     const instId = req.b2bUser.institucion_id;
     try {
         const instRes = await pool.query(
-            'SELECT mp_preapproval_id, plan FROM instituciones_b2b WHERE id=$1',
+            'SELECT mp_preapproval_id, plan, plan_manual_expires_at FROM instituciones_b2b WHERE id=$1',
             [instId]
         );
         if (instRes.rowCount === 0) return res.status(404).json({ error: 'Institución no encontrada' });
@@ -4910,8 +4910,33 @@ app.post('/api/admin/set-plan', async (req, res) => {
     try {
         const { institucion_id, plan, months, note } = req.body;
         if (!institucion_id || !plan) return res.status(400).json({ error: 'institucion_id y plan son requeridos' });
-        const validPlans = ['free', 'free_expired', 'basico', 'pro', 'total'];
+        const validPlans = ['free', 'free_trial', 'free_expired', 'basico', 'pro', 'total'];
         if (!validPlans.includes(plan)) return res.status(400).json({ error: `Plan inválido. Debe ser uno de: ${validPlans.join(', ')}` });
+
+        // free_trial: reiniciar el período de prueba con 60 días nuevos desde hoy
+        if (plan === 'free_trial') {
+            const result = await pool.query(
+                `UPDATE instituciones_b2b
+                 SET plan='free', plan_manual_expires_at=NULL, mp_preapproval_id=NULL,
+                     trial_started_at=NOW()
+                 WHERE id=$1
+                 RETURNING id, nombre, plan, trial_started_at`,
+                [parseInt(institucion_id)]
+            );
+            if (result.rowCount === 0) return res.status(404).json({ error: 'Institución no encontrada' });
+            const inst = result.rows[0];
+            const trialEnd = new Date(inst.trial_started_at);
+            trialEnd.setDate(trialEnd.getDate() + 60);
+            console.log(`[SuperAdmin] 🔄 Trial RESET: inst ${inst.id} (${inst.nombre}) → 60 días nuevos hasta ${trialEnd.toLocaleDateString('es-AR')}${note ? ` | Nota: ${note}` : ''}`);
+            return res.json({
+                success: true,
+                trial_reset: true,
+                institucion_id: inst.id,
+                nombre: inst.nombre,
+                plan: 'free',
+                trial_started_at: inst.trial_started_at
+            });
+        }
 
         // free_expired: simular trial vencido para testing
         // Setea plan='free' + trial_started_at=61 días atrás → el sistema lo trata como expirado
