@@ -3672,14 +3672,35 @@ app.delete('/api/b2b/staff/:id', authB2BMiddleware, requireB2BRole('admin_instit
 // GET /api/b2b/pacientes
 app.get('/api/b2b/pacientes', authB2BMiddleware, async (req, res) => {
     try {
+        const { rol, institucion_id, id } = req.b2bUser;
+
+        // Admin siempre ve todos los pacientes de la institución
+        if (rol === 'admin_institucion') {
+            const result = await pool.query(
+                'SELECT * FROM pacientes_b2b WHERE institucion_id=$1 AND activo=TRUE ORDER BY apellido, nombre',
+                [institucion_id]
+            );
+            return res.json(result.rows);
+        }
+
+        // Medico y cuidador_staff: verificar el permiso ver_todos_pacientes de la institución.
+        // Por defecto es TRUE (ve todos). El admin puede desactivarlo por rol.
+        let verTodos = true;
+        try {
+            const instRow = await pool.query('SELECT permisos_equipo FROM instituciones_b2b WHERE id=$1', [institucion_id]);
+            const perms = instRow.rows[0]?.permisos_equipo || {};
+            const permKey = `${rol}_ver_todos_pacientes`;
+            if (permKey in perms) verTodos = !!perms[permKey];
+        } catch (_) { /* si falla, usamos el default true */ }
+
         let query, params;
-        if (req.b2bUser.rol === 'admin_institucion' || req.b2bUser.rol === 'medico') {
+        if (verTodos) {
             query = 'SELECT * FROM pacientes_b2b WHERE institucion_id=$1 AND activo=TRUE ORDER BY apellido, nombre';
-            params = [req.b2bUser.institucion_id];
+            params = [institucion_id];
         } else {
             query = `SELECT p.* FROM pacientes_b2b p JOIN asignaciones_b2b a ON a.paciente_id = p.id
                      WHERE a.cuidador_id=$1 AND a.activa=TRUE AND p.activo=TRUE ORDER BY p.apellido, p.nombre`;
-            params = [req.b2bUser.id];
+            params = [id];
         }
         const result = await pool.query(query, params);
         res.json(result.rows);
