@@ -3395,7 +3395,47 @@ app.get('/api/b2b/auth/verify-email', async (req, res) => {
             [result.rows[0].id]
         );
         console.log(`[B2B] Email verificado: ${result.rows[0].email} (id=${result.rows[0].id})`);
-        res.json({ success: true, message: 'Email confirmado correctamente. Ya podés usar todas las funciones de CuidaDiario PRO.' });
+
+        // Emitir un JWT fresco con email_verified=true para que el onboarding no quede bloqueado.
+        // Sin esto, el JWT original (emitido al registrarse) tenía email_verified:false y el
+        // middleware bloqueaba la llamada de updateInstitucion al finalizar el onboarding (→ loop).
+        let freshToken = null;
+        let freshUser  = null;
+        try {
+            const userRow = await pool.query(
+                `SELECT u.id, u.nombre, u.email, u.rol, u.email_verified, u.notif_prefs,
+                        i.id AS institucion_id, i.nombre AS institucion_nombre, i.plan,
+                        i.permisos_equipo, i.onboarding_done, i.stock_modelo,
+                        i.shared_mode, i.trial_started_at, i.discount_expires_at
+                 FROM usuarios_b2b u
+                 JOIN instituciones_b2b i ON i.id = u.institucion_id
+                 WHERE u.id = $1`,
+                [result.rows[0].id]
+            );
+            if (userRow.rowCount > 0) {
+                const u = userRow.rows[0];
+                freshToken = jwt.sign(
+                    { id: u.id, institucion_id: u.institucion_id, rol: u.rol,
+                      email: u.email, nombre: u.nombre, b2b: true, email_verified: true },
+                    JWT_SECRET, { expiresIn: '30d' }
+                );
+                freshUser = {
+                    id: u.id, nombre: u.nombre, email: u.email, rol: u.rol,
+                    institucion_id: u.institucion_id, institucion_nombre: u.institucion_nombre,
+                    plan: u.plan, institucion_permisos: u.permisos_equipo || {},
+                    onboarding_done: !!u.onboarding_done, email_verified: true,
+                    stock_modelo: u.stock_modelo || 'familiar', shared_mode: !!u.shared_mode,
+                    trial_started_at: u.trial_started_at || null,
+                    notif_prefs: u.notif_prefs || {},
+                    discount_expires_at: u.discount_expires_at || null
+                };
+            }
+        } catch (tokenErr) {
+            // No fatal — el frontend puede seguir sin el token fresco (requerirá re-login)
+            console.warn('[B2B] No se pudo generar token fresco tras verificación:', tokenErr.message);
+        }
+
+        res.json({ success: true, message: 'Email confirmado correctamente. Ya podés usar todas las funciones de CuidaDiario PRO.', token: freshToken, user: freshUser });
     } catch (err) {
         console.error('GET /api/b2b/auth/verify-email:', err.message);
         res.status(500).json({ error: 'Error al verificar email' });
