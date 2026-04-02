@@ -3716,8 +3716,11 @@ app.get('/api/b2b/pacientes', authB2BMiddleware, async (req, res) => {
             if (permKey in perms) verTodos = !!perms[permKey];
         } catch (_) { /* si falla, usamos el default true */ }
 
+        // mis_asignados=1: fuerza filtro por asignaciones del usuario (ej: "Mis residentes" en cuidador.html),
+        // ignorando ver_todos_pacientes. Así el cuidador ve solo sus asignados aunque tenga verTodos=true.
+        const misAsignados = req.query.mis_asignados === '1';
         let query, params;
-        if (verTodos) {
+        if (verTodos && !misAsignados) {
             query = 'SELECT * FROM pacientes_b2b WHERE institucion_id=$1 AND activo=TRUE ORDER BY apellido, nombre';
             params = [institucion_id];
         } else {
@@ -3820,7 +3823,12 @@ app.delete('/api/b2b/pacientes/:id', authB2BMiddleware, async (req, res) => {
 // ---------- B2B: ASIGNACIONES ----------
 
 // GET /api/b2b/asignaciones
-app.get('/api/b2b/asignaciones', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+app.get('/api/b2b/asignaciones', authB2BMiddleware, async (req, res) => {
+    // Admin siempre puede verlas; no-admin necesita perm ver_staff (solo lectura)
+    if (req.b2bUser.rol !== 'admin_institucion') {
+        const canView = await checkB2BCanDo(req.b2bUser, 'ver_staff');
+        if (!canView) return res.status(403).json({ error: 'No tenés permisos para ver las asignaciones' });
+    }
     try {
         const result = await pool.query(
             `SELECT a.*, u.nombre as cuidador_nombre, u.rol as cuidador_rol,
