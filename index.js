@@ -3102,6 +3102,7 @@ async function checkB2BCanDo(b2bUser, action) {
         editar_paciente:   { medico: true,  cuidador_staff: true  },
         dar_alta:          { medico: true,  cuidador_staff: false },
         eliminar_paciente: { medico: false, cuidador_staff: false },
+        gestionar_catalogo:{ medico: false, cuidador_staff: false },
     };
     try {
         const r = await pool.query('SELECT permisos_equipo FROM instituciones_b2b WHERE id=$1', [b2bUser.institucion_id]);
@@ -3998,7 +3999,7 @@ app.delete('/api/b2b/medicamentos/:id', authB2BMiddleware, requireB2BRole('admin
 // ---------- B2B: CATÁLOGO DE MEDICAMENTOS ----------
 
 // GET /api/b2b/catalogo/stock-bajo  (must come BEFORE /:id)
-app.get('/api/b2b/catalogo/stock-bajo', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+app.get('/api/b2b/catalogo/stock-bajo', authB2BMiddleware, requireB2BRole('admin_institucion','medico','cuidador_staff'), async (req, res) => {
     try {
         const result = await pool.query(
             `SELECT c.*, p.nombre AS paciente_nombre, p.apellido AS paciente_apellido
@@ -4055,8 +4056,9 @@ app.get('/api/b2b/catalogo', authB2BMiddleware, async (req, res) => {
 });
 
 // POST /api/b2b/catalogo
-app.post('/api/b2b/catalogo', authB2BMiddleware, requireB2BRole('admin_institucion'), requireActivePlan, async (req, res) => {
+app.post('/api/b2b/catalogo', authB2BMiddleware, requireB2BRole('admin_institucion','medico','cuidador_staff'), requireActivePlan, async (req, res) => {
     try {
+        if (!(await checkB2BCanDo(req.b2bUser, 'gestionar_catalogo'))) return res.status(403).json({ error: 'No tenés permiso para gestionar el catálogo. Solicitálo al administrador.' });
         const { nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo, paciente_id } = req.body;
         if (!nombre) return res.status(400).json({ error: 'nombre obligatorio' });
         // Si se especifica paciente_id, validar que pertenece a la institución
@@ -4077,8 +4079,9 @@ app.post('/api/b2b/catalogo', authB2BMiddleware, requireB2BRole('admin_instituci
 });
 
 // PATCH /api/b2b/catalogo/:id
-app.patch('/api/b2b/catalogo/:id', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+app.patch('/api/b2b/catalogo/:id', authB2BMiddleware, requireB2BRole('admin_institucion','medico','cuidador_staff'), async (req, res) => {
     try {
+        if (!(await checkB2BCanDo(req.b2bUser, 'gestionar_catalogo'))) return res.status(403).json({ error: 'No tenés permiso para gestionar el catálogo. Solicitálo al administrador.' });
         const { nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo, notas_restock } = req.body;
         const iid = req.b2bUser.institucion_id;
         // Fetch current state to detect stock changes for restock log
