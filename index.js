@@ -3117,6 +3117,8 @@ async function checkB2BCanDo(b2bUser, action) {
         eliminar_paciente: { medico: false, cuidador_staff: false },
         gestionar_catalogo:{ medico: false, cuidador_staff: false },
         ver_staff:         { medico: false, cuidador_staff: false },
+        crear_staff:       { medico: false, cuidador_staff: false },
+        asignar_paciente:  { medico: false, cuidador_staff: false },
     };
     try {
         const r = await pool.query('SELECT permisos_equipo FROM instituciones_b2b WHERE id=$1', [b2bUser.institucion_id]);
@@ -3593,11 +3595,16 @@ app.patch('/api/b2b/institucion', authB2BMiddleware, requireB2BRole('admin_insti
 // ---------- B2B: STAFF ----------
 
 // GET /api/b2b/staff
-// Admin: acceso completo. Medico/cuidador_staff: solo lectura si tienen permiso ver_staff.
+// Admin: acceso completo. Medico/cuidador_staff: ver_staff, crear_staff o asignar_paciente.
 app.get('/api/b2b/staff', authB2BMiddleware, async (req, res) => {
     if (req.b2bUser.rol !== 'admin_institucion') {
-        const canView = await checkB2BCanDo(req.b2bUser, 'ver_staff');
-        if (!canView) return res.status(403).json({ error: 'No tenés permisos para ver el staff' });
+        const [canView, canCreate, canAssign] = await Promise.all([
+            checkB2BCanDo(req.b2bUser, 'ver_staff'),
+            checkB2BCanDo(req.b2bUser, 'crear_staff'),
+            checkB2BCanDo(req.b2bUser, 'asignar_paciente'),
+        ]);
+        if (!canView && !canCreate && !canAssign)
+            return res.status(403).json({ error: 'No tenés permisos para ver el staff' });
     }
     try {
         const result = await pool.query(
@@ -3612,7 +3619,11 @@ app.get('/api/b2b/staff', authB2BMiddleware, async (req, res) => {
 });
 
 // POST /api/b2b/staff — crear miembro del staff
-app.post('/api/b2b/staff', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+app.post('/api/b2b/staff', authB2BMiddleware, async (req, res) => {
+    if (req.b2bUser.rol !== 'admin_institucion') {
+        const canCreate = await checkB2BCanDo(req.b2bUser, 'crear_staff');
+        if (!canCreate) return res.status(403).json({ error: 'No tenés permisos para agregar personal', code: 'FORBIDDEN' });
+    }
     try {
         const { nombre, email, password, rol } = req.body;
         if (!nombre || !email || !password) return res.status(400).json({ error: 'Faltan datos obligatorios' });
@@ -3856,10 +3867,14 @@ app.delete('/api/b2b/pacientes/:id', authB2BMiddleware, async (req, res) => {
 
 // GET /api/b2b/asignaciones
 app.get('/api/b2b/asignaciones', authB2BMiddleware, async (req, res) => {
-    // Admin siempre puede verlas; no-admin necesita perm ver_staff (solo lectura)
+    // Admin siempre puede verlas; no-admin necesita ver_staff o asignar_paciente
     if (req.b2bUser.rol !== 'admin_institucion') {
-        const canView = await checkB2BCanDo(req.b2bUser, 'ver_staff');
-        if (!canView) return res.status(403).json({ error: 'No tenés permisos para ver las asignaciones' });
+        const [canView, canAssign] = await Promise.all([
+            checkB2BCanDo(req.b2bUser, 'ver_staff'),
+            checkB2BCanDo(req.b2bUser, 'asignar_paciente'),
+        ]);
+        if (!canView && !canAssign)
+            return res.status(403).json({ error: 'No tenés permisos para ver las asignaciones' });
     }
     try {
         const result = await pool.query(
@@ -3877,7 +3892,11 @@ app.get('/api/b2b/asignaciones', authB2BMiddleware, async (req, res) => {
 });
 
 // POST /api/b2b/asignaciones
-app.post('/api/b2b/asignaciones', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+app.post('/api/b2b/asignaciones', authB2BMiddleware, async (req, res) => {
+    if (req.b2bUser.rol !== 'admin_institucion') {
+        const canAssign = await checkB2BCanDo(req.b2bUser, 'asignar_paciente');
+        if (!canAssign) return res.status(403).json({ error: 'No tenés permisos para gestionar asignaciones', code: 'FORBIDDEN' });
+    }
     try {
         const { cuidador_id, paciente_id } = req.body;
         if (!cuidador_id || !paciente_id) return res.status(400).json({ error: 'cuidador_id y paciente_id requeridos' });
@@ -3900,7 +3919,11 @@ app.post('/api/b2b/asignaciones', authB2BMiddleware, requireB2BRole('admin_insti
 });
 
 // DELETE /api/b2b/asignaciones/:id
-app.delete('/api/b2b/asignaciones/:id', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+app.delete('/api/b2b/asignaciones/:id', authB2BMiddleware, async (req, res) => {
+    if (req.b2bUser.rol !== 'admin_institucion') {
+        const canAssign = await checkB2BCanDo(req.b2bUser, 'asignar_paciente');
+        if (!canAssign) return res.status(403).json({ error: 'No tenés permisos para gestionar asignaciones', code: 'FORBIDDEN' });
+    }
     try {
         await pool.query('UPDATE asignaciones_b2b SET activa=FALSE WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         res.json({ success: true });
