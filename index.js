@@ -680,6 +680,10 @@ async function runMigrations() {
         await pool.query(`ALTER TABLE instituciones_b2b ADD COLUMN IF NOT EXISTS plan_manual_expires_at TIMESTAMPTZ`).catch(() => {});
         console.log('✅ Migraciones B2B v13 completadas');
 
+        // MIGRACIÓN B2B v14 — Cantidad de unidades por toma de medicamento/insumo
+        await pool.query(`ALTER TABLE historial_medicamentos_b2b ADD COLUMN IF NOT EXISTS cantidad INTEGER DEFAULT 1`).catch(() => {});
+        console.log('✅ Migraciones B2B v14 completadas');
+
         // ============================================================
         // MIGRACIÓN TZ v1 — corrección única de zona horaria (UTC → Argentina)
         // Se ejecuta una sola vez al detectar que aún no fue aplicada.
@@ -3885,7 +3889,7 @@ app.get('/api/b2b/medicamentos', authB2BMiddleware, async (req, res) => {
 });
 
 // POST /api/b2b/medicamentos
-app.post('/api/b2b/medicamentos', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), requireActivePlan, async (req, res) => {
+app.post('/api/b2b/medicamentos', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), requireActivePlan, async (req, res) => {
     try {
         const { paciente_id, nombre, dosis, frecuencia, hora_inicio, hora_fin, horarios_custom, instrucciones, stock, catalogo_id } = req.body;
         if (!paciente_id || !nombre) return res.status(400).json({ error: 'paciente_id y nombre obligatorios' });
@@ -3903,11 +3907,12 @@ app.post('/api/b2b/medicamentos', authB2BMiddleware, requireB2BRole('admin_insti
 });
 
 // POST /api/b2b/medicamentos/:id/toma
-app.post('/api/b2b/medicamentos/:id/toma', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), requireActivePlan, async (req, res) => {
+app.post('/api/b2b/medicamentos/:id/toma', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), requireActivePlan, async (req, res) => {
     try {
         const med = await pool.query('SELECT * FROM medicamentos_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         if (med.rowCount === 0) return res.status(404).json({ error: 'Medicamento no encontrado' });
         const m = med.rows[0];
+        const cantidad = Math.max(1, parseInt(req.body.cantidad) || 1);
 
         // STOCK GUARD: block toma if there is no stock remaining
         // Hybrid model: if linked to a catalog item, check catalog stock regardless of stock_modelo field
@@ -3917,10 +3922,10 @@ app.post('/api/b2b/medicamentos/:id/toma', authB2BMiddleware, requireB2BRole('ad
                 [m.catalogo_id, req.b2bUser.institucion_id]
             );
             const catStock = catRow.rows[0]?.stock_actual ?? 0;
-            if (catStock <= 0) {
+            if (catStock < cantidad) {
                 return res.status(400).json({ error: 'Sin stock disponible en el cat\u00e1logo. Repon\u00e9 el insumo antes de registrar una toma.', code: 'STOCK_ZERO' });
             }
-        } else if (m.stock !== null && m.stock <= 0) {
+        } else if (m.stock !== null && m.stock < cantidad) {
             return res.status(400).json({ error: 'Sin stock disponible. Actualiz\u00e1 el stock antes de registrar una toma.', code: 'STOCK_ZERO' });
         }
 
@@ -3932,22 +3937,22 @@ app.post('/api/b2b/medicamentos/:id/toma', authB2BMiddleware, requireB2BRole('ad
         const _fecha = utcIsoToArgentinaNaive(req.body._offline_ts);
         const result = await pool.query(
             `INSERT INTO historial_medicamentos_b2b
-             (institucion_id, paciente_id, medicamento_id, medicamento_nombre, dosis, administrado_por, administrador_nombre, notas, fecha)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8, COALESCE($9, NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')) RETURNING *`,
-            [req.b2bUser.institucion_id, m.paciente_id, m.id, m.nombre, m.dosis, req.b2bUser.id, _adminNombre, req.body.notas||null, _fecha]
+             (institucion_id, paciente_id, medicamento_id, medicamento_nombre, dosis, administrado_por, administrador_nombre, notas, cantidad, fecha)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, COALESCE($10, NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')) RETURNING *`,
+            [req.b2bUser.institucion_id, m.paciente_id, m.id, m.nombre, m.dosis, req.b2bUser.id, _adminNombre, req.body.notas||null, cantidad, _fecha]
         );
         // Auto-decrement stock — hybrid model: catalog wins when linked, else per-patient/individual stock
         if (m.catalogo_id) {
             // Decrement catalog stock (institutional or patient-specific), never below 0
             await pool.query(
-                'UPDATE catalogo_medicamentos_b2b SET stock_actual = GREATEST(0, stock_actual - 1), updated_at = NOW() WHERE id=$1 AND institucion_id=$2',
-                [m.catalogo_id, req.b2bUser.institucion_id]
+                'UPDATE catalogo_medicamentos_b2b SET stock_actual = GREATEST(0, stock_actual - $3), updated_at = NOW() WHERE id=$1 AND institucion_id=$2',
+                [m.catalogo_id, req.b2bUser.institucion_id, cantidad]
             );
         } else if (m.stock !== null && m.stock > 0) {
             // Decrement individual/manual stock (non-cataloged)
             await pool.query(
-                'UPDATE medicamentos_b2b SET stock = GREATEST(0, stock - 1) WHERE id=$1 AND institucion_id=$2',
-                [m.id, req.b2bUser.institucion_id]
+                'UPDATE medicamentos_b2b SET stock = GREATEST(0, stock - $3) WHERE id=$1 AND institucion_id=$2',
+                [m.id, req.b2bUser.institucion_id, cantidad]
             );
         }
         res.status(201).json(result.rows[0]);
@@ -3958,7 +3963,7 @@ app.post('/api/b2b/medicamentos/:id/toma', authB2BMiddleware, requireB2BRole('ad
 });
 
 // PATCH /api/b2b/medicamentos/:id
-app.patch('/api/b2b/medicamentos/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.patch('/api/b2b/medicamentos/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
         const { nombre, dosis, frecuencia, hora_inicio, hora_fin, horarios_custom, instrucciones, stock, activo, catalogo_id } = req.body;
         // catalogo_id can be explicitly set to null (unlink) or a number (link), hence no COALESCE
@@ -3980,7 +3985,7 @@ app.patch('/api/b2b/medicamentos/:id', authB2BMiddleware, requireB2BRole('admin_
 });
 
 // DELETE /api/b2b/medicamentos/:id
-app.delete('/api/b2b/medicamentos/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.delete('/api/b2b/medicamentos/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
         await pool.query('UPDATE medicamentos_b2b SET activo=FALSE WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         res.json({ success: true });
@@ -4162,7 +4167,7 @@ app.get('/api/b2b/citas', authB2BMiddleware, async (req, res) => {
 });
 
 // POST /api/b2b/citas
-app.post('/api/b2b/citas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), requireActivePlan, async (req, res) => {
+app.post('/api/b2b/citas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), requireActivePlan, async (req, res) => {
     try {
         const { paciente_id, titulo, descripcion, fecha, medico, especialidad, lugar } = req.body;
         if (!paciente_id || !titulo || !fecha) return res.status(400).json({ error: 'paciente_id, titulo y fecha obligatorios' });
@@ -4179,7 +4184,7 @@ app.post('/api/b2b/citas', authB2BMiddleware, requireB2BRole('admin_institucion'
 });
 
 // PATCH /api/b2b/citas/:id
-app.patch('/api/b2b/citas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.patch('/api/b2b/citas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
         const { titulo, descripcion, fecha, medico, especialidad, lugar, estado } = req.body;
         await pool.query(
@@ -4219,7 +4224,7 @@ app.get('/api/b2b/citas/historial', authB2BMiddleware, async (req, res) => {
 });
 
 // DELETE /api/b2b/citas/:id
-app.delete('/api/b2b/citas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.delete('/api/b2b/citas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
         await pool.query('DELETE FROM citas_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         res.json({ success: true });
@@ -4264,7 +4269,7 @@ app.get('/api/b2b/tareas', authB2BMiddleware, async (req, res) => {
 });
 
 // POST /api/b2b/tareas
-app.post('/api/b2b/tareas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), requireActivePlan, async (req, res) => {
+app.post('/api/b2b/tareas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), requireActivePlan, async (req, res) => {
     try {
         const { paciente_id, titulo, descripcion, categoria, frecuencia, hora } = req.body;
         if (!paciente_id || !titulo) return res.status(400).json({ error: 'paciente_id y titulo obligatorios' });
@@ -4281,7 +4286,7 @@ app.post('/api/b2b/tareas', authB2BMiddleware, requireB2BRole('admin_institucion
 });
 
 // POST /api/b2b/tareas/:id/completar
-app.post('/api/b2b/tareas/:id/completar', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), requireActivePlan, async (req, res) => {
+app.post('/api/b2b/tareas/:id/completar', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), requireActivePlan, async (req, res) => {
     try {
         const tarea = await pool.query('SELECT * FROM tareas_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         if (tarea.rowCount === 0) return res.status(404).json({ error: 'Tarea no encontrada' });
@@ -4302,7 +4307,7 @@ app.post('/api/b2b/tareas/:id/completar', authB2BMiddleware, requireB2BRole('adm
 });
 
 // PATCH /api/b2b/tareas/:id
-app.patch('/api/b2b/tareas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.patch('/api/b2b/tareas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
         const { titulo, descripcion, categoria, frecuencia, hora, activa } = req.body;
         await pool.query(
@@ -4319,7 +4324,7 @@ app.patch('/api/b2b/tareas/:id', authB2BMiddleware, requireB2BRole('admin_instit
 });
 
 // DELETE /api/b2b/tareas/:id
-app.delete('/api/b2b/tareas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.delete('/api/b2b/tareas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
         await pool.query('UPDATE tareas_b2b SET activa=FALSE WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         res.json({ success: true });
@@ -4348,7 +4353,7 @@ app.get('/api/b2b/sintomas', authB2BMiddleware, async (req, res) => {
 });
 
 // POST /api/b2b/sintomas
-app.post('/api/b2b/sintomas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), requireActivePlan, async (req, res) => {
+app.post('/api/b2b/sintomas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), requireActivePlan, async (req, res) => {
     try {
         const { paciente_id, descripcion, intensidad } = req.body;
         if (!paciente_id || !descripcion) return res.status(400).json({ error: 'paciente_id y descripcion obligatorios' });
@@ -4367,7 +4372,7 @@ app.post('/api/b2b/sintomas', authB2BMiddleware, requireB2BRole('admin_instituci
 });
 
 // PATCH /api/b2b/sintomas/:id
-app.patch('/api/b2b/sintomas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.patch('/api/b2b/sintomas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
         const { descripcion, intensidad } = req.body;
         if (!descripcion) return res.status(400).json({ error: 'descripcion obligatoria' });
@@ -4384,7 +4389,7 @@ app.patch('/api/b2b/sintomas/:id', authB2BMiddleware, requireB2BRole('admin_inst
 });
 
 // DELETE /api/b2b/sintomas/:id
-app.delete('/api/b2b/sintomas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.delete('/api/b2b/sintomas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
         await pool.query('DELETE FROM sintomas_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         res.json({ success: true });
@@ -4414,7 +4419,7 @@ app.get('/api/b2b/signos-vitales', authB2BMiddleware, async (req, res) => {
 });
 
 // POST /api/b2b/signos-vitales
-app.post('/api/b2b/signos-vitales', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), requireActivePlan, async (req, res) => {
+app.post('/api/b2b/signos-vitales', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), requireActivePlan, async (req, res) => {
     try {
         const { paciente_id, tipo, valor, unidad, notas } = req.body;
         if (!paciente_id || !tipo || !valor) return res.status(400).json({ error: 'paciente_id, tipo y valor obligatorios' });
@@ -4433,7 +4438,7 @@ app.post('/api/b2b/signos-vitales', authB2BMiddleware, requireB2BRole('admin_ins
 });
 
 // DELETE /api/b2b/signos-vitales/:id
-app.delete('/api/b2b/signos-vitales/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.delete('/api/b2b/signos-vitales/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
         await pool.query('DELETE FROM signos_vitales_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         res.json({ success: true });
@@ -4461,7 +4466,7 @@ app.get('/api/b2b/contactos', authB2BMiddleware, async (req, res) => {
 });
 
 // POST /api/b2b/contactos
-app.post('/api/b2b/contactos', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.post('/api/b2b/contactos', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
         const { paciente_id, nombre, relacion, telefono, email, es_principal } = req.body;
         if (!paciente_id || !nombre) return res.status(400).json({ error: 'paciente_id y nombre obligatorios' });
@@ -4478,7 +4483,7 @@ app.post('/api/b2b/contactos', authB2BMiddleware, requireB2BRole('admin_instituc
 });
 
 // PATCH /api/b2b/contactos/:id
-app.patch('/api/b2b/contactos/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.patch('/api/b2b/contactos/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
         const { nombre, relacion, telefono, email, es_principal } = req.body;
         await pool.query(
@@ -4495,7 +4500,7 @@ app.patch('/api/b2b/contactos/:id', authB2BMiddleware, requireB2BRole('admin_ins
 });
 
 // DELETE /api/b2b/contactos/:id
-app.delete('/api/b2b/contactos/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.delete('/api/b2b/contactos/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
         await pool.query('DELETE FROM contactos_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         res.json({ success: true });
@@ -4524,7 +4529,7 @@ app.get('/api/b2b/notas', authB2BMiddleware, async (req, res) => {
 });
 
 // POST /api/b2b/notas
-app.post('/api/b2b/notas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), requireActivePlan, async (req, res) => {
+app.post('/api/b2b/notas', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), requireActivePlan, async (req, res) => {
     try {
         const { paciente_id, titulo, contenido, urgente } = req.body;
         if (!paciente_id) return res.status(400).json({ error: 'paciente_id obligatorio' });
@@ -4542,7 +4547,7 @@ app.post('/api/b2b/notas', authB2BMiddleware, requireB2BRole('admin_institucion'
 });
 
 // PATCH /api/b2b/notas/:id
-app.patch('/api/b2b/notas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.patch('/api/b2b/notas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
         const { titulo, contenido, urgente } = req.body;
         await pool.query(
@@ -4558,7 +4563,7 @@ app.patch('/api/b2b/notas/:id', authB2BMiddleware, requireB2BRole('admin_institu
 });
 
 // DELETE /api/b2b/notas/:id
-app.delete('/api/b2b/notas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff'), async (req, res) => {
+app.delete('/api/b2b/notas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
         await pool.query('DELETE FROM notas_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         res.json({ success: true });
