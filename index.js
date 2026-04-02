@@ -3103,6 +3103,7 @@ async function checkB2BCanDo(b2bUser, action) {
         dar_alta:          { medico: true,  cuidador_staff: false },
         eliminar_paciente: { medico: false, cuidador_staff: false },
         gestionar_catalogo:{ medico: false, cuidador_staff: false },
+        ver_staff:         { medico: false, cuidador_staff: false },
     };
     try {
         const r = await pool.query('SELECT permisos_equipo FROM instituciones_b2b WHERE id=$1', [b2bUser.institucion_id]);
@@ -3555,7 +3556,12 @@ app.patch('/api/b2b/institucion', authB2BMiddleware, requireB2BRole('admin_insti
 // ---------- B2B: STAFF ----------
 
 // GET /api/b2b/staff
-app.get('/api/b2b/staff', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
+// Admin: acceso completo. Medico/cuidador_staff: solo lectura si tienen permiso ver_staff.
+app.get('/api/b2b/staff', authB2BMiddleware, async (req, res) => {
+    if (req.b2bUser.rol !== 'admin_institucion') {
+        const canView = await checkB2BCanDo(req.b2bUser, 'ver_staff');
+        if (!canView) return res.status(403).json({ error: 'No tenés permisos para ver el staff' });
+    }
     try {
         const result = await pool.query(
             'SELECT id, nombre, email, rol, activo, created_at FROM usuarios_b2b WHERE institucion_id=$1 ORDER BY nombre',
@@ -3684,6 +3690,18 @@ app.get('/api/b2b/pacientes', authB2BMiddleware, async (req, res) => {
             const result = await pool.query(
                 'SELECT * FROM pacientes_b2b WHERE institucion_id=$1 AND activo=TRUE ORDER BY apellido, nombre',
                 [institucion_id]
+            );
+            return res.json(result.rows);
+        }
+
+        // Familiar: siempre solo ve los pacientes que tiene asignados (nunca todos).
+        // Si cae en el bloque verTodos de abajo, obtendría todos los pacientes porque
+        // 'familiar_ver_todos_pacientes' no está en perms → verTodos queda true → BUG.
+        if (rol === 'familiar') {
+            const result = await pool.query(
+                `SELECT p.* FROM pacientes_b2b p JOIN asignaciones_b2b a ON a.paciente_id = p.id
+                 WHERE a.cuidador_id=$1 AND a.activa=TRUE AND p.activo=TRUE ORDER BY p.apellido, p.nombre`,
+                [id]
             );
             return res.json(result.rows);
         }
