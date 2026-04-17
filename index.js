@@ -2119,11 +2119,11 @@ app.post('/api/b2b/create-subscription', authB2BMiddleware, requireB2BRole('admi
         if (instRes.rows.length === 0) return res.status(404).json({ error: 'Institución no encontrada' });
         const inst = instRes.rows[0];
         const PLANES_MP = {
-            total:  { reason: 'CuidaDiario PRO — Plan Total',   amount: 99000 },
-            pro:    { reason: 'CuidaDiario PRO — Plan PRO',     amount: 59000 },
-            basico: { reason: 'CuidaDiario PRO — Plan Básico',  amount: 29000 }
+            total:  { reason: 'CuidaDiario PRO — Plan Total',   amount: 45000 },
+            // pro:    { reason: 'CuidaDiario PRO — Plan PRO',     amount: 59000 },  // Plan PRO desactivado temporalmente
+            basico: { reason: 'CuidaDiario PRO — Plan Básico',  amount: 19000 }
         };
-        const planKey  = Object.keys(PLANES_MP).includes(req.body.plan) ? req.body.plan : 'pro';
+        const planKey  = Object.keys(PLANES_MP).includes(req.body.plan) ? req.body.plan : 'basico';
         // Validar elegibilidad del plan según conteos actuales (familiares excluidos del staff)
         const eligR = await pool.query(
             `SELECT (SELECT COUNT(*) FROM pacientes_b2b WHERE institucion_id=$1 AND activo=TRUE AND fecha_egreso IS NULL) AS pac,
@@ -2131,18 +2131,13 @@ app.post('/api/b2b/create-subscription', authB2BMiddleware, requireB2BRole('admi
             [inst.id]);
         const curPac = parseInt(eligR.rows[0].pac) || 0;
         const curStf = parseInt(eligR.rows[0].stf) || 0;
-        if (planKey === 'basico' && (curPac > 15 || curStf > 8)) {
+        if (planKey === 'basico' && (curPac > 30 || curStf > 20)) {
             const parts = [];
-            if (curPac > 15) parts.push(`${curPac} pacientes activos (máx. 15 en Básico)`);
-            if (curStf > 8)  parts.push(`${curStf} miembros de staff (máx. 8 en Básico)`);
-            return res.status(403).json({ error: `No podés contratar el Plan Básico con tu configuración actual: ${parts.join(' y ')}. Reducí primero tus registros desde Pacientes o Staff.`, code: 'PLAN_LIMIT_EXCEEDED' });
+            if (curPac > 30) parts.push(`${curPac} pacientes activos (máx. 30 en Básico)`);
+            if (curStf > 20) parts.push(`${curStf} miembros de staff (máx. 20 en Básico)`);
+            return res.status(403).json({ error: `No podés contratar el Plan Básico con tu configuración actual: ${parts.join(' y ')}. Reducí primero tus registros o contratá el Plan Total.`, code: 'PLAN_LIMIT_EXCEEDED' });
         }
-        if (planKey === 'pro' && (curPac > 40 || curStf > 20)) {
-            const parts = [];
-            if (curPac > 40) parts.push(`${curPac} pacientes activos (máx. 40 en PRO)`);
-            if (curStf > 20) parts.push(`${curStf} miembros de staff (máx. 20 en PRO)`);
-            return res.status(403).json({ error: `No podés contratar el Plan PRO con tu configuración actual: ${parts.join(' y ')}. Actualizá a Plan Total para continuar.`, code: 'PLAN_LIMIT_EXCEEDED' });
-        }
+        // if (planKey === 'pro' && ...) { ... }  // Plan PRO desactivado temporalmente
         // Cancelar suscripción MP anterior antes de crear la nueva (evita doble cobro)
         // Guard: ignorar el sentinel 'baja_programada' que no es un ID real de MP
         if (inst.mp_preapproval_id && inst.mp_preapproval_id !== 'baja_programada' && MP_ACCESS_TOKEN) {
@@ -2248,8 +2243,8 @@ function _mpPlanFromPreapproval(preapproval) {
     if (reason.includes('plan pro')) return 'pro';
     if (reason.includes('básico') || reason.includes('basico')) return 'basico';
     // Fallback por monto
-    if (amount >= 50000) return 'total';
-    if (amount >= 20000) return 'pro';
+    if (amount >= 40000) return 'total';
+    // if (amount >= 50000) return 'pro';  // Plan PRO desactivado temporalmente
     return 'basico';
 }
 
@@ -2326,7 +2321,7 @@ app.post('/api/b2b/cancel-subscription', authB2BMiddleware, requireB2BRole('admi
         if (instRes.rowCount === 0) return res.status(404).json({ error: 'Institución no encontrada' });
         const inst = instRes.rows[0];
 
-        if (!['basico','pro','total'].includes(inst.plan)) {
+        if (!['basico','pro','total','free'].includes(inst.plan)) {
             return res.status(400).json({ error: 'No hay ningún plan activo para cancelar.' });
         }
 
@@ -5223,13 +5218,13 @@ app.post('/api/admin/set-plan', async (req, res) => {
             );
             const curPac = parseInt(eligR.rows[0]?.pac) || 0;
             const curStf = parseInt(eligR.rows[0]?.stf) || 0;
-            const limPac = plan === 'basico' ? 15 : 40;
-            const limStf = plan === 'basico' ? 8  : 20;
+            const limPac = plan === 'basico' ? 30 : 99999;  // PRO desactivado: basico=30, total=ilimitado
+            const limStf = plan === 'basico' ? 20 : 99999;
             if (curPac > limPac || curStf > limStf) {
                 const parts = [];
                 if (curPac > limPac) parts.push(`${curPac} pacientes activos (máx. ${limPac})`);
                 if (curStf > limStf) parts.push(`${curStf} staff activo (máx. ${limStf})`);
-                const planLabel = plan === 'basico' ? 'Básico' : 'PRO';
+                const planLabel = 'Básico';
                 return res.status(403).json({
                     error: `No se puede asignar Plan ${planLabel}: la institución tiene ${parts.join(' y ')}. Usá Plan Total o reducí los registros primero.`,
                     pacientes_count: curPac,
