@@ -758,6 +758,10 @@ async function runMigrations() {
         await pool.query(`ALTER TABLE citas_b2b ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()`).catch(() => {});
         console.log('✅ Migración B2B v14 completada');
 
+        // MIGRACIONES B2B v15 — Categoría de insumos en catálogo (nullable: ítems existentes sin romper)
+        await pool.query(`ALTER TABLE catalogo_medicamentos_b2b ADD COLUMN IF NOT EXISTS categoria VARCHAR(50)`).catch(() => {});
+        console.log('✅ Migraciones B2B v15 completadas');
+
         // ============================================================
         // FIN MIGRACIONES B2B
         // ============================================================
@@ -4082,6 +4086,19 @@ app.delete('/api/b2b/medicamentos/:id', authB2BMiddleware, requireB2BRole('admin
 
 // ---------- B2B: CATÁLOGO DE MEDICAMENTOS ----------
 
+const CATALOGO_CATEGORIAS_VALIDAS = new Set([
+    'medicamento', 'alimentos', 'cocina', 'limpieza', 'higiene', 'enfermeria', 'papeleria', 'mantenimiento', 'otros'
+]);
+
+/** Normaliza categoría de catálogo; null = sin categoría; undefined = no enviado (PATCH); '__invalid__' = valor no permitido */
+function normalizeCatalogoCategoria(val) {
+    if (val === undefined) return undefined;
+    if (val === null || val === '') return null;
+    const v = String(val).trim().toLowerCase();
+    if (!CATALOGO_CATEGORIAS_VALIDAS.has(v)) return '__invalid__';
+    return v;
+}
+
 // GET /api/b2b/catalogo/stock-bajo  (must come BEFORE /:id)
 app.get('/api/b2b/catalogo/stock-bajo', authB2BMiddleware, requireB2BRole('admin_institucion','medico','cuidador_staff'), async (req, res) => {
     try {
@@ -4143,17 +4160,19 @@ app.get('/api/b2b/catalogo', authB2BMiddleware, async (req, res) => {
 app.post('/api/b2b/catalogo', authB2BMiddleware, requireB2BRole('admin_institucion','medico','cuidador_staff'), requireActivePlan, async (req, res) => {
     try {
         if (!(await checkB2BCanDo(req.b2bUser, 'gestionar_catalogo'))) return res.status(403).json({ error: 'No tenés permiso para gestionar el catálogo. Solicitálo al administrador.' });
-        const { nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo, paciente_id } = req.body;
+        const { nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo, paciente_id, categoria } = req.body;
         if (!nombre) return res.status(400).json({ error: 'nombre obligatorio' });
+        const categoriaNorm = normalizeCatalogoCategoria(categoria);
+        if (categoriaNorm === '__invalid__') return res.status(400).json({ error: 'Categoría no válida' });
         // Si se especifica paciente_id, validar que pertenece a la institución
         if (paciente_id) {
             const pCheck = await pool.query('SELECT id FROM pacientes_b2b WHERE id=$1 AND institucion_id=$2', [paciente_id, req.b2bUser.institucion_id]);
             if (pCheck.rowCount === 0) return res.status(403).json({ error: 'Paciente no pertenece a la institución' });
         }
         const result = await pool.query(
-            `INSERT INTO catalogo_medicamentos_b2b (institucion_id, nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo, paciente_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-            [req.b2bUser.institucion_id, nombre, principio_activo||null, presentacion||null, unidad||'comprimido', stock_actual||0, stock_minimo||5, paciente_id||null]
+            `INSERT INTO catalogo_medicamentos_b2b (institucion_id, nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo, paciente_id, categoria)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+            [req.b2bUser.institucion_id, nombre, principio_activo||null, presentacion||null, unidad||'comprimido', stock_actual||0, stock_minimo||5, paciente_id||null, categoriaNorm]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -4166,8 +4185,14 @@ app.post('/api/b2b/catalogo', authB2BMiddleware, requireB2BRole('admin_instituci
 app.patch('/api/b2b/catalogo/:id', authB2BMiddleware, requireB2BRole('admin_institucion','medico','cuidador_staff'), async (req, res) => {
     try {
         if (!(await checkB2BCanDo(req.b2bUser, 'gestionar_catalogo'))) return res.status(403).json({ error: 'No tenés permiso para gestionar el catálogo. Solicitálo al administrador.' });
-        const { nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo, notas_restock } = req.body;
+        const { nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo, notas_restock, categoria } = req.body;
         const iid = req.b2bUser.institucion_id;
+        const hasCategoria = Object.prototype.hasOwnProperty.call(req.body, 'categoria');
+        let categoriaNorm;
+        if (hasCategoria) {
+            categoriaNorm = normalizeCatalogoCategoria(categoria);
+            if (categoriaNorm === '__invalid__') return res.status(400).json({ error: 'Categoría no válida' });
+        }
         // Fetch current state to detect stock changes for restock log
         const curRes = await pool.query('SELECT * FROM catalogo_medicamentos_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, iid]);
         if (curRes.rowCount === 0) return res.status(404).json({ error: 'Ítem no encontrado' });
@@ -4177,9 +4202,11 @@ app.patch('/api/b2b/catalogo/:id', authB2BMiddleware, requireB2BRole('admin_inst
              SET nombre=COALESCE($1,nombre), principio_activo=COALESCE($2,principio_activo),
                  presentacion=COALESCE($3,presentacion), unidad=COALESCE($4,unidad),
                  stock_actual=COALESCE($5,stock_actual), stock_minimo=COALESCE($6,stock_minimo),
+                 categoria = CASE WHEN $9 THEN $10 ELSE categoria END,
                  updated_at=NOW()
              WHERE id=$7 AND institucion_id=$8 RETURNING *`,
-            [nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo, req.params.id, iid]
+            [nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo, req.params.id, iid,
+             hasCategoria, hasCategoria ? categoriaNorm : null]
         );
         // Log restock entry if stock_actual was increased
         if (stock_actual !== undefined && stock_actual !== null) {
