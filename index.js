@@ -3701,8 +3701,8 @@ app.patch('/api/b2b/staff/:id', authB2BMiddleware, requireB2BRole('admin_institu
             if (conflict.rowCount > 0) return res.status(409).json({ error: 'El email ya está en uso por otro usuario' });
             await pool.query('UPDATE usuarios_b2b SET email=$1 WHERE id=$2', [emailLower, id]);
         }
-        const VALID_STAFF_ROLES = ['medico', 'cuidador_staff', 'familiar'];
-        if (rol && !VALID_STAFF_ROLES.includes(rol)) return res.status(400).json({ error: 'Rol inválido. Valores permitidos: medico, cuidador_staff, familiar' });
+        const VALID_STAFF_ROLES = ['admin_institucion', 'medico', 'cuidador_staff', 'familiar'];
+        if (rol && !VALID_STAFF_ROLES.includes(rol)) return res.status(400).json({ error: 'Rol inválido. Valores permitidos: admin_institucion, medico, cuidador_staff, familiar' });
         if (rol) await pool.query('UPDATE usuarios_b2b SET rol=$1 WHERE id=$2', [rol, id]);
         if (activo !== undefined) await pool.query('UPDATE usuarios_b2b SET activo=$1 WHERE id=$2', [activo, id]);
         if (password) { const h = await bcrypt.hash(password, SALT_ROUNDS); await pool.query('UPDATE usuarios_b2b SET password_hash=$1 WHERE id=$2', [h, id]); }
