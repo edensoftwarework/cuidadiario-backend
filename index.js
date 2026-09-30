@@ -3052,22 +3052,70 @@ async function requireActivePlan(req, res, next) {
 }
 
 // ---------- B2B: Middleware de autenticación ----------
-function authB2BMiddleware(req, res, next) {
+const B2B_ROLES = new Set(['admin_institucion', 'medico', 'cuidador_staff', 'familiar']);
+
+function parseB2BId(value) {
+    if (typeof value === 'number') return Number.isSafeInteger(value) && value > 0 ? value : null;
+    if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) return null;
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+async function authB2BMiddleware(req, res, next) {
     const auth = req.headers.authorization;
     if (!auth) return res.status(401).json({ error: 'Token B2B requerido' });
-    const token = auth.split(' ')[1];
+    const bearer = /^Bearer ([^\s]+)$/.exec(auth);
+    if (!bearer) return res.status(401).json({ error: 'Token B2B inválido o expirado' });
+    const token = bearer[1];
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
-        if (!decoded.b2b) return res.status(401).json({ error: 'Token no es B2B' });
-        // Bloquear usuarios cuyo email_verified sea explícitamente false (en el JWT).
-        // === false es intencional: undefined (tokens viejos sin el campo) pasa sin problemas.
-        if (decoded.email_verified === false) {
+        if (decoded.b2b !== true) return res.status(401).json({ error: 'Token no es B2B' });
+        const userId = parseB2BId(decoded.id);
+        const tokenInstitutionId = parseB2BId(decoded.institucion_id);
+        if (!userId || !tokenInstitutionId) {
+            return res.status(401).json({ error: 'Token B2B inválido o expirado' });
+        }
+
+        const current = await pool.query(
+            `SELECT u.id, u.institucion_id, u.nombre, u.email, u.rol, u.activo, u.email_verified,
+                    i.activa AS institucion_activa, i.permisos_equipo
+             FROM usuarios_b2b u
+             JOIN instituciones_b2b i ON i.id = u.institucion_id
+             WHERE u.id=$1`,
+            [userId]
+        );
+        if (current.rowCount === 0) return res.status(401).json({ error: 'Sesión B2B no vigente' });
+
+        const user = current.rows[0];
+        if (Number(user.institucion_id) !== tokenInstitutionId) {
+            return res.status(401).json({ error: 'Sesión B2B no vigente' });
+        }
+        if (!user.activo || !user.institucion_activa || !B2B_ROLES.has(user.rol)) {
+            return res.status(401).json({ error: 'Sesión B2B no vigente' });
+        }
+        if (!user.email_verified) {
             return res.status(401).json({ error: 'Email no verificado. Revisá tu bandeja de entrada o solicitá un nuevo enlace desde el login.', code: 'EMAIL_NOT_VERIFIED' });
         }
-        req.b2bUser = decoded;
+
+        // Los guards siguientes reciben exclusivamente identidad, tenant, rol y permisos vigentes.
+        // Claims descriptivos obsoletos del JWT nunca prevalecen sobre PostgreSQL.
+        req.b2bUser = {
+            id: Number(user.id),
+            institucion_id: Number(user.institucion_id),
+            nombre: user.nombre,
+            email: user.email,
+            rol: user.rol,
+            b2b: true,
+            email_verified: true,
+            institucion_permisos: user.permisos_equipo || {},
+        };
         next();
     } catch (e) {
-        return res.status(401).json({ error: 'Token B2B inválido o expirado' });
+        if (e && ['JsonWebTokenError', 'TokenExpiredError', 'NotBeforeError'].includes(e.name)) {
+            return res.status(401).json({ error: 'Token B2B inválido o expirado' });
+        }
+        console.error('authB2BMiddleware:', e.message);
+        return res.status(503).json({ error: 'No se pudo validar la sesión B2B' });
     }
 }
 
@@ -3080,33 +3128,40 @@ function requireB2BRole(...roles) {
     };
 }
 
-// Helper: verifica si el usuario B2B puede acceder a un paciente
+function b2bCanListAllPatients(b2bUser) {
+    if (b2bUser.rol === 'admin_institucion') return true;
+    if (b2bUser.rol !== 'medico' && b2bUser.rol !== 'cuidador_staff') return false;
+    const key = `${b2bUser.rol}_ver_todos_pacientes`;
+    const perms = b2bUser.institucion_permisos || {};
+    return key in perms ? !!perms[key] : true;
+}
+
+// Helper: verifica si el usuario B2B puede acceder a un paciente activo de su tenant.
 async function checkB2BPacienteAccess(b2bUser, paciente_id) {
+    const pacienteId = parseB2BId(paciente_id);
+    if (!pacienteId) return false;
+    const patient = await pool.query(
+        'SELECT id FROM pacientes_b2b WHERE id=$1 AND institucion_id=$2 AND activo=TRUE',
+        [pacienteId, b2bUser.institucion_id]
+    );
+    if (patient.rowCount === 0) return false;
     if (b2bUser.rol === 'admin_institucion') {
-        const r = await pool.query('SELECT id FROM pacientes_b2b WHERE id=$1 AND institucion_id=$2 AND activo=TRUE', [paciente_id, b2bUser.institucion_id]);
-        return r.rowCount > 0;
+        return true;
     }
-    // medico y cuidador_staff: respetan el permiso ver_todos_pacientes configurado por la institución
-    if (b2bUser.rol === 'medico' || b2bUser.rol === 'cuidador_staff') {
-        const permKey = `${b2bUser.rol}_ver_todos_pacientes`;
-        let verTodos = true; // default: acceso total si no está configurado explícitamente
-        try {
-            const instRow = await pool.query('SELECT permisos_equipo FROM instituciones_b2b WHERE id=$1', [b2bUser.institucion_id]);
-            const perms = instRow.rows[0]?.permisos_equipo || {};
-            if (permKey in perms) verTodos = !!perms[permKey];
-        } catch {}
-        if (verTodos) {
-            const r = await pool.query('SELECT id FROM pacientes_b2b WHERE id=$1 AND institucion_id=$2 AND activo=TRUE', [paciente_id, b2bUser.institucion_id]);
-            return r.rowCount > 0;
-        }
-    }
+    if (b2bCanListAllPatients(b2bUser)) return true;
     // familiar / staff sin ver_todos: verificar asignación explícita
-    const r = await pool.query('SELECT id FROM asignaciones_b2b WHERE cuidador_id=$1 AND paciente_id=$2 AND activa=TRUE', [b2bUser.id, paciente_id]);
+    const r = await pool.query(
+        `SELECT a.id FROM asignaciones_b2b a
+         JOIN pacientes_b2b p ON p.id=a.paciente_id
+         WHERE a.cuidador_id=$1 AND a.paciente_id=$2 AND a.institucion_id=$3
+           AND a.activa=TRUE AND p.institucion_id=$3 AND p.activo=TRUE`,
+        [b2bUser.id, pacienteId, b2bUser.institucion_id]
+    );
     return r.rowCount > 0;
 }
 
 // Helper: verifica si el usuario B2B tiene permiso para una acción según configuración de la institución en DB
-async function checkB2BCanDo(b2bUser, action) {
+function checkB2BCanDo(b2bUser, action) {
     if (b2bUser.rol === 'admin_institucion') return true;
     if (b2bUser.rol === 'familiar') return false;
     const defaults = {
@@ -3119,18 +3174,15 @@ async function checkB2BCanDo(b2bUser, action) {
         crear_staff:       { medico: false, cuidador_staff: false },
         asignar_paciente:  { medico: false, cuidador_staff: false },
     };
-    try {
-        const r = await pool.query('SELECT permisos_equipo FROM instituciones_b2b WHERE id=$1', [b2bUser.institucion_id]);
-        const perms = r.rows[0]?.permisos_equipo || {};
-        const key = `${b2bUser.rol}_${action}`;
-        if (key in perms) return !!perms[key];
-    } catch {}
+    const perms = b2bUser.institucion_permisos || {};
+    const key = `${b2bUser.rol}_${action}`;
+    if (key in perms) return !!perms[key];
     return defaults[action]?.[b2bUser.rol] ?? false;
 }
 
 // Helper: verifica si un familiar puede ver una sección de la ficha del paciente
 // Secciones: medicamentos | citas | tareas | sintomas | signos | contactos | notas | documentos
-async function checkB2BFamiliarCanSee(b2bUser, section) {
+function checkB2BFamiliarCanSee(b2bUser, section) {
     if (b2bUser.rol !== 'familiar') return true; // para otros roles, esta función no aplica
     const defaults = {
         medicamentos: true,
@@ -3142,13 +3194,76 @@ async function checkB2BFamiliarCanSee(b2bUser, section) {
         notas:        false,
         documentos:   true,
     };
-    try {
-        const r = await pool.query('SELECT permisos_equipo FROM instituciones_b2b WHERE id=$1', [b2bUser.institucion_id]);
-        const perms = r.rows[0]?.permisos_equipo || {};
-        const key = `familiar_ver_${section}`;
-        if (key in perms) return !!perms[key];
-    } catch {}
+    const perms = b2bUser.institucion_permisos || {};
+    const key = `familiar_ver_${section}`;
+    if (key in perms) return !!perms[key];
     return defaults[section] ?? false;
+}
+
+async function authorizeB2BPatientList(b2bUser, paciente_id, section) {
+    if (b2bUser.rol === 'familiar' && section && !checkB2BFamiliarCanSee(b2bUser, section)) {
+        return { allowed: false, status: 403, error: 'Acceso restringido por la institución' };
+    }
+    if (paciente_id === undefined || paciente_id === null || paciente_id === '') {
+        if (!b2bCanListAllPatients(b2bUser)) {
+            return { allowed: false, status: 400, error: 'paciente_id requerido para este rol' };
+        }
+        return { allowed: true, pacienteId: null };
+    }
+    const pacienteId = parseB2BId(paciente_id);
+    if (!pacienteId) {
+        return { allowed: false, status: 400, error: 'paciente_id inválido' };
+    }
+    if (!(await checkB2BPacienteAccess(b2bUser, pacienteId))) {
+        return { allowed: false, status: 403, error: 'Sin acceso a este paciente' };
+    }
+    return { allowed: true, pacienteId };
+}
+
+const B2B_PATIENT_RESOURCE_TABLES = new Set([
+    'medicamentos_b2b', 'citas_b2b', 'tareas_b2b', 'sintomas_b2b',
+    'signos_vitales_b2b', 'contactos_b2b', 'notas_b2b',
+    'documentos_b2b', 'catalogo_medicamentos_b2b',
+]);
+
+async function loadAndAuthorizeB2BPatientResource(b2bUser, table, resourceId) {
+    if (!B2B_PATIENT_RESOURCE_TABLES.has(table)) throw new Error('Tabla B2B no permitida');
+    const id = parseB2BId(resourceId);
+    if (!id) return { found: false, allowed: false, row: null };
+    const result = await pool.query(
+        `SELECT * FROM ${table} WHERE id=$1 AND institucion_id=$2`,
+        [id, b2bUser.institucion_id]
+    );
+    if (result.rowCount === 0) return { found: false, allowed: false, row: null };
+    const row = result.rows[0];
+    if (row.paciente_id === null || row.paciente_id === undefined) {
+        return { found: true, allowed: b2bUser.rol === 'admin_institucion', row };
+    }
+    const allowed = await checkB2BPacienteAccess(b2bUser, row.paciente_id);
+    return { found: true, allowed, row };
+}
+
+async function checkB2BCatalogLink(b2bUser, catalogoId, pacienteId) {
+    if (catalogoId === undefined || catalogoId === null || catalogoId === '') return true;
+    const id = parseB2BId(catalogoId);
+    if (!id) return false;
+    const result = await pool.query(
+        `SELECT id FROM catalogo_medicamentos_b2b
+         WHERE id=$1 AND institucion_id=$2 AND activo=TRUE
+           AND (paciente_id IS NULL OR paciente_id=$3)`,
+        [id, b2bUser.institucion_id, pacienteId]
+    );
+    return result.rowCount > 0;
+}
+
+function setB2BSensitiveNoStore(res) {
+    res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+}
+
+function denyB2BResource(res, access, label = 'Recurso') {
+    return res.status(404).json({ error: `${label} no encontrado` });
 }
 
 // ---------- B2B: AUTH ----------
@@ -3749,21 +3864,16 @@ app.get('/api/b2b/pacientes', authB2BMiddleware, async (req, res) => {
         if (rol === 'familiar') {
             const result = await pool.query(
                 `SELECT p.* FROM pacientes_b2b p JOIN asignaciones_b2b a ON a.paciente_id = p.id
-                 WHERE a.cuidador_id=$1 AND a.activa=TRUE AND p.activo=TRUE ORDER BY p.apellido, p.nombre`,
-                [id]
+                 WHERE a.cuidador_id=$1 AND a.institucion_id=$2 AND a.activa=TRUE
+                   AND p.institucion_id=$2 AND p.activo=TRUE ORDER BY p.apellido, p.nombre`,
+                [id, institucion_id]
             );
             return res.json(result.rows);
         }
 
         // Medico y cuidador_staff: verificar el permiso ver_todos_pacientes de la institución.
         // Por defecto es TRUE (ve todos). El admin puede desactivarlo por rol.
-        let verTodos = true;
-        try {
-            const instRow = await pool.query('SELECT permisos_equipo FROM instituciones_b2b WHERE id=$1', [institucion_id]);
-            const perms = instRow.rows[0]?.permisos_equipo || {};
-            const permKey = `${rol}_ver_todos_pacientes`;
-            if (permKey in perms) verTodos = !!perms[permKey];
-        } catch (_) { /* si falla, usamos el default true */ }
+        const verTodos = b2bCanListAllPatients(req.b2bUser);
 
         // mis_asignados=1: fuerza filtro por asignaciones del usuario (ej: "Mis residentes" en cuidador.html),
         // ignorando ver_todos_pacientes. Así el cuidador ve solo sus asignados aunque tenga verTodos=true.
@@ -3774,8 +3884,9 @@ app.get('/api/b2b/pacientes', authB2BMiddleware, async (req, res) => {
             params = [institucion_id];
         } else {
             query = `SELECT p.* FROM pacientes_b2b p JOIN asignaciones_b2b a ON a.paciente_id = p.id
-                     WHERE a.cuidador_id=$1 AND a.activa=TRUE AND p.activo=TRUE ORDER BY p.apellido, p.nombre`;
-            params = [id];
+                     WHERE a.cuidador_id=$1 AND a.institucion_id=$2 AND a.activa=TRUE
+                       AND p.institucion_id=$2 AND p.activo=TRUE ORDER BY p.apellido, p.nombre`;
+            params = [id, institucion_id];
         }
         const result = await pool.query(query, params);
         res.json(result.rows);
@@ -3789,7 +3900,7 @@ app.get('/api/b2b/pacientes', authB2BMiddleware, async (req, res) => {
 app.get('/api/b2b/pacientes/:id', authB2BMiddleware, async (req, res) => {
     try {
         const { id } = req.params;
-        const hasAccess = await checkB2BPacienteAccess(req.b2bUser, parseInt(id));
+        const hasAccess = await checkB2BPacienteAccess(req.b2bUser, id);
         if (!hasAccess) return res.status(404).json({ error: 'Paciente no encontrado' });
         const result = await pool.query(
             'SELECT * FROM pacientes_b2b WHERE id=$1 AND institucion_id=$2 AND activo=TRUE',
@@ -3834,6 +3945,8 @@ app.patch('/api/b2b/pacientes/:id', authB2BMiddleware, async (req, res) => {
         const action = isEgreso ? 'dar_alta' : 'editar_paciente';
         if (!await checkB2BCanDo(req.b2bUser, action))
             return res.status(403).json({ error: 'No tenés permisos para esta acción' });
+        if (!(await checkB2BPacienteAccess(req.b2bUser, id)))
+            return res.status(404).json({ error: 'Paciente no encontrado' });
         const fields = ['nombre','apellido','fecha_nacimiento','dni','habitacion','diagnostico','obra_social','num_afiliado','contacto_familiar_nombre','contacto_familiar_tel','notas_ingreso','fecha_ingreso','foto_url','alergias','medico_cabecera','antecedentes','fecha_egreso','motivo_egreso'];
         const updates = []; const values = []; let i = 1;
         for (const f of fields) { if (req.body[f] !== undefined) { updates.push(`${f}=$${i++}`); values.push(req.body[f]); } }
@@ -3853,6 +3966,8 @@ app.delete('/api/b2b/pacientes/:id', authB2BMiddleware, async (req, res) => {
         if (!await checkB2BCanDo(req.b2bUser, 'eliminar_paciente'))
             return res.status(403).json({ error: 'No tenés permisos para eliminar pacientes' });
         const { id } = req.params;
+        if (!(await checkB2BPacienteAccess(req.b2bUser, id)))
+            return res.status(404).json({ error: 'Paciente no encontrado' });
         const result = await pool.query('UPDATE pacientes_b2b SET activo=FALSE WHERE id=$1 AND institucion_id=$2 RETURNING id', [id, req.b2bUser.institucion_id]);
         if (result.rowCount === 0) return res.status(404).json({ error: 'Paciente no encontrado' });
         res.json({ success: true });
@@ -3924,7 +4039,8 @@ app.delete('/api/b2b/asignaciones/:id', authB2BMiddleware, async (req, res) => {
         if (!canAssign) return res.status(403).json({ error: 'No tenés permisos para gestionar asignaciones', code: 'FORBIDDEN' });
     }
     try {
-        await pool.query('UPDATE asignaciones_b2b SET activa=FALSE WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
+        const result = await pool.query('UPDATE asignaciones_b2b SET activa=FALSE WHERE id=$1 AND institucion_id=$2 RETURNING id', [req.params.id, req.b2bUser.institucion_id]);
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Asignación no encontrada' });
         res.json({ success: true });
     } catch (err) {
         console.error('DELETE /api/b2b/asignaciones/:id:', err.message);
@@ -3938,13 +4054,11 @@ app.delete('/api/b2b/asignaciones/:id', authB2BMiddleware, async (req, res) => {
 app.get('/api/b2b/medicamentos/historial', authB2BMiddleware, async (req, res) => {
     try {
         const { paciente_id } = req.query;
-        if (req.b2bUser.rol === 'familiar' && !(await checkB2BFamiliarCanSee(req.b2bUser, 'medicamentos')))
-            return res.status(403).json({ error: 'Acceso restringido por la institución' });
-        if (paciente_id && !(await checkB2BPacienteAccess(req.b2bUser, parseInt(paciente_id))))
-            return res.status(403).json({ error: 'Sin acceso a este paciente' });
+        const scope = await authorizeB2BPatientList(req.b2bUser, paciente_id, 'medicamentos');
+        if (!scope.allowed) return res.status(scope.status).json({ error: scope.error });
         let query = 'SELECT * FROM historial_medicamentos_b2b WHERE institucion_id=$1';
         const params = [req.b2bUser.institucion_id];
-        if (paciente_id) { query += ` AND paciente_id=$2`; params.push(paciente_id); }
+        if (scope.pacienteId) { query += ` AND paciente_id=$2`; params.push(scope.pacienteId); }
         query += ' ORDER BY fecha DESC LIMIT 100';
         res.json((await pool.query(query, params)).rows);
     } catch (err) {
@@ -3957,10 +4071,8 @@ app.get('/api/b2b/medicamentos/historial', authB2BMiddleware, async (req, res) =
 app.get('/api/b2b/medicamentos', authB2BMiddleware, async (req, res) => {
     try {
         const { paciente_id } = req.query;
-        if (req.b2bUser.rol === 'familiar' && !(await checkB2BFamiliarCanSee(req.b2bUser, 'medicamentos')))
-            return res.status(403).json({ error: 'Acceso restringido por la institución' });
-        if (paciente_id && !(await checkB2BPacienteAccess(req.b2bUser, parseInt(paciente_id))))
-            return res.status(403).json({ error: 'Sin acceso a este paciente' });
+        const scope = await authorizeB2BPatientList(req.b2bUser, paciente_id, 'medicamentos');
+        if (!scope.allowed) return res.status(scope.status).json({ error: scope.error });
         let query = `SELECT m.*,
                      c.nombre AS catalogo_nombre, c.stock_actual AS catalogo_stock,
                      c.stock_minimo AS catalogo_stock_minimo, c.unidad AS catalogo_unidad
@@ -3968,7 +4080,7 @@ app.get('/api/b2b/medicamentos', authB2BMiddleware, async (req, res) => {
                      LEFT JOIN catalogo_medicamentos_b2b c ON m.catalogo_id = c.id
                      WHERE m.institucion_id=$1 AND m.activo=TRUE`;
         const params = [req.b2bUser.institucion_id];
-        if (paciente_id) { query += ` AND m.paciente_id=$2`; params.push(paciente_id); }
+        if (scope.pacienteId) { query += ` AND m.paciente_id=$2`; params.push(scope.pacienteId); }
         query += ' ORDER BY m.nombre';
         res.json((await pool.query(query, params)).rows);
     } catch (err) {
@@ -3983,6 +4095,8 @@ app.post('/api/b2b/medicamentos', authB2BMiddleware, requireB2BRole('admin_insti
         const { paciente_id, nombre, dosis, frecuencia, hora_inicio, hora_fin, horarios_custom, instrucciones, stock, catalogo_id } = req.body;
         if (!paciente_id || !nombre) return res.status(400).json({ error: 'paciente_id y nombre obligatorios' });
         if (!(await checkB2BPacienteAccess(req.b2bUser, paciente_id))) return res.status(403).json({ error: 'Sin acceso a este paciente' });
+        if (!(await checkB2BCatalogLink(req.b2bUser, catalogo_id, paciente_id)))
+            return res.status(403).json({ error: 'Catálogo no disponible para este paciente' });
         const result = await pool.query(
             `INSERT INTO medicamentos_b2b (institucion_id, paciente_id, nombre, dosis, frecuencia, hora_inicio, hora_fin, horarios_custom, instrucciones, stock, catalogo_id)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
@@ -3998,9 +4112,9 @@ app.post('/api/b2b/medicamentos', authB2BMiddleware, requireB2BRole('admin_insti
 // POST /api/b2b/medicamentos/:id/toma
 app.post('/api/b2b/medicamentos/:id/toma', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), requireActivePlan, async (req, res) => {
     try {
-        const med = await pool.query('SELECT * FROM medicamentos_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
-        if (med.rowCount === 0) return res.status(404).json({ error: 'Medicamento no encontrado' });
-        const m = med.rows[0];
+        const access = await loadAndAuthorizeB2BPatientResource(req.b2bUser, 'medicamentos_b2b', req.params.id);
+        if (!access.found || !access.allowed) return denyB2BResource(res, access, 'Medicamento');
+        const m = access.row;
         const cantidad = Math.max(1, parseInt(req.body.cantidad) || 1);
 
         // STOCK GUARD: block toma if there is no stock remaining
@@ -4054,9 +4168,13 @@ app.post('/api/b2b/medicamentos/:id/toma', authB2BMiddleware, requireB2BRole('ad
 // PATCH /api/b2b/medicamentos/:id
 app.patch('/api/b2b/medicamentos/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
+        const access = await loadAndAuthorizeB2BPatientResource(req.b2bUser, 'medicamentos_b2b', req.params.id);
+        if (!access.found || !access.allowed) return denyB2BResource(res, access, 'Medicamento');
         const { nombre, dosis, frecuencia, hora_inicio, hora_fin, horarios_custom, instrucciones, stock, activo, catalogo_id } = req.body;
         // catalogo_id can be explicitly set to null (unlink) or a number (link), hence no COALESCE
         const hasCatalogoId = Object.prototype.hasOwnProperty.call(req.body, 'catalogo_id');
+        if (hasCatalogoId && !(await checkB2BCatalogLink(req.b2bUser, catalogo_id, access.row.paciente_id)))
+            return res.status(403).json({ error: 'Catálogo no disponible para este paciente' });
         await pool.query(
             `UPDATE medicamentos_b2b SET nombre=COALESCE($1,nombre), dosis=COALESCE($2,dosis), frecuencia=COALESCE($3,frecuencia),
              hora_inicio=COALESCE($4,hora_inicio), hora_fin=COALESCE($5,hora_fin), horarios_custom=COALESCE($6,horarios_custom),
@@ -4076,6 +4194,8 @@ app.patch('/api/b2b/medicamentos/:id', authB2BMiddleware, requireB2BRole('admin_
 // DELETE /api/b2b/medicamentos/:id
 app.delete('/api/b2b/medicamentos/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
+        const access = await loadAndAuthorizeB2BPatientResource(req.b2bUser, 'medicamentos_b2b', req.params.id);
+        if (!access.found || !access.allowed) return denyB2BResource(res, access, 'Medicamento');
         await pool.query('UPDATE medicamentos_b2b SET activo=FALSE WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         res.json({ success: true });
     } catch (err) {
@@ -4102,13 +4222,29 @@ function normalizeCatalogoCategoria(val) {
 // GET /api/b2b/catalogo/stock-bajo  (must come BEFORE /:id)
 app.get('/api/b2b/catalogo/stock-bajo', authB2BMiddleware, requireB2BRole('admin_institucion','medico','cuidador_staff'), async (req, res) => {
     try {
+        const params = [req.b2bUser.institucion_id];
+        let patientFilter = '';
+        if (req.query.paciente_id) {
+            const scope = await authorizeB2BPatientList(req.b2bUser, req.query.paciente_id, null);
+            if (!scope.allowed) return res.status(scope.status).json({ error: scope.error });
+            patientFilter = ' AND c.paciente_id=$2';
+            params.push(scope.pacienteId);
+        } else if (!b2bCanListAllPatients(req.b2bUser)) {
+            patientFilter = ` AND (c.paciente_id IS NULL OR EXISTS (
+                SELECT 1 FROM asignaciones_b2b a
+                WHERE a.cuidador_id=$2 AND a.paciente_id=c.paciente_id
+                  AND a.institucion_id=$1 AND a.activa=TRUE
+            ))`;
+            params.push(req.b2bUser.id);
+        }
         const result = await pool.query(
             `SELECT c.*, p.nombre AS paciente_nombre, p.apellido AS paciente_apellido
              FROM catalogo_medicamentos_b2b c
              LEFT JOIN pacientes_b2b p ON c.paciente_id = p.id
              WHERE c.institucion_id=$1 AND c.activo=TRUE AND c.stock_actual <= c.stock_minimo
+             ${patientFilter}
              ORDER BY c.stock_actual ASC`,
-            [req.b2bUser.institucion_id]
+            params
         );
         res.json(result.rows);
     } catch (err) {
@@ -4126,12 +4262,13 @@ app.get('/api/b2b/catalogo', authB2BMiddleware, async (req, res) => {
 
         // Familiar: solo puede ver insumos específicos de sus pacientes asignados
         if (req.b2bUser.rol === 'familiar') {
+            if (!checkB2BFamiliarCanSee(req.b2bUser, 'medicamentos'))
+                return res.status(403).json({ error: 'Acceso restringido por la institución' });
             if (!paciente_id) return res.json([]); // sin inventario institucional
-            const acc = await pool.query(
-                'SELECT id FROM asignaciones_b2b WHERE cuidador_id=$1 AND paciente_id=$2 AND activa=TRUE',
-                [req.b2bUser.id, paciente_id]
-            );
-            if (acc.rowCount === 0) return res.status(403).json({ error: 'No tenés acceso a este paciente' });
+            if (!(await checkB2BPacienteAccess(req.b2bUser, paciente_id)))
+                return res.status(403).json({ error: 'No tenés acceso a este paciente' });
+        } else if (paciente_id && !(await checkB2BPacienteAccess(req.b2bUser, paciente_id))) {
+            return res.status(403).json({ error: 'No tenés acceso a este paciente' });
         }
 
         let query, params;
@@ -4164,10 +4301,10 @@ app.post('/api/b2b/catalogo', authB2BMiddleware, requireB2BRole('admin_instituci
         if (!nombre) return res.status(400).json({ error: 'nombre obligatorio' });
         const categoriaNorm = normalizeCatalogoCategoria(categoria);
         if (categoriaNorm === '__invalid__') return res.status(400).json({ error: 'Categoría no válida' });
-        // Si se especifica paciente_id, validar que pertenece a la institución
+        // Si se especifica paciente_id, exigir acceso vigente al residente.
         if (paciente_id) {
-            const pCheck = await pool.query('SELECT id FROM pacientes_b2b WHERE id=$1 AND institucion_id=$2', [paciente_id, req.b2bUser.institucion_id]);
-            if (pCheck.rowCount === 0) return res.status(403).json({ error: 'Paciente no pertenece a la institución' });
+            if (!(await checkB2BPacienteAccess(req.b2bUser, paciente_id)))
+                return res.status(403).json({ error: 'Sin acceso a este paciente' });
         }
         const result = await pool.query(
             `INSERT INTO catalogo_medicamentos_b2b (institucion_id, nombre, principio_activo, presentacion, unidad, stock_actual, stock_minimo, paciente_id, categoria)
@@ -4197,6 +4334,8 @@ app.patch('/api/b2b/catalogo/:id', authB2BMiddleware, requireB2BRole('admin_inst
         const curRes = await pool.query('SELECT * FROM catalogo_medicamentos_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, iid]);
         if (curRes.rowCount === 0) return res.status(404).json({ error: 'Ítem no encontrado' });
         const cur = curRes.rows[0];
+        if (cur.paciente_id && !(await checkB2BPacienteAccess(req.b2bUser, cur.paciente_id)))
+            return res.status(404).json({ error: 'Ítem no encontrado' });
         const result = await pool.query(
             `UPDATE catalogo_medicamentos_b2b
              SET nombre=COALESCE($1,nombre), principio_activo=COALESCE($2,principio_activo),
@@ -4235,6 +4374,8 @@ app.patch('/api/b2b/catalogo/:id', authB2BMiddleware, requireB2BRole('admin_inst
 app.get('/api/b2b/catalogo/restock-historial', authB2BMiddleware, async (req, res) => {
     try {
         const { catalogo_id, paciente_id } = req.query;
+        if (req.b2bUser.rol === 'familiar' && !checkB2BFamiliarCanSee(req.b2bUser, 'medicamentos'))
+            return res.status(403).json({ error: 'Acceso restringido por la institución' });
         const iid = req.b2bUser.institucion_id;
         let query = `SELECT h.*, COALESCE(h.registrado_nombre, u.nombre, 'Sistema') AS registrador
                      FROM historial_restock_b2b h
@@ -4242,7 +4383,21 @@ app.get('/api/b2b/catalogo/restock-historial', authB2BMiddleware, async (req, re
                      WHERE h.institucion_id=$1`;
         const params = [iid];
         if (catalogo_id) { query += ` AND h.catalogo_id=$${params.length + 1}`; params.push(catalogo_id); }
-        if (paciente_id) { query += ` AND h.paciente_id=$${params.length + 1}`; params.push(paciente_id); }
+        if (paciente_id) {
+            const scope = await authorizeB2BPatientList(req.b2bUser, paciente_id, null);
+            if (!scope.allowed) return res.status(scope.status).json({ error: scope.error });
+            query += ` AND h.paciente_id=$${params.length + 1}`;
+            params.push(scope.pacienteId);
+        } else if (req.b2bUser.rol === 'familiar') {
+            return res.status(400).json({ error: 'paciente_id requerido para este rol' });
+        } else if (!b2bCanListAllPatients(req.b2bUser)) {
+            params.push(req.b2bUser.id);
+            query += ` AND (h.paciente_id IS NULL OR EXISTS (
+                SELECT 1 FROM asignaciones_b2b a
+                WHERE a.cuidador_id=$${params.length} AND a.paciente_id=h.paciente_id
+                  AND a.institucion_id=$1 AND a.activa=TRUE
+            ))`;
+        }
         query += ' ORDER BY h.created_at DESC LIMIT 50';
         res.json((await pool.query(query, params)).rows);
     } catch (err) {
@@ -4254,7 +4409,8 @@ app.get('/api/b2b/catalogo/restock-historial', authB2BMiddleware, async (req, re
 // DELETE /api/b2b/catalogo/:id
 app.delete('/api/b2b/catalogo/:id', authB2BMiddleware, requireB2BRole('admin_institucion'), async (req, res) => {
     try {
-        await pool.query('UPDATE catalogo_medicamentos_b2b SET activo=FALSE WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
+        const result = await pool.query('UPDATE catalogo_medicamentos_b2b SET activo=FALSE WHERE id=$1 AND institucion_id=$2 RETURNING id', [req.params.id, req.b2bUser.institucion_id]);
+        if (result.rowCount === 0) return res.status(404).json({ error: 'Ítem no encontrado' });
         res.json({ success: true });
     } catch (err) {
         console.error('DELETE /api/b2b/catalogo/:id:', err.message);
@@ -4268,14 +4424,12 @@ app.delete('/api/b2b/catalogo/:id', authB2BMiddleware, requireB2BRole('admin_ins
 app.get('/api/b2b/citas', authB2BMiddleware, async (req, res) => {
     try {
         const { paciente_id } = req.query;
-        if (req.b2bUser.rol === 'familiar' && !(await checkB2BFamiliarCanSee(req.b2bUser, 'citas')))
-            return res.status(403).json({ error: 'Acceso restringido por la institución' });
-        if (paciente_id && !(await checkB2BPacienteAccess(req.b2bUser, parseInt(paciente_id))))
-            return res.status(403).json({ error: 'Sin acceso a este paciente' });
+        const scope = await authorizeB2BPatientList(req.b2bUser, paciente_id, 'citas');
+        if (!scope.allowed) return res.status(scope.status).json({ error: scope.error });
         let query = `SELECT c.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
                      FROM citas_b2b c JOIN pacientes_b2b p ON c.paciente_id=p.id WHERE c.institucion_id=$1`;
         const params = [req.b2bUser.institucion_id];
-        if (paciente_id) { query += ` AND c.paciente_id=$2`; params.push(paciente_id); }
+        if (scope.pacienteId) { query += ` AND c.paciente_id=$2`; params.push(scope.pacienteId); }
         query += ' ORDER BY c.fecha LIMIT 200';
         res.json((await pool.query(query, params)).rows);
     } catch (err) {
@@ -4305,6 +4459,8 @@ app.post('/api/b2b/citas', authB2BMiddleware, requireB2BRole('admin_institucion'
 // PATCH /api/b2b/citas/:id
 app.patch('/api/b2b/citas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
+        const access = await loadAndAuthorizeB2BPatientResource(req.b2bUser, 'citas_b2b', req.params.id);
+        if (!access.found || !access.allowed) return denyB2BResource(res, access, 'Cita');
         const { titulo, descripcion, fecha, medico, especialidad, lugar, estado } = req.body;
         await pool.query(
             `UPDATE citas_b2b SET titulo=COALESCE($1,titulo), descripcion=COALESCE($2,descripcion), fecha=COALESCE($3,fecha),
@@ -4324,14 +4480,12 @@ app.patch('/api/b2b/citas/:id', authB2BMiddleware, requireB2BRole('admin_institu
 app.get('/api/b2b/citas/historial', authB2BMiddleware, async (req, res) => {
     try {
         const { paciente_id } = req.query;
-        if (req.b2bUser.rol === 'familiar' && !(await checkB2BFamiliarCanSee(req.b2bUser, 'citas')))
-            return res.status(403).json({ error: 'Acceso restringido por la institución' });
-        if (paciente_id && !(await checkB2BPacienteAccess(req.b2bUser, parseInt(paciente_id))))
-            return res.status(403).json({ error: 'Sin acceso a este paciente' });
+        const scope = await authorizeB2BPatientList(req.b2bUser, paciente_id, 'citas');
+        if (!scope.allowed) return res.status(scope.status).json({ error: scope.error });
         const iid = req.b2bUser.institucion_id;
         const params = [iid];
         let pacienteFilter = '';
-        if (paciente_id) { params.push(paciente_id); pacienteFilter = `AND c.paciente_id=$${params.length}`; }
+        if (scope.pacienteId) { params.push(scope.pacienteId); pacienteFilter = `AND c.paciente_id=$${params.length}`; }
         const query = `
             SELECT c.id, c.titulo, c.descripcion, c.fecha, c.medico, c.especialidad, c.lugar, c.estado,
                    c.updated_at, c.paciente_id
@@ -4349,6 +4503,8 @@ app.get('/api/b2b/citas/historial', authB2BMiddleware, async (req, res) => {
 // DELETE /api/b2b/citas/:id
 app.delete('/api/b2b/citas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
+        const access = await loadAndAuthorizeB2BPatientResource(req.b2bUser, 'citas_b2b', req.params.id);
+        if (!access.found || !access.allowed) return denyB2BResource(res, access, 'Cita');
         await pool.query('DELETE FROM citas_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         res.json({ success: true });
     } catch (err) {
@@ -4363,13 +4519,11 @@ app.delete('/api/b2b/citas/:id', authB2BMiddleware, requireB2BRole('admin_instit
 app.get('/api/b2b/tareas/historial', authB2BMiddleware, async (req, res) => {
     try {
         const { paciente_id } = req.query;
-        if (req.b2bUser.rol === 'familiar' && !(await checkB2BFamiliarCanSee(req.b2bUser, 'tareas')))
-            return res.status(403).json({ error: 'Acceso restringido por la institución' });
-        if (paciente_id && !(await checkB2BPacienteAccess(req.b2bUser, parseInt(paciente_id))))
-            return res.status(403).json({ error: 'Sin acceso a este paciente' });
+        const scope = await authorizeB2BPatientList(req.b2bUser, paciente_id, 'tareas');
+        if (!scope.allowed) return res.status(scope.status).json({ error: scope.error });
         let query = 'SELECT * FROM historial_tareas_b2b WHERE institucion_id=$1';
         const params = [req.b2bUser.institucion_id];
-        if (paciente_id) { query += ` AND paciente_id=$2`; params.push(paciente_id); }
+        if (scope.pacienteId) { query += ` AND paciente_id=$2`; params.push(scope.pacienteId); }
         query += ' ORDER BY fecha DESC LIMIT 100';
         res.json((await pool.query(query, params)).rows);
     } catch (err) {
@@ -4382,15 +4536,13 @@ app.get('/api/b2b/tareas/historial', authB2BMiddleware, async (req, res) => {
 app.get('/api/b2b/tareas', authB2BMiddleware, async (req, res) => {
     try {
         const { paciente_id } = req.query;
-        if (req.b2bUser.rol === 'familiar' && !(await checkB2BFamiliarCanSee(req.b2bUser, 'tareas')))
-            return res.status(403).json({ error: 'Acceso restringido por la institución' });
-        if (paciente_id && !(await checkB2BPacienteAccess(req.b2bUser, parseInt(paciente_id))))
-            return res.status(403).json({ error: 'Sin acceso a este paciente' });
+        const scope = await authorizeB2BPatientList(req.b2bUser, paciente_id, 'tareas');
+        if (!scope.allowed) return res.status(scope.status).json({ error: scope.error });
         let query = `SELECT t.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
                      FROM tareas_b2b t JOIN pacientes_b2b p ON t.paciente_id=p.id
                      WHERE t.institucion_id=$1 AND t.activa=TRUE`;
         const params = [req.b2bUser.institucion_id];
-        if (paciente_id) { query += ` AND t.paciente_id=$2`; params.push(paciente_id); }
+        if (scope.pacienteId) { query += ` AND t.paciente_id=$2`; params.push(scope.pacienteId); }
         query += ' ORDER BY t.hora NULLS LAST, t.titulo';
         res.json((await pool.query(query, params)).rows);
     } catch (err) {
@@ -4442,6 +4594,8 @@ app.post('/api/b2b/tareas/:id/completar', authB2BMiddleware, requireB2BRole('adm
 // PATCH /api/b2b/tareas/:id
 app.patch('/api/b2b/tareas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
+        const access = await loadAndAuthorizeB2BPatientResource(req.b2bUser, 'tareas_b2b', req.params.id);
+        if (!access.found || !access.allowed) return denyB2BResource(res, access, 'Tarea');
         const { titulo, descripcion, categoria, frecuencia, hora, activa } = req.body;
         await pool.query(
             `UPDATE tareas_b2b SET titulo=COALESCE($1,titulo), descripcion=COALESCE($2,descripcion),
@@ -4459,6 +4613,8 @@ app.patch('/api/b2b/tareas/:id', authB2BMiddleware, requireB2BRole('admin_instit
 // DELETE /api/b2b/tareas/:id
 app.delete('/api/b2b/tareas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
+        const access = await loadAndAuthorizeB2BPatientResource(req.b2bUser, 'tareas_b2b', req.params.id);
+        if (!access.found || !access.allowed) return denyB2BResource(res, access, 'Tarea');
         await pool.query('UPDATE tareas_b2b SET activa=FALSE WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         res.json({ success: true });
     } catch (err) {
@@ -4473,14 +4629,12 @@ app.delete('/api/b2b/tareas/:id', authB2BMiddleware, requireB2BRole('admin_insti
 app.get('/api/b2b/sintomas', authB2BMiddleware, async (req, res) => {
     try {
         const { paciente_id } = req.query;
-        if (req.b2bUser.rol === 'familiar' && !(await checkB2BFamiliarCanSee(req.b2bUser, 'sintomas')))
-            return res.status(403).json({ error: 'Acceso restringido por la institución' });
-        if (paciente_id && !(await checkB2BPacienteAccess(req.b2bUser, parseInt(paciente_id))))
-            return res.status(403).json({ error: 'Sin acceso a este paciente' });
+        const scope = await authorizeB2BPatientList(req.b2bUser, paciente_id, 'sintomas');
+        if (!scope.allowed) return res.status(scope.status).json({ error: scope.error });
         let query = `SELECT s.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
                      FROM sintomas_b2b s JOIN pacientes_b2b p ON s.paciente_id=p.id WHERE s.institucion_id=$1`;
         const params = [req.b2bUser.institucion_id];
-        if (paciente_id) { query += ` AND s.paciente_id=$2`; params.push(paciente_id); }
+        if (scope.pacienteId) { query += ` AND s.paciente_id=$2`; params.push(scope.pacienteId); }
         query += ' ORDER BY s.fecha DESC LIMIT 100';
         res.json((await pool.query(query, params)).rows);
     } catch (err) {
@@ -4512,6 +4666,8 @@ app.post('/api/b2b/sintomas', authB2BMiddleware, requireB2BRole('admin_instituci
 // PATCH /api/b2b/sintomas/:id
 app.patch('/api/b2b/sintomas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
+        const access = await loadAndAuthorizeB2BPatientResource(req.b2bUser, 'sintomas_b2b', req.params.id);
+        if (!access.found || !access.allowed) return denyB2BResource(res, access, 'Síntoma');
         const { descripcion, intensidad } = req.body;
         if (!descripcion) return res.status(400).json({ error: 'descripcion obligatoria' });
         const result = await pool.query(
@@ -4529,6 +4685,8 @@ app.patch('/api/b2b/sintomas/:id', authB2BMiddleware, requireB2BRole('admin_inst
 // DELETE /api/b2b/sintomas/:id
 app.delete('/api/b2b/sintomas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
+        const access = await loadAndAuthorizeB2BPatientResource(req.b2bUser, 'sintomas_b2b', req.params.id);
+        if (!access.found || !access.allowed) return denyB2BResource(res, access, 'Síntoma');
         await pool.query('DELETE FROM sintomas_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         res.json({ success: true });
     } catch (err) {
@@ -4543,14 +4701,12 @@ app.delete('/api/b2b/sintomas/:id', authB2BMiddleware, requireB2BRole('admin_ins
 app.get('/api/b2b/signos-vitales', authB2BMiddleware, async (req, res) => {
     try {
         const { paciente_id, tipo } = req.query;
-        if (req.b2bUser.rol === 'familiar' && !(await checkB2BFamiliarCanSee(req.b2bUser, 'signos')))
-            return res.status(403).json({ error: 'Acceso restringido por la institución' });
-        if (paciente_id && !(await checkB2BPacienteAccess(req.b2bUser, parseInt(paciente_id))))
-            return res.status(403).json({ error: 'Sin acceso a este paciente' });
+        const scope = await authorizeB2BPatientList(req.b2bUser, paciente_id, 'signos');
+        if (!scope.allowed) return res.status(scope.status).json({ error: scope.error });
         let query = `SELECT sv.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
                      FROM signos_vitales_b2b sv JOIN pacientes_b2b p ON sv.paciente_id=p.id WHERE sv.institucion_id=$1`;
         const params = [req.b2bUser.institucion_id];
-        if (paciente_id) { query += ` AND sv.paciente_id=$${params.length+1}`; params.push(paciente_id); }
+        if (scope.pacienteId) { query += ` AND sv.paciente_id=$${params.length+1}`; params.push(scope.pacienteId); }
         if (tipo) { query += ` AND sv.tipo=$${params.length+1}`; params.push(tipo); }
         query += ' ORDER BY sv.fecha DESC LIMIT 100';
         res.json((await pool.query(query, params)).rows);
@@ -4583,6 +4739,8 @@ app.post('/api/b2b/signos-vitales', authB2BMiddleware, requireB2BRole('admin_ins
 // DELETE /api/b2b/signos-vitales/:id
 app.delete('/api/b2b/signos-vitales/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
+        const access = await loadAndAuthorizeB2BPatientResource(req.b2bUser, 'signos_vitales_b2b', req.params.id);
+        if (!access.found || !access.allowed) return denyB2BResource(res, access, 'Signo vital');
         await pool.query('DELETE FROM signos_vitales_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         res.json({ success: true });
     } catch (err) {
@@ -4597,13 +4755,11 @@ app.delete('/api/b2b/signos-vitales/:id', authB2BMiddleware, requireB2BRole('adm
 app.get('/api/b2b/contactos', authB2BMiddleware, async (req, res) => {
     try {
         const { paciente_id } = req.query;
-        if (req.b2bUser.rol === 'familiar' && !(await checkB2BFamiliarCanSee(req.b2bUser, 'contactos')))
-            return res.status(403).json({ error: 'Acceso restringido por la institución' });
-        if (paciente_id && !(await checkB2BPacienteAccess(req.b2bUser, parseInt(paciente_id))))
-            return res.status(403).json({ error: 'Sin acceso a este paciente' });
+        const scope = await authorizeB2BPatientList(req.b2bUser, paciente_id, 'contactos');
+        if (!scope.allowed) return res.status(scope.status).json({ error: scope.error });
         let query = 'SELECT * FROM contactos_b2b WHERE institucion_id=$1';
         const params = [req.b2bUser.institucion_id];
-        if (paciente_id) { query += ` AND paciente_id=$2`; params.push(paciente_id); }
+        if (scope.pacienteId) { query += ` AND paciente_id=$2`; params.push(scope.pacienteId); }
         query += ' ORDER BY es_principal DESC, nombre';
         res.json((await pool.query(query, params)).rows);
     } catch (err) {
@@ -4633,6 +4789,8 @@ app.post('/api/b2b/contactos', authB2BMiddleware, requireB2BRole('admin_instituc
 // PATCH /api/b2b/contactos/:id
 app.patch('/api/b2b/contactos/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
+        const access = await loadAndAuthorizeB2BPatientResource(req.b2bUser, 'contactos_b2b', req.params.id);
+        if (!access.found || !access.allowed) return denyB2BResource(res, access, 'Contacto');
         const { nombre, relacion, telefono, email, es_principal } = req.body;
         await pool.query(
             `UPDATE contactos_b2b SET nombre=COALESCE($1,nombre), relacion=COALESCE($2,relacion),
@@ -4650,6 +4808,8 @@ app.patch('/api/b2b/contactos/:id', authB2BMiddleware, requireB2BRole('admin_ins
 // DELETE /api/b2b/contactos/:id
 app.delete('/api/b2b/contactos/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
+        const access = await loadAndAuthorizeB2BPatientResource(req.b2bUser, 'contactos_b2b', req.params.id);
+        if (!access.found || !access.allowed) return denyB2BResource(res, access, 'Contacto');
         await pool.query('DELETE FROM contactos_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         res.json({ success: true });
     } catch (err) {
@@ -4664,14 +4824,12 @@ app.delete('/api/b2b/contactos/:id', authB2BMiddleware, requireB2BRole('admin_in
 app.get('/api/b2b/notas', authB2BMiddleware, async (req, res) => {
     try {
         const { paciente_id } = req.query;
-        if (req.b2bUser.rol === 'familiar' && !(await checkB2BFamiliarCanSee(req.b2bUser, 'notas')))
-            return res.status(403).json({ error: 'Acceso restringido por la institución' });
-        if (paciente_id && !(await checkB2BPacienteAccess(req.b2bUser, parseInt(paciente_id))))
-            return res.status(403).json({ error: 'Sin acceso a este paciente' });
+        const scope = await authorizeB2BPatientList(req.b2bUser, paciente_id, 'notas');
+        if (!scope.allowed) return res.status(scope.status).json({ error: scope.error });
         let query = `SELECT n.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
                      FROM notas_b2b n JOIN pacientes_b2b p ON n.paciente_id=p.id WHERE n.institucion_id=$1`;
         const params = [req.b2bUser.institucion_id];
-        if (paciente_id) { query += ` AND n.paciente_id=$2`; params.push(paciente_id); }
+        if (scope.pacienteId) { query += ` AND n.paciente_id=$2`; params.push(scope.pacienteId); }
         query += ' ORDER BY n.urgente DESC, n.created_at DESC LIMIT 200';
         res.json((await pool.query(query, params)).rows);
     } catch (err) {
@@ -4702,6 +4860,8 @@ app.post('/api/b2b/notas', authB2BMiddleware, requireB2BRole('admin_institucion'
 // PATCH /api/b2b/notas/:id
 app.patch('/api/b2b/notas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
+        const access = await loadAndAuthorizeB2BPatientResource(req.b2bUser, 'notas_b2b', req.params.id);
+        if (!access.found || !access.allowed) return denyB2BResource(res, access, 'Nota');
         const { titulo, contenido, urgente } = req.body;
         await pool.query(
             `UPDATE notas_b2b SET titulo=COALESCE($1,titulo), contenido=COALESCE($2,contenido), urgente=COALESCE($3,urgente)
@@ -4718,6 +4878,8 @@ app.patch('/api/b2b/notas/:id', authB2BMiddleware, requireB2BRole('admin_institu
 // DELETE /api/b2b/notas/:id
 app.delete('/api/b2b/notas/:id', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), async (req, res) => {
     try {
+        const access = await loadAndAuthorizeB2BPatientResource(req.b2bUser, 'notas_b2b', req.params.id);
+        if (!access.found || !access.allowed) return denyB2BResource(res, access, 'Nota');
         await pool.query('DELETE FROM notas_b2b WHERE id=$1 AND institucion_id=$2', [req.params.id, req.b2bUser.institucion_id]);
         res.json({ success: true });
     } catch (err) {
@@ -4737,20 +4899,24 @@ app.get('/api/b2b/notificaciones', authB2BMiddleware, async (req, res) => {
         const lsRes = await pool.query('SELECT notif_last_seen_at FROM usuarios_b2b WHERE id=$1', [uid]);
         const lastSeen = lsRes.rows[0]?.notif_last_seen_at || new Date(0);
 
-        // Familiares solo ven notificaciones de sus pacientes asignados
-        let familiarPatientIds = new Set();
-        if (req.b2bUser.rol === 'familiar') {
+        // Familiares y equipo sin permiso global sólo ven residentes asignados.
+        let scopedPatientIds = null;
+        if (req.b2bUser.rol === 'familiar' || !b2bCanListAllPatients(req.b2bUser)) {
             const assignedR = await pool.query(
-                'SELECT paciente_id FROM asignaciones_b2b WHERE cuidador_id=$1 AND activa=TRUE',
-                [uid]
+                'SELECT paciente_id FROM asignaciones_b2b WHERE cuidador_id=$1 AND institucion_id=$2 AND activa=TRUE',
+                [uid, iid]
             );
             if (assignedR.rows.length === 0) return res.json({ unread: 0, items: [] });
-            assignedR.rows.forEach(r => familiarPatientIds.add(r.paciente_id));
+            scopedPatientIds = new Set(assignedR.rows.map(r => r.paciente_id));
         }
-        // Helpers de filtro: _fp filtra por paciente_id, _fpById filtra por id (cuando la row es el paciente)
-        const _fp    = (rows) => familiarPatientIds.size === 0 ? rows : rows.filter(r => familiarPatientIds.has(r.paciente_id));
-        const _fpById = (rows) => familiarPatientIds.size === 0 ? rows : rows.filter(r => familiarPatientIds.has(r.id));
-        const _fpStock = (rows) => familiarPatientIds.size === 0 ? rows : rows.filter(r => r.paciente_id !== null && familiarPatientIds.has(r.paciente_id));
+        // Helpers de filtro: _fp filtra por paciente_id, _fpById por id de residente.
+        const _fp = (rows) => scopedPatientIds === null ? rows : rows.filter(r => scopedPatientIds.has(r.paciente_id));
+        const _fpById = (rows) => scopedPatientIds === null ? rows : rows.filter(r => scopedPatientIds.has(r.id));
+        const _fpStock = (rows) => {
+            if (scopedPatientIds === null) return rows;
+            if (req.b2bUser.rol === 'familiar') return rows.filter(r => r.paciente_id !== null && scopedPatientIds.has(r.paciente_id));
+            return rows.filter(r => r.paciente_id === null || scopedPatientIds.has(r.paciente_id));
+        };
 
         const [citasR, notasR, sintomasR, stockR, cumpleR, ingresosR, egresosR] = await Promise.all([
             // Citas próximas (15 días) pendientes
@@ -4863,19 +5029,13 @@ app.get('/api/b2b/dashboard', authB2BMiddleware, async (req, res) => {
         // Determinar si el usuario tiene acceso restringido (solo sus pacientes asignados)
         let assignedIds = null; // null = acceso total a la institución
         if (req.b2bUser.rol === 'familiar') {
-            const r = await pool.query('SELECT paciente_id FROM asignaciones_b2b WHERE cuidador_id=$1 AND activa=TRUE', [uid]);
+            const r = await pool.query('SELECT paciente_id FROM asignaciones_b2b WHERE cuidador_id=$1 AND institucion_id=$2 AND activa=TRUE', [uid, iid]);
             assignedIds = r.rows.map(x => x.paciente_id);
             if (assignedIds.length === 0) return res.json({ resumen: { pacientes_activos: 0, tomas_hoy: 0, tareas_completadas_hoy: 0, staff: [] }, citas_proximas: [], sintomas_recientes: [], notas_urgentes: [], cumpleanos_hoy: [], stock_bajo: [] });
         } else if (req.b2bUser.rol === 'medico' || req.b2bUser.rol === 'cuidador_staff') {
-            const permKey = `${req.b2bUser.rol}_ver_todos_pacientes`;
-            let verTodos = true;
-            try {
-                const instRow = await pool.query('SELECT permisos_equipo FROM instituciones_b2b WHERE id=$1', [iid]);
-                const perms = instRow.rows[0]?.permisos_equipo || {};
-                if (permKey in perms) verTodos = !!perms[permKey];
-            } catch {}
+            const verTodos = b2bCanListAllPatients(req.b2bUser);
             if (!verTodos) {
-                const r = await pool.query('SELECT paciente_id FROM asignaciones_b2b WHERE cuidador_id=$1 AND activa=TRUE', [uid]);
+                const r = await pool.query('SELECT paciente_id FROM asignaciones_b2b WHERE cuidador_id=$1 AND institucion_id=$2 AND activa=TRUE', [uid, iid]);
                 assignedIds = r.rows.map(x => x.paciente_id);
                 if (assignedIds.length === 0) return res.json({ resumen: { pacientes_activos: 0, tomas_hoy: 0, tareas_completadas_hoy: 0, staff: [] }, citas_proximas: [], sintomas_recientes: [], notas_urgentes: [], cumpleanos_hoy: [], stock_bajo: [] });
             }
@@ -4887,26 +5047,36 @@ app.get('/api/b2b/dashboard', authB2BMiddleware, async (req, res) => {
         const pdf  = assignedIds ? ' AND paciente_id = ANY($2)' : ''; // historial sin join
         const bp   = assignedIds ? [iid, assignedIds] : [iid];
 
+        const familySections = req.b2bUser.rol === 'familiar' ? {
+            medicamentos: checkB2BFamiliarCanSee(req.b2bUser, 'medicamentos'),
+            citas: checkB2BFamiliarCanSee(req.b2bUser, 'citas'),
+            tareas: checkB2BFamiliarCanSee(req.b2bUser, 'tareas'),
+            sintomas: checkB2BFamiliarCanSee(req.b2bUser, 'sintomas'),
+            notas: checkB2BFamiliarCanSee(req.b2bUser, 'notas'),
+        } : { medicamentos: true, citas: true, tareas: true, sintomas: true, notas: true };
+        const emptyRows = () => Promise.resolve({ rows: [] });
+        const zeroCount = () => Promise.resolve({ rows: [{ total: '0' }] });
+
         const [pacientes, staff, citasProximas, sintomasRecientes, notasUrgentes, tomasHoy, tareasHoy, cumpleanosHoy, stockBajo] = await Promise.all([
             pool.query(`SELECT COUNT(*) as total FROM pacientes_b2b WHERE institucion_id=$1 AND activo=TRUE AND fecha_egreso IS NULL${pidf}`, bp),
             pool.query('SELECT COUNT(*) as total, rol FROM usuarios_b2b WHERE institucion_id=$1 AND activo=TRUE GROUP BY rol', [iid]),
-            pool.query(`SELECT c.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
+            familySections.citas ? pool.query(`SELECT c.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
                         FROM citas_b2b c JOIN pacientes_b2b p ON c.paciente_id=p.id
                         WHERE c.institucion_id=$1 AND c.fecha BETWEEN NOW() AND NOW()+INTERVAL '15 days' AND c.estado='pendiente'
                         AND p.fecha_egreso IS NULL${pf}
-                        ORDER BY c.fecha LIMIT 10`, bp),
-            pool.query(`SELECT s.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
+                        ORDER BY c.fecha LIMIT 10`, bp) : emptyRows(),
+            familySections.sintomas ? pool.query(`SELECT s.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
                         FROM sintomas_b2b s JOIN pacientes_b2b p ON s.paciente_id=p.id
                         WHERE s.institucion_id=$1 AND s.fecha > NOW()-INTERVAL '24 hours'
                         AND p.fecha_egreso IS NULL${pf}
-                        ORDER BY s.fecha DESC LIMIT 10`, bp),
-            pool.query(`SELECT n.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
+                        ORDER BY s.fecha DESC LIMIT 10`, bp) : emptyRows(),
+            familySections.notas ? pool.query(`SELECT n.*, p.nombre as paciente_nombre, p.apellido as paciente_apellido
                         FROM notas_b2b n JOIN pacientes_b2b p ON n.paciente_id=p.id
                         WHERE n.institucion_id=$1 AND n.urgente=TRUE
                         AND p.fecha_egreso IS NULL${pf}
-                        ORDER BY n.created_at DESC LIMIT 10`, bp),
-            pool.query(`SELECT COUNT(*) as total FROM historial_medicamentos_b2b WHERE institucion_id=$1 AND fecha>CURRENT_DATE${pdf}`, bp),
-            pool.query(`SELECT COUNT(*) as total FROM historial_tareas_b2b WHERE institucion_id=$1 AND fecha>CURRENT_DATE${pdf}`, bp),
+                        ORDER BY n.created_at DESC LIMIT 10`, bp) : emptyRows(),
+            familySections.medicamentos ? pool.query(`SELECT COUNT(*) as total FROM historial_medicamentos_b2b WHERE institucion_id=$1 AND fecha>CURRENT_DATE${pdf}`, bp) : zeroCount(),
+            familySections.tareas ? pool.query(`SELECT COUNT(*) as total FROM historial_tareas_b2b WHERE institucion_id=$1 AND fecha>CURRENT_DATE${pdf}`, bp) : zeroCount(),
             pool.query(`SELECT id, nombre, apellido, fecha_nacimiento,
                         EXTRACT(YEAR FROM AGE(fecha_nacimiento)) AS edad
                         FROM pacientes_b2b
@@ -4956,21 +5126,31 @@ app.get('/api/b2b/reportes', authB2BMiddleware, async (req, res) => {
     try {
         const { paciente_id, desde, hasta } = req.query;
         if (!paciente_id) return res.status(400).json({ error: 'paciente_id requerido' });
-        if (!(await checkB2BPacienteAccess(req.b2bUser, parseInt(paciente_id))))
+        if (!(await checkB2BPacienteAccess(req.b2bUser, paciente_id)))
             return res.status(403).json({ error: 'Sin acceso a este paciente' });
         const iid = req.b2bUser.institucion_id;
         const d = desde || new Date(Date.now() - 30*24*60*60*1000).toISOString();
         const h = hasta || new Date().toISOString();
+        const sections = req.b2bUser.rol === 'familiar' ? {
+            medicamentos: checkB2BFamiliarCanSee(req.b2bUser, 'medicamentos'),
+            citas: checkB2BFamiliarCanSee(req.b2bUser, 'citas'),
+            tareas: checkB2BFamiliarCanSee(req.b2bUser, 'tareas'),
+            sintomas: checkB2BFamiliarCanSee(req.b2bUser, 'sintomas'),
+            signos: checkB2BFamiliarCanSee(req.b2bUser, 'signos'),
+            contactos: checkB2BFamiliarCanSee(req.b2bUser, 'contactos'),
+            notas: checkB2BFamiliarCanSee(req.b2bUser, 'notas'),
+        } : { medicamentos: true, citas: true, tareas: true, sintomas: true, signos: true, contactos: true, notas: true };
+        const empty = () => Promise.resolve({ rows: [], rowCount: 0 });
         const [paciente, medicamentos, histMeds, citas, histTareas, sintomas, signos, contactos, notas] = await Promise.all([
             pool.query('SELECT * FROM pacientes_b2b WHERE id=$1 AND institucion_id=$2', [paciente_id, iid]),
-            pool.query('SELECT * FROM medicamentos_b2b WHERE paciente_id=$1 AND activo=TRUE', [paciente_id]),
-            pool.query('SELECT * FROM historial_medicamentos_b2b WHERE paciente_id=$1 AND fecha BETWEEN $2 AND $3 ORDER BY fecha DESC', [paciente_id, d, h]),
-            pool.query('SELECT * FROM citas_b2b WHERE paciente_id=$1 AND fecha BETWEEN $2 AND $3 ORDER BY fecha', [paciente_id, d, h]),
-            pool.query('SELECT * FROM historial_tareas_b2b WHERE paciente_id=$1 AND fecha BETWEEN $2 AND $3 ORDER BY fecha DESC', [paciente_id, d, h]),
-            pool.query('SELECT * FROM sintomas_b2b WHERE paciente_id=$1 AND fecha BETWEEN $2 AND $3 ORDER BY fecha DESC', [paciente_id, d, h]),
-            pool.query('SELECT * FROM signos_vitales_b2b WHERE paciente_id=$1 AND fecha BETWEEN $2 AND $3 ORDER BY fecha DESC', [paciente_id, d, h]),
-            pool.query('SELECT * FROM contactos_b2b WHERE paciente_id=$1 ORDER BY es_principal DESC', [paciente_id]),
-            pool.query('SELECT * FROM notas_b2b WHERE paciente_id=$1 AND created_at BETWEEN $2 AND $3 ORDER BY created_at DESC', [paciente_id, d, h])
+            sections.medicamentos ? pool.query('SELECT * FROM medicamentos_b2b WHERE paciente_id=$1 AND institucion_id=$2 AND activo=TRUE', [paciente_id, iid]) : empty(),
+            sections.medicamentos ? pool.query('SELECT * FROM historial_medicamentos_b2b WHERE paciente_id=$1 AND institucion_id=$2 AND fecha BETWEEN $3 AND $4 ORDER BY fecha DESC', [paciente_id, iid, d, h]) : empty(),
+            sections.citas ? pool.query('SELECT * FROM citas_b2b WHERE paciente_id=$1 AND institucion_id=$2 AND fecha BETWEEN $3 AND $4 ORDER BY fecha', [paciente_id, iid, d, h]) : empty(),
+            sections.tareas ? pool.query('SELECT * FROM historial_tareas_b2b WHERE paciente_id=$1 AND institucion_id=$2 AND fecha BETWEEN $3 AND $4 ORDER BY fecha DESC', [paciente_id, iid, d, h]) : empty(),
+            sections.sintomas ? pool.query('SELECT * FROM sintomas_b2b WHERE paciente_id=$1 AND institucion_id=$2 AND fecha BETWEEN $3 AND $4 ORDER BY fecha DESC', [paciente_id, iid, d, h]) : empty(),
+            sections.signos ? pool.query('SELECT * FROM signos_vitales_b2b WHERE paciente_id=$1 AND institucion_id=$2 AND fecha BETWEEN $3 AND $4 ORDER BY fecha DESC', [paciente_id, iid, d, h]) : empty(),
+            sections.contactos ? pool.query('SELECT * FROM contactos_b2b WHERE paciente_id=$1 AND institucion_id=$2 ORDER BY es_principal DESC', [paciente_id, iid]) : empty(),
+            sections.notas ? pool.query('SELECT * FROM notas_b2b WHERE paciente_id=$1 AND institucion_id=$2 AND created_at BETWEEN $3 AND $4 ORDER BY created_at DESC', [paciente_id, iid, d, h]) : empty()
         ]);
         if (paciente.rowCount === 0) return res.status(404).json({ error: 'Paciente no encontrado' });
         res.json({
@@ -5037,13 +5217,20 @@ app.get('/api/b2b/reporte/export', authB2BMiddleware, async (req, res) => {
 
 // ---------- B2B: DOCUMENTOS ADJUNTOS ----------
 
+// Incluso errores de autenticación/autorización de documentos deben quedar fuera de cachés HTTP.
+app.use('/api/b2b/documentos', (req, res, next) => {
+    setB2BSensitiveNoStore(res);
+    next();
+});
+
 // POST /api/b2b/documentos — subir documento (base64) para un paciente (máx 5 MB)
 app.post('/api/b2b/documentos', authB2BMiddleware, requireB2BRole('admin_institucion','cuidador_staff','medico'), requireActivePlan, async (req, res) => {
     try {
+        setB2BSensitiveNoStore(res);
         const { paciente_id, nombre_archivo, tipo_mime, datos } = req.body;
         if (!paciente_id || !nombre_archivo || !datos)
             return res.status(400).json({ error: 'paciente_id, nombre_archivo y datos son requeridos' });
-        const hasAccess = await checkB2BPacienteAccess(req.b2bUser, parseInt(paciente_id));
+        const hasAccess = await checkB2BPacienteAccess(req.b2bUser, paciente_id);
         if (!hasAccess) return res.status(403).json({ error: 'Sin acceso a este paciente' });
         // Base64 de 5 MB ≈ 6.8 MB de texto; con margen: 7 MB de chars
         if (datos.length > 7 * 1024 * 1024)
@@ -5078,11 +5265,12 @@ app.post('/api/b2b/documentos', authB2BMiddleware, requireB2BRole('admin_institu
 // GET /api/b2b/documentos?paciente_id=X — listar documentos (sin datos binarios para listado rápido)
 app.get('/api/b2b/documentos', authB2BMiddleware, async (req, res) => {
     try {
+        setB2BSensitiveNoStore(res);
         const { paciente_id } = req.query;
         if (!paciente_id) return res.status(400).json({ error: 'paciente_id requerido' });
         if (req.b2bUser.rol === 'familiar' && !(await checkB2BFamiliarCanSee(req.b2bUser, 'documentos')))
             return res.status(403).json({ error: 'Acceso restringido por la institución' });
-        const hasAccess = await checkB2BPacienteAccess(req.b2bUser, parseInt(paciente_id));
+        const hasAccess = await checkB2BPacienteAccess(req.b2bUser, paciente_id);
         if (!hasAccess) return res.status(403).json({ error: 'Sin acceso a este paciente' });
         const result = await pool.query(
             `SELECT id, nombre_archivo, tipo_mime, tamanio_bytes, subido_nombre, created_at
@@ -5099,12 +5287,12 @@ app.get('/api/b2b/documentos', authB2BMiddleware, async (req, res) => {
 // GET /api/b2b/documentos/:id/download — descargar documento completo con headers
 app.get('/api/b2b/documentos/:id/download', authB2BMiddleware, async (req, res) => {
     try {
-        const result = await pool.query(
-            'SELECT * FROM documentos_b2b WHERE id=$1 AND institucion_id=$2',
-            [req.params.id, req.b2bUser.institucion_id]
-        );
-        if (result.rowCount === 0) return res.status(404).json({ error: 'Documento no encontrado' });
-        const doc = result.rows[0];
+        setB2BSensitiveNoStore(res);
+        const access = await loadAndAuthorizeB2BPatientResource(req.b2bUser, 'documentos_b2b', req.params.id);
+        if (!access.found || !access.allowed) return denyB2BResource(res, access, 'Documento');
+        if (req.b2bUser.rol === 'familiar' && !checkB2BFamiliarCanSee(req.b2bUser, 'documentos'))
+            return res.status(404).json({ error: 'Documento no encontrado' });
+        const doc = access.row;
         const buf = Buffer.from(doc.datos, 'base64');
         res.setHeader('Content-Type', doc.tipo_mime || 'application/octet-stream');
         res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(doc.nombre_archivo)}`);
@@ -5119,10 +5307,16 @@ app.get('/api/b2b/documentos/:id/download', authB2BMiddleware, async (req, res) 
 // DELETE /api/b2b/documentos/:id — solo quien lo subió o el admin puede eliminarlo
 app.delete('/api/b2b/documentos/:id', authB2BMiddleware, async (req, res) => {
     try {
+        setB2BSensitiveNoStore(res);
+        const access = await loadAndAuthorizeB2BPatientResource(req.b2bUser, 'documentos_b2b', req.params.id);
+        if (!access.found || !access.allowed) return denyB2BResource(res, access, 'Documento');
+        if (req.b2bUser.rol === 'familiar' && !checkB2BFamiliarCanSee(req.b2bUser, 'documentos'))
+            return res.status(404).json({ error: 'Documento no encontrado' });
+        if (req.b2bUser.rol !== 'admin_institucion' && Number(access.row.subido_por) !== req.b2bUser.id)
+            return res.status(404).json({ error: 'Documento no encontrado' });
         const result = await pool.query(
-            `DELETE FROM documentos_b2b WHERE id=$1 AND institucion_id=$2
-             AND (subido_por=$3 OR $4='admin_institucion') RETURNING id`,
-            [req.params.id, req.b2bUser.institucion_id, req.b2bUser.id, req.b2bUser.rol]
+            'DELETE FROM documentos_b2b WHERE id=$1 AND institucion_id=$2 RETURNING id',
+            [req.params.id, req.b2bUser.institucion_id]
         );
         if (result.rowCount === 0) return res.status(404).json({ error: 'Documento no encontrado o sin permisos' });
         res.json({ success: true });
@@ -5294,38 +5488,54 @@ app.post('/api/admin/set-plan', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
-    console.log(`✅ Servidor escuchando en puerto ${PORT}`);
-    console.log(`📍 http://localhost:${PORT}`);
-    await runMigrations();
-    startPushReminders(); // ← Arranca el chequeo periódico de push
+function startServer(port = PORT) {
+    return app.listen(port, async () => {
+        console.log(`✅ Servidor escuchando en puerto ${port}`);
+        console.log(`📍 http://localhost:${port}`);
+        await runMigrations();
+        startPushReminders(); // ← Arranca el chequeo periódico de push
 
-    // Sincronización periódica con MercadoPago: detecta cancelaciones aunque el webhook falle
-    if (MP_ACCESS_TOKEN) {
-        setTimeout(syncMPSubscriptions, 30000); // primer sync 30s después del boot
-        setInterval(syncMPSubscriptions, 4 * 60 * 60 * 1000); // luego cada 4 horas
-        console.log('✅ Sync periódico de suscripciones MP activado (cada 4 horas)');
-    }
+        // Sincronización periódica con MercadoPago: detecta cancelaciones aunque el webhook falle
+        if (MP_ACCESS_TOKEN) {
+            setTimeout(syncMPSubscriptions, 30000); // primer sync 30s después del boot
+            setInterval(syncMPSubscriptions, 4 * 60 * 60 * 1000); // luego cada 4 horas
+            console.log('✅ Sync periódico de suscripciones MP activado (cada 4 horas)');
+        }
 
-    // Recordatorios de vencimiento de trial: chequea diariamente
-    setTimeout(checkTrialReminders, 2 * 60 * 1000); // primer chequeo 2min después del boot
-    setInterval(checkTrialReminders, 24 * 60 * 60 * 1000); // luego cada 24 horas
-    console.log('✅ Recordatorios de vencimiento de trial activados (cada 24 horas)');
+        // Recordatorios de vencimiento de trial: chequea diariamente
+        setTimeout(checkTrialReminders, 2 * 60 * 1000); // primer chequeo 2min después del boot
+        setInterval(checkTrialReminders, 24 * 60 * 60 * 1000); // luego cada 24 horas
+        console.log('✅ Recordatorios de vencimiento de trial activados (cada 24 horas)');
 
-    // Keep-alive: evita que Railway duerma el servidor en planes gratuitos.
-    // Se hace un GET a /health propio cada 4 minutos.
-    const BACKEND_URL = process.env.RAILWAY_STATIC_URL
-        ? `https://${process.env.RAILWAY_STATIC_URL}`
-        : (process.env.BACKEND_URL || null);
-    if (BACKEND_URL) {
-        setInterval(() => {
-            https.get(`${BACKEND_URL}/health`, (res) => {
-                // Solo para mantener vivo el proceso, no necesitamos la respuesta
-                res.resume();
-            }).on('error', () => { /* silencioso — el servidor sigue corriendo */ });
-        }, 4 * 60 * 1000); // cada 4 minutos
-        console.log(`🏓 Keep-alive activado → ${BACKEND_URL}/health`);
-    }
-});
+        // Keep-alive: evita que Railway duerma el servidor en planes gratuitos.
+        // Se hace un GET a /health propio cada 4 minutos.
+        const BACKEND_URL = process.env.RAILWAY_STATIC_URL
+            ? `https://${process.env.RAILWAY_STATIC_URL}`
+            : (process.env.BACKEND_URL || null);
+        if (BACKEND_URL) {
+            setInterval(() => {
+                https.get(`${BACKEND_URL}/health`, (res) => {
+                    // Solo para mantener vivo el proceso, no necesitamos la respuesta
+                    res.resume();
+                }).on('error', () => { /* silencioso — el servidor sigue corriendo */ });
+            }, 4 * 60 * 1000); // cada 4 minutos
+            console.log(`🏓 Keep-alive activado → ${BACKEND_URL}/health`);
+        }
+    });
+}
+
+if (require.main === module) startServer();
+
+module.exports = {
+    app,
+    pool,
+    startServer,
+    authB2BMiddleware,
+    checkB2BPacienteAccess,
+    checkB2BCanDo,
+    checkB2BFamiliarCanSee,
+    authorizeB2BPatientList,
+    loadAndAuthorizeB2BPatientResource,
+};
 
 // fin
