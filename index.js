@@ -212,6 +212,18 @@ app.use('/api/paypal/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
+// Estado técnico mínimo para el guard visual B2B. No consulta ni expone datos
+// ni requiere credenciales. B2B_MAINTENANCE_MODE controla sólo la capa visual;
+// B2B_P1_BRIDGE_MODE sigue siendo la barrera técnica de mutaciones.
+app.get('/api/b2b/maintenance-status', (req, res) => {
+    res.set({
+        'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+        'Pragma': 'no-cache',
+        'Expires': '0'
+    });
+    res.json({ maintenance: process.env.B2B_MAINTENANCE_MODE === '1' });
+});
+
 // ========== VAPID — Web Push (NUEVO) ==========
 const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY;
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
