@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const { P1C_MIGRATION } = require('./b2b-p1c');
 
 const SOFT_DELETE_TABLES = Object.freeze([
     'citas_b2b',
@@ -37,6 +38,7 @@ const AUDIT_FIELD_ALLOWLIST = Object.freeze({
         'stock_modelo', 'permisos_equipo', 'onboarding_done', 'shared_mode', 'trial_started_at',
         'discount_expires_at', 'plan_manual_expires_at', 'mp_preapproval_id'],
     usuario: [...COMMON_AUDIT_FIELDS, 'nombre', 'email', 'rol', 'email_verified', 'turno', 'notif_prefs', 'notif_last_seen_at'],
+    operador: ['id', 'institucion_id', 'nombre', 'rol', 'activo', 'credential_version', 'version', 'created_at', 'updated_at'],
     paciente: [...COMMON_AUDIT_FIELDS, 'nombre', 'apellido', 'fecha_nacimiento', 'dni', 'foto_url',
         'habitacion', 'obra_social', 'num_afiliado', 'contacto_familiar_nombre', 'contacto_familiar_tel',
         'diagnostico', 'alergias', 'medico_cabecera', 'antecedentes', 'notas_ingreso', 'fecha_ingreso',
@@ -158,6 +160,7 @@ ALTER TABLE ${table}
     ADD COLUMN IF NOT EXISTS deletion_reason TEXT NULL;
 `).join('\n'),
     },
+    P1C_MIGRATION,
 ]);
 
 function migrationChecksum(sql) {
@@ -319,18 +322,21 @@ async function appendB2BAudit(client, input) {
 
     const actor = input.actor || null;
     const actorType = input.actorType || (actor ? 'usuario' : 'sistema');
+    const actorUsuarioId = actor ? (actor.principal_usuario_id || actor.id) : null;
+    const operadorB2BId = actor?.operador_b2b_id || input.operatorB2BId || null;
     const inserted = await client.query(
         `INSERT INTO auditoria_eventos_b2b
-         (institucion_id, paciente_id, actor_usuario_id, actor_tipo, operador_usuario_id,
+         (institucion_id, paciente_id, actor_usuario_id, actor_tipo, operador_usuario_id, operador_b2b_id,
           recurso_tipo, recurso_id, accion, recurso_version, motivo, before_data, after_data,
           capture_mode, metadata, request_id)
-         VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
          RETURNING id`,
         [
             input.institutionId,
             input.patientId || null,
-            actor ? actor.id : null,
+            actorUsuarioId,
             actorType,
+            operadorB2BId,
             input.resourceType,
             input.resourceId || null,
             input.action,
@@ -384,14 +390,18 @@ function getIdempotencyKey(req) {
 async function beginIdempotentOperation(client, { req, actor, operation, patientId, resourceId }) {
     const key = getIdempotencyKey(req);
     if (!key) return { enabled: false };
+    const operatorId = actor.operador_b2b_id || null;
+    const storedKey = operatorId
+        ? crypto.createHash('sha256').update(`operator:${operatorId}:${key}`).digest('hex')
+        : key;
     const requestHash = hashIdempotencyRequest(operation, resourceId, req.body);
     const inserted = await client.query(
         `INSERT INTO operaciones_idempotentes_b2b
-         (institucion_id,paciente_id,actor_usuario_id,operacion,clave,request_hash,estado,expires_at)
-         VALUES ($1,$2,$3,$4,$5,$6,'processing',clock_timestamp()+INTERVAL '90 days')
+         (institucion_id,paciente_id,actor_usuario_id,operador_b2b_id,operacion,clave,request_hash,estado,expires_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'processing',clock_timestamp()+INTERVAL '90 days')
          ON CONFLICT (institucion_id,actor_usuario_id,operacion,clave) DO NOTHING
          RETURNING id`,
-        [actor.institucion_id, patientId || null, actor.id, operation, key, requestHash]
+        [actor.institucion_id, patientId || null, actor.principal_usuario_id || actor.id, operatorId, operation, storedKey, requestHash]
     );
     if (inserted.rowCount > 0) {
         return { enabled: true, id: inserted.rows[0].id, key, requestHash, replay: false };
@@ -401,7 +411,7 @@ async function beginIdempotentOperation(client, { req, actor, operation, patient
         `SELECT * FROM operaciones_idempotentes_b2b
          WHERE institucion_id=$1 AND actor_usuario_id=$2 AND operacion=$3 AND clave=$4
          FOR UPDATE`,
-        [actor.institucion_id, actor.id, operation, key]
+        [actor.institucion_id, actor.principal_usuario_id || actor.id, operation, storedKey]
     );
     const row = existing.rows[0];
     if (!row) throw new Error('No se pudo resolver la operación idempotente');
