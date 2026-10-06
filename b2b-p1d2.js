@@ -449,10 +449,12 @@ function setSensitiveDownloadHeaders(res) {
 
 async function revalidateAdministrativeContext(client, institutionId, principal, operator) {
     const institution = await client.query(
-        `SELECT id,nombre,tipo,direccion,telefono,email,plan,activa,created_at,stock_modelo,
+        `SELECT id,nombre,tipo,direccion,telefono,email,plan,activa,lifecycle_state,created_at,stock_modelo,
                 permisos_equipo,onboarding_done,trial_started_at,shared_mode,mp_preapproval_id,
-                discount_expires_at,plan_manual_expires_at,version
-         FROM instituciones_b2b WHERE id=$1 AND activa=TRUE`,
+                discount_expires_at,plan_manual_expires_at,offboarding_started_at,offboarding_reason,
+                offboarded_at,retention_review_at,retention_note,version
+         FROM instituciones_b2b
+         WHERE id=$1 AND activa=TRUE AND lifecycle_state IN ('active','offboarding_prepared')`,
         [institutionId]
     );
     if (institution.rowCount !== 1) throw exportError('P1D2_INSTITUTION_NOT_ACTIVE', 'Institución inválida o inactiva', 403);
@@ -608,7 +610,8 @@ async function createInstitutionalExport(options) {
             },
             exclusions: [
                 'password_hash', 'reset_token', 'email_verification_token', 'pin_hash',
-                'operador_sesiones_b2b', 'operaciones_idempotentes_b2b', '_migrations',
+                'operador_sesiones_b2b', 'operaciones_idempotentes_b2b',
+                'institucion_exportaciones_b2b', '_migrations',
                 'JWT/cookies/variables de entorno/secretos de proveedores/material criptográfico',
             ],
             schema_migrations_b2b: migrationRows,
@@ -658,7 +661,7 @@ async function cleanupExport(result) {
 }
 
 function registerInstitutionalExportRoutes(app, dependencies) {
-    const { pool, authB2BMiddleware, requireB2BRole, tempRoot, testMode = false } = dependencies;
+    const { pool, authB2BMiddleware, requireB2BRole, recordExportReceipt, tempRoot, testMode = false } = dependencies;
     app.use('/api/b2b/institutional-export', (req, res, next) => {
         setSensitiveDownloadHeaders(res);
         next();
@@ -675,10 +678,22 @@ function registerInstitutionalExportRoutes(app, dependencies) {
                 tempRoot,
                 failStage,
             });
+            if (typeof recordExportReceipt !== 'function') {
+                throw exportError('P1D3_EXPORT_RECEIPT_UNAVAILABLE', 'No se pudo registrar la evidencia de exportación', 500);
+            }
+            const receipt = await recordExportReceipt(pool, {
+                institutionId: req.b2bUser.institucion_id,
+                actorUserId: (req.b2bPrincipal || req.b2bUser).id,
+                schema: EXPORT_SCHEMA,
+                sha256: result.sha256,
+                bytes: result.bytes,
+            });
             res.status(200);
             res.setHeader('Content-Type', 'application/zip');
             res.setHeader('Content-Length', String(result.bytes));
             res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(result.fileName)}`);
+            res.setHeader('X-B2B-Export-Receipt', receipt);
+            res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, X-B2B-Export-Receipt');
             await pipeline(fs.createReadStream(result.zipPath), res);
         } catch (error) {
             const code = error && /^P1D2_[A-Z0-9_]+$/.test(error.code || '') ? error.code : 'P1D2_EXPORT_FAILED';

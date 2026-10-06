@@ -77,6 +77,11 @@ const {
     registerOperatorRoutes,
 } = require('./b2b-p1c');
 const { registerInstitutionalExportRoutes } = require('./b2b-p1d2');
+const {
+    isOperationalLifecycle,
+    recordInstitutionalExportReceipt,
+    registerOffboardingRoutes,
+} = require('./b2b-p1d3');
 // ─── Zona horaria Argentina para todas las conexiones del pool ───────────────
 // Esto asegura que NOW() devuelva la hora local de Argentina en vez de UTC.
 // Afecta INSERT DEFAULT NOW(), comparaciones, y serialización de TIMESTAMP.
@@ -2235,7 +2240,8 @@ app.post('/api/b2b/webhook/mercadopago', async (req, res) => {
                     if (preapproval.status === 'authorized') {
                         const plan = _mpPlanFromPreapproval(preapproval);
                         await pool.query(
-                            `UPDATE instituciones_b2b SET plan=$1, mp_preapproval_id=$3, plan_manual_expires_at=NOW() + INTERVAL '31 days' WHERE id=$2`,
+                            `UPDATE instituciones_b2b SET plan=$1, mp_preapproval_id=$3, plan_manual_expires_at=NOW() + INTERVAL '31 days'
+                             WHERE id=$2 AND activa=TRUE AND lifecycle_state IN ('active','offboarding_prepared')`,
                             [plan, instId, preapproval.id]
                         );
                         console.log(`[MP Webhook B2B] ✅ Institución ${instId} → plan: ${plan.toUpperCase()} (estado MP: "${preapproval.status}") — renovación en 31 días`)
@@ -2244,7 +2250,9 @@ app.post('/api/b2b/webhook/mercadopago', async (req, res) => {
                         // Si ya tiene el sentinel 'baja_programada' (baja diferida), el AND no hace match
                         // y el plan se mantiene activo hasta plan_manual_expires_at (comportamiento correcto).
                         const upd = await pool.query(
-                            `UPDATE instituciones_b2b SET plan='free' WHERE id=$1 AND mp_preapproval_id=$2 RETURNING id`,
+                            `UPDATE instituciones_b2b SET plan='free'
+                             WHERE id=$1 AND mp_preapproval_id=$2 AND activa=TRUE
+                               AND lifecycle_state IN ('active','offboarding_prepared') RETURNING id`,
                             [instId, preapproval.id]
                         );
                         if (upd.rowCount > 0) {
@@ -2809,8 +2817,10 @@ async function syncMPSubscriptions() {
     try {
         const b2bInsts = await pool.query(
             `SELECT id, mp_preapproval_id FROM instituciones_b2b
-             WHERE plan IN ('basico','pro','total')
-               AND mp_preapproval_id IS NOT NULL
+            WHERE plan IN ('basico','pro','total')
+              AND activa=TRUE
+              AND lifecycle_state IN ('active','offboarding_prepared')
+              AND mp_preapproval_id IS NOT NULL
                AND mp_preapproval_id != 'baja_programada'
                AND (plan_manual_expires_at IS NULL OR plan_manual_expires_at > NOW())`
         );
@@ -2849,6 +2859,7 @@ async function checkTrialReminders() {
         const warn15 = await pool.query(`
             SELECT id, nombre, email FROM instituciones_b2b
             WHERE plan = 'free' AND trial_started_at IS NOT NULL
+              AND activa=TRUE AND lifecycle_state IN ('active','offboarding_prepared')
               AND email IS NOT NULL AND email <> ''
               AND NOW() - trial_started_at BETWEEN INTERVAL '44 days 12 hours' AND INTERVAL '45 days 12 hours'
         `);
@@ -2874,6 +2885,7 @@ async function checkTrialReminders() {
         const warn5 = await pool.query(`
             SELECT id, nombre, email FROM instituciones_b2b
             WHERE plan = 'free' AND trial_started_at IS NOT NULL
+              AND activa=TRUE AND lifecycle_state IN ('active','offboarding_prepared')
               AND email IS NOT NULL AND email <> ''
               AND NOW() - trial_started_at BETWEEN INTERVAL '54 days 12 hours' AND INTERVAL '55 days 12 hours'
         `);
@@ -3124,7 +3136,7 @@ async function authB2BMiddleware(req, res, next) {
 
         const current = await pool.query(
             `SELECT u.id, u.institucion_id, u.nombre, u.email, u.rol, u.activo, u.email_verified,
-                    i.activa AS institucion_activa, i.permisos_equipo, i.shared_mode
+                    i.activa AS institucion_activa, i.lifecycle_state, i.permisos_equipo, i.shared_mode
              FROM usuarios_b2b u
              JOIN instituciones_b2b i ON i.id = u.institucion_id
              WHERE u.id=$1`,
@@ -3136,7 +3148,7 @@ async function authB2BMiddleware(req, res, next) {
         if (Number(user.institucion_id) !== tokenInstitutionId) {
             return res.status(401).json({ error: 'Sesión B2B no vigente' });
         }
-        if (!user.activo || !user.institucion_activa || !B2B_ROLES.has(user.rol)) {
+        if (!user.activo || !user.institucion_activa || !isOperationalLifecycle(user.lifecycle_state) || !B2B_ROLES.has(user.rol)) {
             return res.status(401).json({ error: 'Sesión B2B no vigente' });
         }
         if (!user.email_verified) {
@@ -3219,8 +3231,20 @@ registerInstitutionalExportRoutes(app, {
     pool,
     authB2BMiddleware,
     requireB2BRole,
+    recordExportReceipt: recordInstitutionalExportReceipt,
     tempRoot: process.env.P1_TEST_MODE === '1' ? process.env.P1D2_TEST_TEMP_ROOT : undefined,
     testMode: process.env.P1_TEST_MODE === '1',
+});
+
+registerOffboardingRoutes(app, {
+    pool,
+    bcrypt,
+    authB2BMiddleware,
+    withB2BTransaction,
+    appendB2BAudit,
+    beginIdempotentOperation,
+    completeIdempotentOperation,
+    sendP1Error,
 });
 
 function b2bCanListAllPatients(b2bUser) {
@@ -3565,7 +3589,9 @@ app.post('/api/b2b/auth/login', authRateLimit, async (req, res) => {
         if (!email || !password) return res.status(400).json({ error: 'Email y contraseña requeridos' });
 
         const result = await pool.query(
-            `SELECT u.*, i.nombre as institucion_nombre, i.plan, i.activa as institucion_activa, i.permisos_equipo, i.onboarding_done, i.stock_modelo, i.shared_mode, i.trial_started_at, i.discount_expires_at
+            `SELECT u.*, i.nombre as institucion_nombre, i.plan, i.activa as institucion_activa,
+                    i.lifecycle_state, i.permisos_equipo, i.onboarding_done, i.stock_modelo,
+                    i.shared_mode, i.trial_started_at, i.discount_expires_at
              FROM usuarios_b2b u JOIN instituciones_b2b i ON u.institucion_id = i.id
              WHERE u.email = $1`,
             [email.toLowerCase()]
@@ -3574,7 +3600,9 @@ app.post('/api/b2b/auth/login', authRateLimit, async (req, res) => {
 
         const user = result.rows[0];
         if (!user.activo) return res.status(401).json({ error: 'Usuario desactivado' });
-        if (!user.institucion_activa) return res.status(401).json({ error: 'Institución desactivada' });
+        if (!user.institucion_activa || !isOperationalLifecycle(user.lifecycle_state)) {
+            return res.status(401).json({ error: 'Institución desactivada' });
+        }
 
         const valid = await bcrypt.compare(password, user.password_hash);
         if (!valid) return res.status(401).json({ error: 'Credenciales inválidas' });
@@ -3696,7 +3724,12 @@ app.post('/api/b2b/auth/forgot-password', authRateLimit, async (req, res) => {
         const token = require('crypto').randomBytes(32).toString('hex');
         const expiry = new Date(Date.now() + 60 * 60 * 1000); // 1 hora
         const user=await withB2BTransaction(pool,async client=>{
-            const current=await client.query('SELECT * FROM usuarios_b2b WHERE email=$1 FOR UPDATE',[email.toLowerCase()]);
+            const current=await client.query(
+                `SELECT u.* FROM usuarios_b2b u JOIN instituciones_b2b i ON i.id=u.institucion_id
+                 WHERE u.email=$1 AND u.activo=TRUE AND i.activa=TRUE
+                   AND i.lifecycle_state IN ('active','offboarding_prepared') FOR UPDATE OF u`,
+                [email.toLowerCase()]
+            );
             if(current.rowCount===0) return current;
             const changed=await client.query('UPDATE usuarios_b2b SET reset_token=$1,reset_token_expiry=$2,version=version+1 WHERE id=$3 RETURNING *',[token,expiry,current.rows[0].id]);
             await appendB2BAudit(client,{institutionId:current.rows[0].institucion_id,actorType:'sistema',resourceType:'seguridad',resourceId:current.rows[0].id,
@@ -3726,7 +3759,12 @@ app.post('/api/b2b/auth/reset-password', async (req, res) => {
         const { token, password } = req.body;
         const hash = await bcrypt.hash(password, SALT_ROUNDS);
         await withB2BTransaction(pool,async client=>{
-            const user=await client.query('SELECT * FROM usuarios_b2b WHERE reset_token=$1 AND reset_token_expiry>NOW() FOR UPDATE',[token]);
+            const user=await client.query(
+                `SELECT u.* FROM usuarios_b2b u JOIN instituciones_b2b i ON i.id=u.institucion_id
+                 WHERE u.reset_token=$1 AND u.reset_token_expiry>NOW() AND u.activo=TRUE
+                   AND i.activa=TRUE AND i.lifecycle_state IN ('active','offboarding_prepared')
+                 FOR UPDATE OF u`, [token]
+            );
             if(user.rowCount===0) throw Object.assign(new Error('Token inválido o expirado'),{status:400,code:'INVALID_RESET_TOKEN'});
             const changed=await client.query('UPDATE usuarios_b2b SET password_hash=$1,reset_token=NULL,reset_token_expiry=NULL,version=version+1 WHERE id=$2 RETURNING *',[hash,user.rows[0].id]);
             await appendB2BAudit(client,{institutionId:user.rows[0].institucion_id,actorType:'sistema',resourceType:'seguridad',resourceId:user.rows[0].id,
@@ -3746,7 +3784,13 @@ app.get('/api/b2b/auth/verify-email', async (req, res) => {
         if (!token) return res.status(400).json({ error: 'Token de verificación requerido' });
 
         const result=await withB2BTransaction(pool,async client=>{
-            const current=await client.query('SELECT * FROM usuarios_b2b WHERE email_verification_token=$1 AND email_verification_expiry>NOW() FOR UPDATE',[token]);
+            const current=await client.query(
+                `SELECT u.* FROM usuarios_b2b u JOIN instituciones_b2b i ON i.id=u.institucion_id
+                 WHERE u.email_verification_token=$1 AND u.email_verification_expiry>NOW()
+                   AND u.activo=TRUE AND i.activa=TRUE
+                   AND i.lifecycle_state IN ('active','offboarding_prepared') FOR UPDATE OF u`,
+                [token]
+            );
             if(current.rowCount===0) throw Object.assign(new Error('El link de verificación es inválido o ya expiró. Solícita uno nuevo desde la aplicación.'),{status:400,code:'INVALID_VERIFICATION_TOKEN'});
             const changed=await client.query('UPDATE usuarios_b2b SET email_verified=TRUE,email_verification_token=NULL,email_verification_expiry=NULL,version=version+1 WHERE id=$1 RETURNING *',[current.rows[0].id]);
             await appendB2BAudit(client,{institutionId:current.rows[0].institucion_id,actorType:'sistema',resourceType:'seguridad',resourceId:current.rows[0].id,
@@ -3768,7 +3812,8 @@ app.get('/api/b2b/auth/verify-email', async (req, res) => {
                         i.shared_mode, i.trial_started_at, i.discount_expires_at
                  FROM usuarios_b2b u
                  JOIN instituciones_b2b i ON i.id = u.institucion_id
-                 WHERE u.id = $1`,
+                 WHERE u.id = $1 AND u.activo=TRUE AND i.activa=TRUE
+                   AND i.lifecycle_state IN ('active','offboarding_prepared')`,
                 [result.rows[0].id]
             );
             if (userRow.rowCount > 0) {
@@ -5924,6 +5969,11 @@ async function updateB2BPlanAsSuperadmin(institutionId, updateSql, updateParams,
     return withB2BTransaction(pool, async client => {
         const currentResult = await client.query('SELECT * FROM instituciones_b2b WHERE id=$1 FOR UPDATE', [institutionId]);
         if (currentResult.rowCount === 0) return null;
+        if (!isOperationalLifecycle(currentResult.rows[0].lifecycle_state) || !currentResult.rows[0].activa) {
+            throw Object.assign(new Error('La institución está dada de baja y en retención'), {
+                status: 409, code: 'INSTITUTION_RETAINED',
+            });
+        }
         const changedResult = await client.query(updateSql, updateParams);
         const changed = changedResult.rows[0];
         await appendB2BAudit(client, {
@@ -6042,7 +6092,7 @@ app.post('/api/admin/set-plan', b2bP1BridgeMiddleware, async (req, res) => {
         });
     } catch (err) {
         console.error('[SuperAdmin] set-plan error:', err.message);
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message, ...(err.code ? { code: err.code } : {}) });
     }
 });
 

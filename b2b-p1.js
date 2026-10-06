@@ -2,6 +2,7 @@
 
 const crypto = require('crypto');
 const { P1C_MIGRATION } = require('./b2b-p1c');
+const { P1D3_MIGRATION } = require('./b2b-p1d3');
 
 const SOFT_DELETE_TABLES = Object.freeze([
     'citas_b2b',
@@ -36,7 +37,10 @@ const COMMON_AUDIT_FIELDS = [
 const AUDIT_FIELD_ALLOWLIST = Object.freeze({
     institucion: [...COMMON_AUDIT_FIELDS, 'nombre', 'tipo', 'direccion', 'telefono', 'email', 'plan',
         'stock_modelo', 'permisos_equipo', 'onboarding_done', 'shared_mode', 'trial_started_at',
-        'discount_expires_at', 'plan_manual_expires_at', 'mp_preapproval_id'],
+        'discount_expires_at', 'plan_manual_expires_at', 'mp_preapproval_id', 'lifecycle_state',
+        'offboarding_started_at', 'offboarding_started_by', 'offboarding_reason',
+        'final_export_receipt_id', 'offboarded_at', 'offboarded_by',
+        'retention_review_at', 'retention_note'],
     usuario: [...COMMON_AUDIT_FIELDS, 'nombre', 'email', 'rol', 'email_verified', 'turno', 'notif_prefs', 'notif_last_seen_at'],
     operador: ['id', 'institucion_id', 'nombre', 'rol', 'activo', 'credential_version', 'version', 'created_at', 'updated_at'],
     paciente: [...COMMON_AUDIT_FIELDS, 'nombre', 'apellido', 'fecha_nacimiento', 'dni', 'foto_url',
@@ -161,6 +165,7 @@ ALTER TABLE ${table}
 `).join('\n'),
     },
     P1C_MIGRATION,
+    P1D3_MIGRATION,
 ]);
 
 function migrationChecksum(sql) {
