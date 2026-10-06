@@ -76,6 +76,7 @@ const {
     hasOperatorTokenFromRequest,
     registerOperatorRoutes,
 } = require('./b2b-p1c');
+const { registerInstitutionalExportRoutes } = require('./b2b-p1d2');
 // ─── Zona horaria Argentina para todas las conexiones del pool ───────────────
 // Esto asegura que NOW() devuelva la hora local de Argentina en vez de UTC.
 // Afecta INSERT DEFAULT NOW(), comparaciones, y serialización de TIMESTAMP.
@@ -3212,6 +3213,14 @@ registerOperatorRoutes(app, {
     appendB2BAudit,
     withB2BTransaction,
     sendP1Error,
+});
+
+registerInstitutionalExportRoutes(app, {
+    pool,
+    authB2BMiddleware,
+    requireB2BRole,
+    tempRoot: process.env.P1_TEST_MODE === '1' ? process.env.P1D2_TEST_TEMP_ROOT : undefined,
+    testMode: process.env.P1_TEST_MODE === '1',
 });
 
 function b2bCanListAllPatients(b2bUser) {
