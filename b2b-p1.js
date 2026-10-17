@@ -3,6 +3,10 @@
 const crypto = require('crypto');
 const { P1C_MIGRATION } = require('./b2b-p1c');
 const { P1D3_MIGRATION } = require('./b2b-p1d3');
+const { LA1_MIGRATION } = require('./b2b-la1');
+const { LA2_MIGRATION } = require('./b2b-la2');
+const { LA3_MIGRATION } = require('./b2b-la3');
+const { LA4_MIGRATION } = require('./b2b-la4');
 
 const SOFT_DELETE_TABLES = Object.freeze([
     'citas_b2b',
@@ -42,16 +46,20 @@ const AUDIT_FIELD_ALLOWLIST = Object.freeze({
         'final_export_receipt_id', 'offboarded_at', 'offboarded_by',
         'retention_review_at', 'retention_note'],
     usuario: [...COMMON_AUDIT_FIELDS, 'nombre', 'email', 'rol', 'email_verified', 'turno', 'notif_prefs', 'notif_last_seen_at'],
-    operador: ['id', 'institucion_id', 'nombre', 'rol', 'activo', 'credential_version', 'version', 'created_at', 'updated_at'],
+    operador: ['id', 'institucion_id', 'usuario_b2b_id', 'nombre', 'rol', 'activo', 'credential_version', 'version', 'created_at', 'updated_at'],
     paciente: [...COMMON_AUDIT_FIELDS, 'nombre', 'apellido', 'fecha_nacimiento', 'dni', 'foto_url',
         'habitacion', 'obra_social', 'num_afiliado', 'contacto_familiar_nombre', 'contacto_familiar_tel',
         'diagnostico', 'alergias', 'medico_cabecera', 'antecedentes', 'notas_ingreso', 'fecha_ingreso',
-        'fecha_egreso', 'motivo_egreso'],
+        'fecha_egreso', 'motivo_egreso', 'dieta_restricciones', 'movilidad', 'nivel_dependencia',
+        'riesgo_caida', 'continencia', 'aspectos_cognitivos'],
     asignacion: [...COMMON_AUDIT_FIELDS, 'cuidador_id'],
     medicamento: [...COMMON_AUDIT_FIELDS, 'catalogo_id', 'nombre', 'dosis', 'frecuencia', 'hora_inicio',
-        'hora_fin', 'horarios_custom', 'instrucciones', 'stock'],
+        'hora_fin', 'horarios_custom', 'instrucciones', 'stock', 'via', 'indicacion', 'prescriptor',
+        'vigente_desde', 'vigente_hasta', 'horarios_programados', 'esquema_version'],
     administracion_medicamento: ['id', 'institucion_id', 'paciente_id', 'medicamento_id',
-        'medicamento_nombre', 'dosis', 'administrado_por', 'administrador_nombre', 'notas', 'cantidad', 'fecha'],
+        'medicamento_nombre', 'dosis', 'administrado_por', 'administrador_nombre', 'notas', 'cantidad', 'fecha',
+        'resultado', 'motivo_omision', 'programada_para', 'via', 'esquema_version', 'operador_b2b_id'],
+    evolucion: [...COMMON_AUDIT_FIELDS, 'tipo', 'ocurrido_at', 'titulo', 'contenido', 'creado_por', 'operador_b2b_id'],
     catalogo: [...COMMON_AUDIT_FIELDS, 'nombre', 'principio_activo', 'presentacion', 'unidad', 'categoria',
         'stock_actual', 'stock_minimo'],
     restock: ['id', 'institucion_id', 'paciente_id', 'catalogo_id', 'nombre_item', 'stock_anterior',
@@ -64,10 +72,18 @@ const AUDIT_FIELD_ALLOWLIST = Object.freeze({
     sintoma: [...COMMON_AUDIT_FIELDS, 'descripcion', 'intensidad', 'registrado_por', 'registrador_nombre', 'fecha'],
     signo_vital: [...COMMON_AUDIT_FIELDS, 'tipo', 'valor', 'unidad', 'notas', 'registrado_por',
         'registrador_nombre', 'fecha'],
-    contacto: [...COMMON_AUDIT_FIELDS, 'nombre', 'relacion', 'telefono', 'email', 'es_principal'],
+    contacto: [...COMMON_AUDIT_FIELDS, 'nombre', 'relacion', 'telefono', 'email', 'es_principal',
+        'prioridad', 'observaciones', 'alcance_autorizacion'],
     nota: [...COMMON_AUDIT_FIELDS, 'titulo', 'contenido', 'urgente', 'autor_id', 'autor_nombre'],
     documento: [...COMMON_AUDIT_FIELDS, 'nombre_archivo', 'tipo_mime', 'tamanio_bytes', 'subido_por',
-        'subido_nombre'],
+        'subido_nombre', 'categoria', 'fecha_documento', 'descripcion'],
+    alerta_residente: [...COMMON_AUDIT_FIELDS, 'tipo', 'etiqueta', 'severidad', 'vigente_desde',
+        'vigente_hasta', 'creado_por', 'operador_b2b_id'],
+    incidente: [...COMMON_AUDIT_FIELDS, 'categoria', 'severidad', 'ocurrido_at', 'descripcion',
+        'accion_tomada', 'estado', 'notificacion_realizada', 'contacto_notificado_id',
+        'notificacion_detalle', 'notificada_at', 'creado_por', 'operador_b2b_id'],
+    estado_residente: [...COMMON_AUDIT_FIELDS, 'tipo', 'iniciado_at', 'finalizado_at', 'motivo',
+        'iniciado_por', 'iniciado_operador_b2b_id', 'finalizado_por', 'finalizado_operador_b2b_id'],
     seguridad: ['id', 'institucion_id', 'email_verified', 'activo', 'rol', 'version'],
     plan: ['id', 'institucion_id', 'plan', 'plan_manual_expires_at', 'trial_started_at', 'mp_preapproval_id',
         'discount_expires_at', 'version'],
@@ -166,6 +182,10 @@ ALTER TABLE ${table}
     },
     P1C_MIGRATION,
     P1D3_MIGRATION,
+    LA1_MIGRATION,
+    LA2_MIGRATION,
+    LA3_MIGRATION,
+    LA4_MIGRATION,
 ]);
 
 function migrationChecksum(sql) {

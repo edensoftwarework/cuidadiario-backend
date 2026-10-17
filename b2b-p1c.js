@@ -195,6 +195,7 @@ function publicOperator(row, includeAdministrative = false) {
         result.pin_configured = !!row.pin_hash;
         result.created_at = row.created_at;
         result.updated_at = row.updated_at;
+        result.usuario_b2b_id = row.usuario_b2b_id == null ? null : Number(row.usuario_b2b_id);
     }
     return result;
 }
@@ -216,7 +217,7 @@ function registerOperatorRoutes(app, dependencies) {
             const administrative = req.query.all === '1';
             if (administrative && principal.rol !== 'admin_institucion') return requirePrincipalAdmin(req, res, () => {});
             const result = await pool.query(
-                `SELECT id,nombre,rol,activo,credential_version,pin_hash,created_at,updated_at,version
+                `SELECT id,usuario_b2b_id,nombre,rol,activo,credential_version,pin_hash,created_at,updated_at,version
                  FROM operadores_b2b WHERE institucion_id=$1 ${administrative ? '' : 'AND activo=TRUE'}
                  ORDER BY activo DESC,nombre,id`,
                 [principal.institucion_id]
@@ -231,28 +232,51 @@ function registerOperatorRoutes(app, dependencies) {
     app.post('/api/b2b/operators', authB2BMiddleware, requirePrincipalAdmin, async (req, res) => {
         try {
             const principal = req.b2bPrincipal || req.b2bUser;
-            const nombre = normalizeOperatorName(req.body?.nombre);
-            const rol = validateOperatorRole(req.body?.rol);
             const pin = validatePin(req.body?.pin);
-            if (nombre.length < 2 || nombre.length > 120) throw operatorHttpError(400, 'INVALID_OPERATOR_NAME', 'El nombre debe tener entre 2 y 120 caracteres');
-            if (!rol) throw operatorHttpError(400, 'INVALID_OPERATOR_ROLE', 'Rol de operador inválido');
             const pinHash = await bcrypt.hash(pin, saltRounds);
             const created = await withB2BTransaction(pool, async client => {
+                const requestedStaffId = req.body?.usuario_b2b_id == null ? null : Number(req.body.usuario_b2b_id);
+                let nombre;
+                let rol;
+                if (requestedStaffId !== null) {
+                    if (!Number.isSafeInteger(requestedStaffId) || requestedStaffId <= 0) {
+                        throw operatorHttpError(400, 'INVALID_STAFF_ID', 'Miembro del staff inválido');
+                    }
+                    const staffResult = await client.query(
+                        `SELECT id,nombre,rol,activo FROM usuarios_b2b
+                         WHERE id=$1 AND institucion_id=$2 FOR UPDATE`,
+                        [requestedStaffId, principal.institucion_id]
+                    );
+                    if (staffResult.rowCount === 0 || !staffResult.rows[0].activo) {
+                        throw operatorHttpError(404, 'STAFF_NOT_AVAILABLE', 'El miembro del staff no está disponible');
+                    }
+                    const staff = staffResult.rows[0];
+                    if (!OPERATOR_ROLES.includes(staff.rol)) {
+                        throw operatorHttpError(400, 'STAFF_ROLE_NOT_COMPATIBLE', 'Este rol de Staff no puede operar una estación compartida');
+                    }
+                    nombre = normalizeOperatorName(staff.nombre);
+                    rol = staff.rol;
+                } else {
+                    nombre = normalizeOperatorName(req.body?.nombre);
+                    rol = validateOperatorRole(req.body?.rol);
+                    if (nombre.length < 2 || nombre.length > 120) throw operatorHttpError(400, 'INVALID_OPERATOR_NAME', 'El nombre debe tener entre 2 y 120 caracteres');
+                    if (!rol) throw operatorHttpError(400, 'INVALID_OPERATOR_ROLE', 'Rol de operador inválido');
+                }
                 const inserted = await client.query(
-                    `INSERT INTO operadores_b2b (institucion_id,nombre,rol,pin_hash,created_by_usuario_id)
-                     VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-                    [principal.institucion_id, nombre, rol, pinHash, principal.id]
+                    `INSERT INTO operadores_b2b (institucion_id,usuario_b2b_id,nombre,rol,pin_hash,created_by_usuario_id)
+                     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+                    [principal.institucion_id, requestedStaffId, nombre, rol, pinHash, principal.id]
                 );
                 await appendB2BAudit(client, {
                     institutionId: principal.institucion_id, actor: principal, resourceType: 'operador',
                     resourceId: inserted.rows[0].id, action: 'CREATE', version: inserted.rows[0].version,
-                    after: inserted.rows[0], metadata: { channel: 'operator_create' },
+                    after: inserted.rows[0], metadata: { channel: requestedStaffId ? 'operator_enable_from_staff' : 'operator_create' },
                 });
                 return inserted.rows[0];
             });
             res.status(201).json(publicOperator(created, true));
         } catch (error) {
-            if (error?.code === '23505') return res.status(409).json({ error: 'Ya existe un operador con ese nombre', code: 'OPERATOR_NAME_CONFLICT' });
+            if (error?.code === '23505') return res.status(409).json({ error: 'Este miembro del Staff ya está habilitado o existe un operador con ese nombre', code: 'OPERATOR_CONFLICT' });
             sendP1Error(res, error, 'Error al crear operador');
         }
     });

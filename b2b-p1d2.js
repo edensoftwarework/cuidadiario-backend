@@ -577,6 +577,8 @@ async function createInstitutionalExport(options) {
         await add('audit/eventos.csv', csvBuffer(auditRows,
             ['id','paciente_id','actor_usuario_id','operador_b2b_id','actor_tipo','recurso_tipo','recurso_id','accion','recurso_version','ocurrido_at','motivo','capture_mode','request_id']), 'auditoria_eventos');
 
+        const counts = Object.fromEntries(DATASETS.map(definition => [definition.key, data[definition.key].length]));
+        counts.auditoria_eventos = auditRows.length;
         const readme = [
             'CuidaDiario PRO — Exportación institucional',
             '',
@@ -585,7 +587,14 @@ async function createInstitutionalExport(options) {
             `Institución ID: ${institutionId}`,
             '',
             'Los archivos JSON/JSONL UTF-8 son la representación canónica. Los CSV son vistas de conveniencia.',
+            'Para una lectura rápida, abra primero este README y luego la carpeta views, que contiene listados CSV de residentes, personal, documentos y auditoría.',
+            'La carpeta data conserva las demás familias operativas en JSONL: cada línea es un registro independiente.',
             'Los documentos originales están bajo documents/<id>/ y su nombre original permanece en documents/index.jsonl.',
+            '',
+            'Resumen de registros incluidos:',
+            ...Object.entries(counts).map(([family, count]) => `- ${family}: ${count}`),
+            `- documentos originales: ${documentIndex.length}`,
+            '',
             'Verifique manifest.sha256, manifest.json y checksums.sha256 antes de usar el paquete.',
             'Este paquete excluye credenciales, sesiones, idempotencia y secretos técnicos.',
             'La auditoría es prospectiva: no se fabricó historia anterior a P1-A.',
@@ -595,8 +604,6 @@ async function createInstitutionalExport(options) {
 
         const checksumText = inventory.map(file => `${file.sha256}  ${file.path}`).join('\n') + '\n';
         const checksumInfo = await add('checksums.sha256', Buffer.from(checksumText, 'utf8'), 'integridad');
-        const counts = Object.fromEntries(DATASETS.map(definition => [definition.key, data[definition.key].length]));
-        counts.auditoria_eventos = auditRows.length;
         const manifest = {
             schema: EXPORT_SCHEMA,
             exporter_version: EXPORTER_VERSION,
