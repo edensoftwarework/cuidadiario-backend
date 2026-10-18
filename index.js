@@ -161,8 +161,10 @@ function utcIsoToArgentinaNaive(isoStr) {
             hour: '2-digit', minute: '2-digit', second: '2-digit',
             hour12: false,
         }).format(d);
-        // 'sv-SE' produce "YYYY-MM-DD HH:MM:SS" — parseable como naive local
-        return new Date(ar);
+        // 'sv-SE' produce "YYYY-MM-DD HH:MM:SS". Devolver el texto, no un Date:
+        // la columna destino es TIMESTAMP sin zona y un Date volvería a aplicar la
+        // zona del runtime (UTC en producción), desplazando los registros offline.
+        return ar;
     } catch { return null; }
 }
 

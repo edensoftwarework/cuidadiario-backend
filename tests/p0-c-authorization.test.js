@@ -665,8 +665,12 @@ async function main() {
     }
 }
 
-main().catch(error => {
-    console.error('P0-C AUTHORIZATION TEST: FAIL');
-    console.error(error.stack || error.message);
-    process.exitCode = 1;
-});
+if (require.main === module) {
+    main().catch(error => {
+        console.error('P0-C AUTHORIZATION TEST: FAIL');
+        console.error(error.stack || error.message);
+        process.exitCode = 1;
+    });
+}
+
+module.exports = { schemaSql, fixtureSql };

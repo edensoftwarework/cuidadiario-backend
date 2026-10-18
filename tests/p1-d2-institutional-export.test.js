@@ -17,6 +17,11 @@ const INITDB = path.join(PG_BIN, 'initdb.exe');
 const PG_CTL = path.join(PG_BIN, 'pg_ctl.exe');
 const TEST_SECRET = 'p1-local-d2-synthetic-secret-never-production';
 const TEST_DB = `cuidadiario_p1_test_d2_${process.pid}`;
+const controlledFrontendRoot = path.join(__dirname, '..', '..', 'frontend');
+const repositoryFrontendRoot = path.join(__dirname, '..', '..', 'cuidadiario-pro');
+const frontendRoot = fs.existsSync(path.join(controlledFrontendRoot, 'js', 'api-b2b.js'))
+    ? controlledFrontendRoot
+    : repositoryFrontendRoot;
 let assertions = 0;
 
 function check(value, message) { assertions += 1; assert.ok(value, message); }
@@ -251,7 +256,8 @@ async function main() {
         equal(Number(manifest.institution.id), 1, 'manifest identifica tenant A');
         equal(manifest.consistency.transaction_isolation, 'repeatable read', 'aislamiento repeatable read');
         equal(manifest.consistency.transaction_read_only, 'on', 'transacción read-only');
-        equal(manifest.schema_migrations_b2b.length, 4, 'cuatro migraciones P1/P1-C');
+        equal(manifest.schema_migrations_b2b.length, 9, 'nueve migraciones estructurales P1/P1-C/P1-D3/LA1-4');
+        equal(new Set(manifest.schema_migrations_b2b.map(row => row.version)).size, 9, 'manifest no duplica migraciones');
         check(manifest.counts.pacientes >= 3 && manifest.counts.documentos >= 4, 'conteos completos del tenant');
         equal(manifest.counts.auditoria_eventos, 1, 'conteo ledger tenant A');
         check(manifest.warnings.some(item => item.code === 'DECLARED_SIZE_MISMATCH'), 'manifest explicita tamaños documentales heredados divergentes');
@@ -268,6 +274,10 @@ async function main() {
 
         const patientsA = jsonLines(entriesA.get('data/pacientes.jsonl'));
         check(patientsA.some(row => row.fecha_egreso && row.motivo_egreso === 'Egreso sintético'), 'residentes egresados incluidos');
+        const medicationHistoryA = jsonLines(entriesA.get('data/historial_medicamentos.jsonl'));
+        check(medicationHistoryA.length > 0, 'historial de administraciones incluido');
+        check(medicationHistoryA.every(row => row.fecha == null || /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(row.fecha)),
+            'horas civiles de administraciones exportadas sin sufijo UTC enga\u00f1oso');
         const appointmentsA = jsonLines(entriesA.get('data/citas.jsonl'));
         check(appointmentsA.some(row => row.deleted_at && row.deletion_reason === 'Archivo sintético'), 'citas soft-deleted incluidas');
         const documentsA = jsonLines(entriesA.get('documents/index.jsonl'));
@@ -340,10 +350,10 @@ async function main() {
         check(await waitForEmpty(exportTempRoot), 'fallo HTTP limpia temporales');
 
         progress('Validando UI controlada y regresión B2C sintética');
-        const apiSource = fs.readFileSync(path.join(__dirname, '..', '..', 'frontend', 'js', 'api-b2b.js'), 'utf8');
-        const configSource = fs.readFileSync(path.join(__dirname, '..', '..', 'frontend', 'js', 'configuracion.js'), 'utf8');
-        const configHtml = fs.readFileSync(path.join(__dirname, '..', '..', 'frontend', 'pages', 'configuracion.html'), 'utf8');
-        check(/async download\(path\)/.test(apiSource) && /cache:\s*'no-store'/.test(apiSource), 'cliente descarga sin caché');
+        const apiSource = fs.readFileSync(path.join(frontendRoot, 'js', 'api-b2b.js'), 'utf8');
+        const configSource = fs.readFileSync(path.join(frontendRoot, 'js', 'configuracion.js'), 'utf8');
+        const configHtml = fs.readFileSync(path.join(frontendRoot, 'pages', 'configuracion.html'), 'utf8');
+        check(/async download\(path,\s*options\s*=\s*\{\}\)/.test(apiSource) && /cache:\s*'no-store'/.test(apiSource), 'cliente descarga sin caché y admite validación por formato');
         check(/descargarExportInstitucional/.test(configSource) && /institutional-export/.test(configSource), 'acción UI D2 conectada');
         check(/Exportación institucional completa/.test(configHtml) && /Reporte imprimible/.test(configHtml), 'UI distingue ZIP de reporte parcial');
         equal(Number((await db.query('SELECT COUNT(*) FROM usuarios')).rows[0].count), 1, 'tabla B2C sintética preservada');

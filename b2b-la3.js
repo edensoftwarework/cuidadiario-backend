@@ -40,7 +40,8 @@ async function buildOperationalAttention(pool, { institutionId, assignedIds = nu
             WHERE i.institucion_id=$1 AND i.deleted_at IS NULL AND i.estado IN ('abierto','en_seguimiento')
               AND p.activo=TRUE AND p.fecha_egreso IS NULL${patientScope}
             ORDER BY i.ocurrido_at ASC LIMIT 50`, params),
-        pool.query(`SELECT h.id,h.paciente_id,p.nombre,p.apellido,h.medicamento_nombre,h.fecha,h.motivo_omision
+        pool.query(`SELECT h.id,h.paciente_id,p.nombre,p.apellido,h.medicamento_nombre,
+                   h.fecha AT TIME ZONE $${assignedIds ? 3 : 2} AS fecha,h.motivo_omision
             FROM historial_medicamentos_b2b h JOIN pacientes_b2b p ON p.id=h.paciente_id AND p.institucion_id=h.institucion_id
             WHERE h.institucion_id=$1 AND h.resultado='omitida'
               AND h.fecha >= ((now() AT TIME ZONE $${assignedIds ? 3 : 2})::date AT TIME ZONE $${assignedIds ? 3 : 2})${patientScope}

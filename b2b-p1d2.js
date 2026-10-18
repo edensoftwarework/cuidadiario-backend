@@ -15,7 +15,8 @@ const DATASETS = Object.freeze([
     {
         key: 'usuarios', file: 'data/usuarios.jsonl', table: 'usuarios_b2b',
         sql: `SELECT id,institucion_id,nombre,email,rol,turno,activo,email_verified,notif_prefs,
-                     notif_last_seen_at,created_at,version
+                     to_char(notif_last_seen_at,'YYYY-MM-DD"T"HH24:MI:SS.US') AS notif_last_seen_at,
+                     to_char(created_at,'YYYY-MM-DD"T"HH24:MI:SS.US') AS created_at,version
               FROM usuarios_b2b WHERE institucion_id=$1 ORDER BY id`,
     },
     {
@@ -23,90 +24,107 @@ const DATASETS = Object.freeze([
         sql: `SELECT id,institucion_id,nombre,apellido,fecha_nacimiento,dni,foto_url,habitacion,
                      obra_social,num_afiliado,contacto_familiar_nombre,contacto_familiar_tel,
                      diagnostico,alergias,medico_cabecera,antecedentes,notas_ingreso,
-                     fecha_ingreso,fecha_egreso,motivo_egreso,activo,created_at,version
+                     fecha_ingreso,fecha_egreso,motivo_egreso,activo,
+                     to_char(created_at,'YYYY-MM-DD"T"HH24:MI:SS.US') AS created_at,version
               FROM pacientes_b2b WHERE institucion_id=$1 ORDER BY id`,
     },
     {
         key: 'asignaciones', file: 'data/asignaciones.jsonl', table: 'asignaciones_b2b',
-        sql: `SELECT id,institucion_id,cuidador_id,paciente_id,activa,created_at,version
+        sql: `SELECT id,institucion_id,cuidador_id,paciente_id,activa,
+                     to_char(created_at,'YYYY-MM-DD"T"HH24:MI:SS.US') AS created_at,version
               FROM asignaciones_b2b WHERE institucion_id=$1 ORDER BY id`,
     },
     {
         key: 'medicamentos', file: 'data/medicamentos.jsonl', table: 'medicamentos_b2b',
         sql: `SELECT id,institucion_id,paciente_id,catalogo_id,nombre,dosis,frecuencia,hora_inicio,
-                     hora_fin,horarios_custom,instrucciones,stock,activo,created_at,version
+                     hora_fin,horarios_custom,instrucciones,stock,activo,
+                     to_char(created_at,'YYYY-MM-DD"T"HH24:MI:SS.US') AS created_at,version
               FROM medicamentos_b2b WHERE institucion_id=$1 ORDER BY id`,
     },
     {
         key: 'historial_medicamentos', file: 'data/historial_medicamentos.jsonl', table: 'historial_medicamentos_b2b',
         sql: `SELECT id,institucion_id,paciente_id,medicamento_id,medicamento_nombre,dosis,
-                     administrado_por,administrador_nombre,notas,fecha,cantidad
+                     administrado_por,administrador_nombre,notas,
+                     to_char(fecha,'YYYY-MM-DD"T"HH24:MI:SS.US') AS fecha,cantidad
               FROM historial_medicamentos_b2b WHERE institucion_id=$1 ORDER BY id`,
     },
     {
         key: 'catalogo_medicamentos', file: 'data/catalogo_medicamentos.jsonl', table: 'catalogo_medicamentos_b2b',
         sql: `SELECT id,institucion_id,paciente_id,nombre,principio_activo,presentacion,unidad,categoria,
-                     stock_actual,stock_minimo,activo,created_at,updated_at,version
+                     stock_actual,stock_minimo,activo,
+                     to_char(created_at,'YYYY-MM-DD"T"HH24:MI:SS.US') AS created_at,
+                     to_char(updated_at,'YYYY-MM-DD"T"HH24:MI:SS.US') AS updated_at,version
               FROM catalogo_medicamentos_b2b WHERE institucion_id=$1 ORDER BY id`,
     },
     {
         key: 'historial_restock', file: 'data/historial_restock.jsonl', table: 'historial_restock_b2b',
         sql: `SELECT id,institucion_id,catalogo_id,paciente_id,nombre_item,stock_anterior,
-                     cantidad_repuesta,stock_nuevo,notas,registrado_por,registrado_nombre,created_at
+                     cantidad_repuesta,stock_nuevo,notas,registrado_por,registrado_nombre,
+                     to_char(created_at,'YYYY-MM-DD"T"HH24:MI:SS.US') AS created_at
               FROM historial_restock_b2b WHERE institucion_id=$1 ORDER BY id`,
     },
     {
         key: 'citas', file: 'data/citas.jsonl', table: 'citas_b2b',
-        sql: `SELECT id,institucion_id,paciente_id,titulo,descripcion,fecha,medico,especialidad,lugar,
-                     estado,created_by,created_at,updated_at,version,deleted_at,deleted_by,deletion_reason
+        sql: `SELECT id,institucion_id,paciente_id,titulo,descripcion,
+                     to_char(fecha,'YYYY-MM-DD"T"HH24:MI:SS.US') AS fecha,medico,especialidad,lugar,
+                     estado,created_by,to_char(created_at,'YYYY-MM-DD"T"HH24:MI:SS.US') AS created_at,
+                     to_char(updated_at,'YYYY-MM-DD"T"HH24:MI:SS.US') AS updated_at,
+                     version,deleted_at,deleted_by,deletion_reason
               FROM citas_b2b WHERE institucion_id=$1 ORDER BY id`,
     },
     {
         key: 'historial_citas', file: 'data/historial_citas.jsonl', table: 'historial_citas_b2b',
-        sql: `SELECT id,institucion_id,cita_id,paciente_id,titulo,descripcion,fecha,medico,
-                     especialidad,lugar,estado,archivado_en,archivado_por
+        sql: `SELECT id,institucion_id,cita_id,paciente_id,titulo,descripcion,
+                     to_char(fecha,'YYYY-MM-DD"T"HH24:MI:SS.US') AS fecha,medico,
+                     especialidad,lugar,estado,
+                     to_char(archivado_en,'YYYY-MM-DD"T"HH24:MI:SS.US') AS archivado_en,archivado_por
               FROM historial_citas_b2b WHERE institucion_id=$1 ORDER BY id`,
     },
     {
         key: 'tareas', file: 'data/tareas.jsonl', table: 'tareas_b2b',
         sql: `SELECT id,institucion_id,paciente_id,titulo,descripcion,categoria,frecuencia,hora,
-                     activa,created_by,created_at,version
+                     activa,created_by,to_char(created_at,'YYYY-MM-DD"T"HH24:MI:SS.US') AS created_at,version
               FROM tareas_b2b WHERE institucion_id=$1 ORDER BY id`,
     },
     {
         key: 'historial_tareas', file: 'data/historial_tareas.jsonl', table: 'historial_tareas_b2b',
         sql: `SELECT id,institucion_id,paciente_id,tarea_id,tarea_titulo,completado_por,
-                     completador_nombre,notas,fecha
+                     completador_nombre,notas,to_char(fecha,'YYYY-MM-DD"T"HH24:MI:SS.US') AS fecha
               FROM historial_tareas_b2b WHERE institucion_id=$1 ORDER BY id`,
     },
     {
         key: 'sintomas', file: 'data/sintomas.jsonl', table: 'sintomas_b2b',
         sql: `SELECT id,institucion_id,paciente_id,descripcion,intensidad,registrado_por,
-                     registrador_nombre,fecha,version,deleted_at,deleted_by,deletion_reason
+                     registrador_nombre,to_char(fecha,'YYYY-MM-DD"T"HH24:MI:SS.US') AS fecha,
+                     version,deleted_at,deleted_by,deletion_reason
               FROM sintomas_b2b WHERE institucion_id=$1 ORDER BY id`,
     },
     {
         key: 'signos_vitales', file: 'data/signos_vitales.jsonl', table: 'signos_vitales_b2b',
         sql: `SELECT id,institucion_id,paciente_id,tipo,valor,unidad,notas,registrado_por,
-                     registrador_nombre,fecha,version,deleted_at,deleted_by,deletion_reason
+                     registrador_nombre,to_char(fecha,'YYYY-MM-DD"T"HH24:MI:SS.US') AS fecha,
+                     version,deleted_at,deleted_by,deletion_reason
               FROM signos_vitales_b2b WHERE institucion_id=$1 ORDER BY id`,
     },
     {
         key: 'contactos', file: 'data/contactos.jsonl', table: 'contactos_b2b',
         sql: `SELECT id,institucion_id,paciente_id,nombre,relacion,telefono,email,es_principal,
-                     created_at,version,deleted_at,deleted_by,deletion_reason
+                     to_char(created_at,'YYYY-MM-DD"T"HH24:MI:SS.US') AS created_at,
+                     version,deleted_at,deleted_by,deletion_reason
               FROM contactos_b2b WHERE institucion_id=$1 ORDER BY id`,
     },
     {
         key: 'notas', file: 'data/notas.jsonl', table: 'notas_b2b',
         sql: `SELECT id,institucion_id,paciente_id,titulo,contenido,urgente,autor_id,autor_nombre,
-                     created_at,version,deleted_at,deleted_by,deletion_reason
+                     to_char(created_at,'YYYY-MM-DD"T"HH24:MI:SS.US') AS created_at,
+                     version,deleted_at,deleted_by,deletion_reason
               FROM notas_b2b WHERE institucion_id=$1 ORDER BY id`,
     },
     {
         key: 'documentos', file: 'documents/index.jsonl', table: 'documentos_b2b',
         sql: `SELECT id,institucion_id,paciente_id,nombre_archivo,tipo_mime,tamanio_bytes,
-                     subido_por,subido_nombre,created_at,version,deleted_at,deleted_by,deletion_reason
+                     subido_por,subido_nombre,to_char(created_at,'YYYY-MM-DD"T"HH24:MI:SS.US') AS created_at,
+                     version,deleted_at,deleted_by,deletion_reason
               FROM documentos_b2b WHERE institucion_id=$1 ORDER BY id`,
     },
     {
@@ -449,7 +467,8 @@ function setSensitiveDownloadHeaders(res) {
 
 async function revalidateAdministrativeContext(client, institutionId, principal, operator) {
     const institution = await client.query(
-        `SELECT id,nombre,tipo,direccion,telefono,email,plan,activa,lifecycle_state,created_at,stock_modelo,
+        `SELECT id,nombre,tipo,direccion,telefono,email,plan,activa,lifecycle_state,
+                to_char(created_at,'YYYY-MM-DD"T"HH24:MI:SS.US') AS created_at,stock_modelo,
                 permisos_equipo,onboarding_done,trial_started_at,shared_mode,mp_preapproval_id,
                 discount_expires_at,plan_manual_expires_at,offboarding_started_at,offboarding_reason,
                 offboarded_at,retention_review_at,retention_note,version
